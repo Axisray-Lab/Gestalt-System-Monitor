@@ -1,0 +1,227 @@
+:root {
+  --bg: #0b0f14;
+  --panel: #131a22;
+  --panel-2: #1a232d;
+  --line: #243240;
+  --text: #d6e1ec;
+  --text-dim: #7f93a6;
+  --accent: #4f9fe0;
+  --red: #e5564e;
+  --blue: #4e8ce5;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+body {
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 264px 1fr;
+  height: 100%;
+}
+
+/* ---- sidebar ---- */
+.sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  padding: 14px 12px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  font-size: 15px;
+  margin-bottom: 6px;
+}
+.brand span {
+  color: var(--accent);
+  margin: 0 3px;
+}
+.sec-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin: 12px 2px 2px;
+}
+.sec-title .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #555;
+}
+.sec-title .dot.on {
+  background: #3ec07a;
+  box-shadow: 0 0 6px #3ec07a88;
+}
+.hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 4px 2px;
+  line-height: 1.5;
+}
+.hint code {
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--text);
+}
+.proc {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  text-align: left;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 11px;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.proc-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.proc:hover {
+  border-color: #34506b;
+}
+.proc.active {
+  border-color: var(--accent);
+  background: #16222e;
+}
+.proc.mock {
+  border-style: dashed;
+}
+.proc-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.proc-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* ---- stage ---- */
+.stage {
+  position: relative;
+  min-width: 0;
+}
+
+/* ---- floating per-vehicle info panels (CSS2D labels) ---- */
+.veh-panel {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: rgba(13, 19, 26, 0.82);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 7px;
+  min-width: 78px;
+  color: var(--text);
+  transform: translate(-50%, 0);
+  backdrop-filter: blur(2px);
+}
+.veh-panel .vp-name {
+  font-size: 11px;
+  font-weight: 700;
+  margin-bottom: 2px;
+}
+.veh-panel .vp-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.veh-panel .vp-row b {
+  color: var(--text);
+  font-weight: 600;
+}
+.veh-panel .vp-hp {
+  height: 3px;
+  border-radius: 2px;
+  background: #33404d;
+  margin-top: 4px;
+  overflow: hidden;
+}
+.veh-panel .vp-hp i {
+  display: block;
+  height: 100%;
+  background: #3ec07a;
+}
+
+/* ---- diorama canvas host ---- */
+.canvas-host {
+  position: absolute;
+  inset: 0;
+}
+
+/* ---- in-scene match title plaque (CSS2D label, overview only) ---- */
+.match-plaque {
+  font: 600 12px/1.2 ui-sans-serif, system-ui, -apple-system, sans-serif;
+  color: var(--text);
+  background: rgba(13, 19, 26, 0.7);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 9px;
+  white-space: nowrap;
+  pointer-events: none;
+  backdrop-filter: blur(2px);
+}
+
+/* ---- sidebar match-row status dot ---- */
+.s-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #777;
+}
+.proc .s-dot[data-status='open'] {
+  background: #3ec07a;
+}
+.proc .s-dot[data-status='connecting'] {
+  background: #e0a93e;
+}
+.proc .s-dot[data-status='error'],
+.proc .s-dot[data-status='closed'] {
+  background: var(--red);
+}
+
+/* ---- "back to overview" button ---- */
+.overview-btn {
+  text-align: left;
+  background: var(--panel-2);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 7px 11px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.overview-btn:hover {
+  background: #16222e;
+}

@@ -1,0 +1,20 @@
+{
+  "name": "gestalt-system-monitor",
+  "version": "0.0.1",
+  "private": true,
+  "description": "LAN match monitor for Gestalt System matches — Three.js map wireframe + vehicle telemetry with automatic LAN discovery.",
+  "type": "module",
+  "workspaces": [
+    "packages/protocol",
+    "packages/agent",
+    "packages/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @gsm/web",
+    "agent": "npm run start -w @gsm/agent",
+    "agent:mock": "npm run mock -w @gsm/agent",
+    "build": "npm run build -w @gsm/web",
+    "typecheck": "npm run typecheck -w @gsm/web && npm run typecheck -w @gsm/agent"
+  },
+  "license": "UNLICENSED"
+}

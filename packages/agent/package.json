@@ -1,0 +1,22 @@
+{
+  "name": "@gsm/agent",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "LAN discovery agent — sniffs the UDP discovery beacon (:7999) and serves a live process list to the browser. Browsers can't read UDP broadcast, so this thin Node process bridges it.",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "mock": "tsx src/index.ts --mock",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@gsm/protocol": "*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

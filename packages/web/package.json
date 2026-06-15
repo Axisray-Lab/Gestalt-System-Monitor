@@ -1,0 +1,25 @@
+{
+  "name": "@gsm/web",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Gestalt-System-Monitor SPA — Three.js map wireframe + vehicle telemetry over the game's WebSocket feed.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@gsm/protocol": "*",
+    "three": "^0.184.0",
+    "vue": "^3.4.21"
+  },
+  "devDependencies": {
+    "@types/three": "^0.184.0",
+    "@vitejs/plugin-vue": "^5.0.4",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "vue-tsc": "^2.1.0"
+  }
+}
