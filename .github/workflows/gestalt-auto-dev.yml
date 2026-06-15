@@ -32,17 +32,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      # For DeepSeek (Anthropic-compatible) instead of Claude:
-      #   1) set the ANTHROPIC_API_KEY secret to your DeepSeek key,
-      #   2) uncomment the env block below, and
-      #   3) add  claude_args: "--model deepseek-chat"  under `with:`.
-      # env:
-      #   ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+      # Using a DeepSeek key via its Anthropic-compatible endpoint.
       - uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Use the workflow token directly so the Claude GitHub App need not be installed.
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Explicit model (the default "[1m]" alias isn't a valid plain API model id).
+          claude_args: "--model deepseek-chat"
           trigger_phrase: "@gestalt"
           label_trigger: "agent:ready"
           branch_prefix: "gestalt/"
