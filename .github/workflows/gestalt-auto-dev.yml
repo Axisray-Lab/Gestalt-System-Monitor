@@ -1,9 +1,9 @@
-name: Claude (issue-driven, maintainer-gated)
+name: Gestalt Auto-Dev (issue-driven, maintainer-gated)
 
 # Issue-driven coding agent for this PUBLIC repo, mirroring the game side's loop.
 # Trigger by EITHER:
 #   - applying the `agent:ready` label to an issue, or
-#   - commenting `@claude <request>` on an issue / PR.
+#   - commenting `@gestalt <request>` on an issue / PR.
 #
 # Security: by default the action only acts for users with WRITE access, so random
 # public users cannot trigger it. It opens a PR; a human reviews and merges (it
@@ -24,7 +24,7 @@ permissions:
   issues: write
 
 jobs:
-  claude:
+  gestalt-auto-dev:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +40,6 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          trigger_phrase: "@claude"
+          trigger_phrase: "@gestalt"
           label_trigger: "agent:ready"
-          # branch_prefix defaults to "claude/" — matches the game side's convention.
+          branch_prefix: "gestalt/"
