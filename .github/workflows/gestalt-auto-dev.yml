@@ -41,6 +41,8 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Use the workflow token directly so the Claude GitHub App need not be installed.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           trigger_phrase: "@gestalt"
           label_trigger: "agent:ready"
           branch_prefix: "gestalt/"
