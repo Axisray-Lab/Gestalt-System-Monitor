@@ -43,3 +43,7 @@ jobs:
           trigger_phrase: "@gestalt"
           label_trigger: "agent:ready"
           branch_prefix: "gestalt/"
+          # Custom commit author: shows "gestalt-bot", linked to the maintainer's
+          # account via the numeric id prefix in the noreply email.
+          bot_name: "gestalt-bot"
+          bot_id: "133656235"
