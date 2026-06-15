@@ -1,0 +1,45 @@
+name: Claude (issue-driven, maintainer-gated)
+
+# Issue-driven coding agent for this PUBLIC repo, mirroring the game side's loop.
+# Trigger by EITHER:
+#   - applying the `agent:ready` label to an issue, or
+#   - commenting `@claude <request>` on an issue / PR.
+#
+# Security: by default the action only acts for users with WRITE access, so random
+# public users cannot trigger it. It opens a PR; a human reviews and merges (it
+# never auto-merges). Do NOT set `allowed_non_write_users` on a public repo without
+# understanding the prompt-injection risk (untrusted issue/PR text -> agent).
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  claude:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # For DeepSeek (Anthropic-compatible) instead of Claude:
+      #   1) set the ANTHROPIC_API_KEY secret to your DeepSeek key,
+      #   2) uncomment the env block below, and
+      #   3) add  claude_args: "--model deepseek-chat"  under `with:`.
+      # env:
+      #   ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: "@claude"
+          label_trigger: "agent:ready"
+          # branch_prefix defaults to "claude/" — matches the game side's convention.
