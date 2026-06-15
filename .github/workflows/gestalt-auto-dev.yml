@@ -22,6 +22,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  id-token: write   # required by claude-code-action@v1 (OIDC token exchange)
 
 jobs:
   gestalt-auto-dev:
