@@ -47,3 +47,6 @@ jobs:
           # account via the numeric id prefix in the noreply email.
           bot_name: "gestalt-bot"
           bot_id: "133656235"
+          # Sign commits via the GitHub API so they show as "Verified".
+          # Author stays "gestalt-bot"; committer shows github-actions[bot].
+          use_commit_signing: "true"
