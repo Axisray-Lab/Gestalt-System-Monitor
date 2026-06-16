@@ -48,17 +48,33 @@ The agent injects `sourceIp` from the datagram and derives `wsUrl =
 ws://<sourceIp>:<wsPort>`. The WS port is randomized per process, which is exactly
 why the beacon has to announce it.
 
-### Telemetry — JSON-RPC notifications on the game WebSocket
+### Telemetry — the in-game `attribute.watchAttributeMaps` channel
 
-Envelope `{ type: 0, method, params }` (`type 0 = Request`, notification = no `id`).
-The game broadcasts these to every connected client, so the monitor receives them
-passively without sending anything.
+The monitor consumes the **same** attribute-map stream the in-game HUD uses (plain
+JSON over the match WebSocket), rather than a bespoke push. On connect it sends one
+subscribe request, then receives `watchAttributeMaps.result` notifications; each is
+folded into a per-map store and projected to the renderer's `WorldSnapshot`. The
+single subscribe is the only thing it ever sends — otherwise it stays passive.
 
 ```ts
-// method "monitor.mapGeometry" — once on connect / map change
-interface MapWireframe { mapId?: string|number; lines: Vec3[][]; bounds?: {min:Vec3; max:Vec3}; }
+// request — "attribute.watchAttributeMaps" (sent once on connect)
+interface WatchAttributeMapsParams { attribute_map_ids: number[]; watch_type: WatchType; }
 
-// method "monitor.worldSnapshot" — per tick
+// notification — "watchAttributeMaps.result" (server push)
+interface WatchAttributeMapsResult { cycle_event_type?: number; watch_attribute_maps_results: AttributeMapUpdate[]; }
+interface AttributeMapUpdate {
+  sync_type: number;             // 0 = full replace, 1 = incremental patch
+  attribute_map_id: number;      // one per entity (a "vehicle" carries PlayerID/Health)
+  attributes: Record<string, number>;  // "<AttrId>" -> value
+}
+```
+
+`AttrId` (`packages/protocol/src/attributes.ts`) is a subset of the game's
+player-observable attribute ids — `Health`, `HealthMax`, `TeamID`, `PlayerID`,
+firing heat, ammo counts, `Defeated`, … The monitor parses exactly the ids the HUD
+does. The store projects the attribute maps into the renderer's internal shape:
+
+```ts
 interface WorldSnapshot { t: number; vehicles: VehicleState[]; }
 interface VehicleState {
   id: number;            // stable per-vehicle id
@@ -69,6 +85,11 @@ interface VehicleState {
 }
 interface Vec3 { x: number; y: number; z: number; }   // UE cm, Z-up, left-handed
 ```
+
+> **Pending attribute ids:** world **position** and **chassis/turret heading** are
+> not in the attribute map yet. Until the game writes them in (see *Game-side
+> requirements* below), `VehicleState.pos` uses a deterministic placeholder layout
+> so the parse chain and per-unit panels stay testable.
 
 ### Coordinate mapping
 
@@ -86,9 +107,15 @@ real matches needs the game side to:
 1. **Advertise the LAN beacon at boot** (including headless processes), with the
    payload carrying `wsPort` + `matchId` — so matches are auto-discoverable
    without any UI interaction.
-2. **Push `monitor.mapGeometry`** on connect / on map change.
-3. **Push `monitor.worldSnapshot`** per tick (e.g. 20–30 Hz) with each vehicle's
-   `id` / `pos` / `yaw` / `team` / `health`.
+2. **Expose per-robot state on the `attribute.watchAttributeMaps` channel** — the
+   same channel the in-game HUD already streams. Health / max-health / team /
+   player-id are already present; the monitor additionally needs **world position**
+   and **chassis + turret heading** written into each robot's attribute map so it
+   can place and orient pieces on the board.
+
+Map geometry needs **no** game-side push: the monitor places the arena client-side
+from the beacon's `mapId` plus the static placement config, falling back to a
+wireframe only for maps it has no model for.
 
 For *launching* matches from the monitor, a headless launch entrypoint is also
 needed. These items are coordinated on the game side and tracked separately; the

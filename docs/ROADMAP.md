@@ -31,11 +31,14 @@ actually matter.
 | **v1.0** | **Release** — the above, hardened + documented, shipped with 0.1.9-AI | GS-1 + GS-2 | target |
 
 ### v0.1 — Live watch loop ▶
-Consume the live `monitor.mapGeometry` + `monitor.worldSnapshot` feed; auto-discover
-real match processes via the LAN beacon; graceful "no live match" state; keep the
-mock as a demo.
-**GS-1:** boot-time beacon carrying the WebSocket port + match id; per-tick
-`monitor.worldSnapshot`; `monitor.mapGeometry` on connect / map change.
+Consume live telemetry by subscribing to the game's existing
+`attribute.watchAttributeMaps` channel (the same one the in-game HUD uses);
+auto-discover real match processes via the LAN beacon; graceful "no live match"
+state; keep the mock as a demo. The arena is placed client-side from the beacon's
+`mapId`, so no map-geometry push is required.
+**GS-1:** boot-time beacon carrying the WebSocket port + match id; and per-robot
+**position + chassis/turret heading** written into the attribute map (health / team
+/ player-id are already streamed there).
 (Wire contract: [`docs/ARCHITECTURE.md`](ARCHITECTURE.md).)
 
 ### v0.2 — Launch & control
