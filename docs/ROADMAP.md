@@ -26,7 +26,7 @@ actually matter.
 | Version | Theme | Game-side dependency | Status |
 |---|---|---|---|
 | **v0.1** | **Live watch loop** — render real matches, not just the mock | GS-1 Live telemetry & auto-discovery | ▶ active |
-| **v0.2** | **Launch & control** — discover the install + start headless AI-vs-AI from the monitor | GS-2 Headless match launch | planned |
+| **v0.2** | **Launch & control** — discover the install + start headless AI-vs-AI from the monitor | GS-2 Headless match launch | monitor-side active |
 | **v0.3** | **Spectator polish** — multi-match overview, per-unit info, basic post-match summary | (AI gameplay quality, part of 0.1.9-AI) | planned |
 | **v1.0** | **Release** — the above, hardened + documented, shipped with 0.1.9-AI | GS-1 + GS-2 | target |
 
@@ -42,8 +42,9 @@ state; keep the mock as a demo. The arena is placed client-side from the beacon'
 (Wire contract: [`docs/ARCHITECTURE.md`](ARCHITECTURE.md).)
 
 ### v0.2 — Launch & control
-The agent (the privileged local process) discovers the installed game and launches a
-headless AI-vs-AI match; the SPA drives it and auto-attaches to the result.
+The agent (the privileged local process) discovers the installed game, reports
+CPU/RAM headroom, and launches headless AI-vs-AI matches through a configured
+entrypoint; the SPA drives it and auto-attaches to the result.
 **GS-2:** a packaged / scriptable headless entrypoint that boots an AI-vs-AI match
 and (via GS-1) advertises + streams it.
 
@@ -51,6 +52,14 @@ and (via GS-1) advertises + streams it.
 Several matches as small dioramas in one scene, a clean per-unit info panel, and a
 lightweight end-of-match summary over the existing telemetry. No new game-side
 dependency beyond gameplay quality already landing in 0.1.9-AI.
+
+Scope refined in **[DASHBOARD_PLAN.md](DASHBOARD_PLAN.md)** (2026-06-19):
+- Unit info cards (HP / ammo / damage / AIMoveMode / buffs)
+- Supply reload effectiveness indicator
+- Movement trajectory trails + heatmap overlay
+- Contribution ranking table (per-match + cross-match)
+- Dart state machine panel
+- Multi-match overview with real-time score strips
 
 ### v1.0 — Release
 v0.1–v0.3 hardened, with docs and an end-to-end acceptance pass against a real

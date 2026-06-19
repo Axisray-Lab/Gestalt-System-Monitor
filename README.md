@@ -35,7 +35,7 @@ browser then connects **directly** to each game process's WebSocket
 ```bash
 npm install
 
-# Terminal A — discovery agent with a built-in fake LAN (no game build needed):
+# Terminal A — discovery/launcher agent with a built-in fake LAN (no game build needed):
 npm run agent:mock
 
 # Terminal B — the monitor SPA:
@@ -47,6 +47,41 @@ npm run dev        # http://localhost:5180
   one to watch its live `ws://` feed end-to-end.
 - For real matches, run `npm run agent` (no `--mock`) once the game-side
   support is in place.
+
+## Local launcher
+
+The same agent also owns privileged local actions for the browser: it scans Steam
+libraries for an installed **Gestalt System**, reports host CPU/RAM headroom, and
+can start one or more headless matches through the configured headless entrypoint.
+
+By default it looks for a Steam app manifest named `Gestalt System` and launches
+the discovered executable with `--headless`. Public configuration can override the
+scan and launch shape without baking game-side implementation details into this
+repo:
+
+```bash
+npm run agent -- --game-exe "C:\Games\Gestalt System\Gestalt System.exe" --headless-args "--headless"
+```
+
+Useful overrides:
+
+| Flag | Environment variable | Default |
+|---|---|---|
+| `--steam-app-id` | `GSM_STEAM_APP_ID` | app manifest name match |
+| `--game-dir` | `GSM_GAME_DIR` | Steam library scan |
+| `--game-exe` | `GSM_GAME_EXE` | executable inferred from install name |
+| `--game-exe-name` | `GSM_GAME_EXE_NAME` | executable inferred from install name |
+| `--headless-args` | `GSM_HEADLESS_ARGS` | `--headless` |
+| `--match-memory-mb` | `GSM_HEADLESS_MEMORY_MB` | `2048` |
+| `--match-cpu-cores` | `GSM_HEADLESS_CPU_CORES` | `2` |
+| `--reserve-memory-mb` | `GSM_RESERVE_MEMORY_MB` | `2048` |
+
+The SPA disables launch when the agent estimates there is not enough remaining
+CPU/RAM for the requested count. The real headless match entrypoint is the GS-2
+game-side capability described in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+If another agent already owns `7788`, run a second one with `--port 7790` and open
+the SPA with `?agent=ws://localhost:7790`.
 
 ## Layout
 

@@ -14,6 +14,8 @@ const OVERVIEW_MARGIN = 1.4;
 const TWEEN_DUR = 0.6;
 const SPOT_HEIGHT = 60;
 const SPOT_INTENSITY = 3.2;
+/** World grid plane: aligned to the sandbox plinth underside, below the model contents. */
+const WORLD_GRID_Y = -1.05;
 
 interface CameraTween {
   fromPos: THREE.Vector3;
@@ -29,6 +31,22 @@ interface CameraTween {
 interface DioramaOptions {
   /** Called when the user focuses/unfocuses by interacting with the scene (click/Esc). */
   onFocusChange?: (key: string | null) => void;
+  /** Called periodically with renderer/frame statistics for the app HUD. */
+  onPerformanceStats?: (stats: ThreePerformanceStats) => void;
+}
+
+export interface ThreePerformanceStats {
+  fps: number;
+  frameMs: number;
+  drawCalls: number;
+  triangles: number;
+  geometries: number;
+  textures: number;
+  programs: number;
+  pixelRatio: number;
+  unitCount: number;
+  width: number;
+  height: number;
 }
 
 function easeInOutCubic(x: number): number {
@@ -54,6 +72,8 @@ export class DioramaScene {
   private ro: ResizeObserver;
   private raf = 0;
   private last = performance.now();
+  private perfFrames = 0;
+  private perfElapsedMs = 0;
 
   private focusKey: string | null = null;
   private tween: CameraTween | null = null;
@@ -107,6 +127,7 @@ export class DioramaScene {
     this.scene.add(this.spot.target);
 
     this.grid = new THREE.GridHelper(1600, 160, 0x2a4a66, 0x1c2a38);
+    this.grid.position.y = WORLD_GRID_Y;
     const gm = this.grid.material as THREE.Material;
     gm.transparent = true;
     gm.opacity = 0.3;
@@ -146,7 +167,10 @@ export class DioramaScene {
   removeUnit(key: string): void {
     const unit = this.units.get(key);
     if (!unit) return;
-    if (this.focusKey === key) this.focusKey = null;
+    if (this.focusKey === key) {
+      this.focusKey = null;
+      for (const u of this.units.values()) u.setState('normal');
+    }
     unit.dispose();
     this.scene.remove(unit.root);
     this.units.delete(key);
@@ -199,6 +223,8 @@ export class DioramaScene {
       this.gridBounds.makeEmpty();
       return;
     }
+    const focused = this.focusKey ? this.units.get(this.focusKey) : null;
+    const oldFocusCenter = focused ? focused.center.clone() : null;
     const cols = Math.ceil(Math.sqrt(list.length));
     let maxW = 0;
     let maxD = 0;
@@ -220,15 +246,24 @@ export class DioramaScene {
     this.gridBounds.makeEmpty();
     for (const u of list) this.gridBounds.union(u.worldBounds(this.tmpBox));
 
-    // Re-aim after topology/size changes so the new arrangement is in view.
-    this.reframe(TWEEN_DUR);
-  }
+    if (focused && oldFocusCenter) {
+      this.tmpPos.subVectors(focused.center, oldFocusCenter);
+      this.camera.position.add(this.tmpPos);
+      this.controls.target.add(this.tmpPos);
+      if (this.tween) {
+        this.tween.fromPos.add(this.tmpPos);
+        this.tween.toPos.add(this.tmpPos);
+        this.tween.fromTgt.add(this.tmpPos);
+        this.tween.toTgt.add(this.tmpPos);
+      }
+      this.updateSpotForUnit(focused);
+      this.camera.lookAt(this.controls.target);
+      this.controls.update();
+      return;
+    }
 
-  private reframe(dur: number): void {
-    if (this.units.size === 0) return;
-    const focused = this.focusKey ? this.units.get(this.focusKey) : null;
-    if (focused) this.frameUnit(focused, dur);
-    else this.frameOverview(dur);
+    // Re-aim the overview after topology/size changes so the arrangement is in view.
+    this.frameOverview(TWEEN_DUR);
   }
 
   private frameOverview(dur: number): void {
@@ -237,13 +272,18 @@ export class DioramaScene {
   }
 
   private frameUnit(unit: MatchUnit, dur: number): void {
+    const box = this.updateSpotForUnit(unit);
+    this.frameBox(box, FOCUS_MARGIN, FOCUS_DIR, SPOT_INTENSITY, dur);
+  }
+
+  private updateSpotForUnit(unit: MatchUnit): THREE.Box3 {
     const c = unit.center;
     this.spot.position.set(c.x, SPOT_HEIGHT, c.z);
     this.spot.target.position.copy(c);
     const box = unit.worldBounds(this.tmpBox);
     const r = box.getBoundingSphere(this.tmpSphere).radius;
     this.spot.angle = Math.min(Math.PI / 3, Math.atan((r * 1.15) / SPOT_HEIGHT));
-    this.frameBox(box, FOCUS_MARGIN, FOCUS_DIR, SPOT_INTENSITY, dur);
+    return box;
   }
 
   private frameBox(
@@ -341,7 +381,8 @@ export class DioramaScene {
   private animate = (): void => {
     this.raf = requestAnimationFrame(this.animate);
     const now = performance.now();
-    const dt = Math.min((now - this.last) / 1000, 0.1); // clamp so a backgrounded tab doesn't teleport
+    const frameMs = now - this.last;
+    const dt = Math.min(frameMs / 1000, 0.1); // clamp so a backgrounded tab doesn't teleport
     this.last = now;
 
     if (this.tween) {
@@ -364,7 +405,34 @@ export class DioramaScene {
     for (const unit of this.units.values()) unit.update(dt);
     this.renderer.render(this.scene, this.camera);
     this.labelRenderer.render(this.scene, this.camera);
+    this.emitPerformanceStats(frameMs);
   };
+
+  private emitPerformanceStats(frameMs: number): void {
+    if (!this.opts.onPerformanceStats) return;
+    this.perfFrames += 1;
+    this.perfElapsedMs += frameMs;
+    if (this.perfElapsedMs < 500) return;
+
+    const info = this.renderer.info;
+    const canvas = this.renderer.domElement;
+    this.opts.onPerformanceStats({
+      fps: (this.perfFrames * 1000) / this.perfElapsedMs,
+      frameMs: this.perfElapsedMs / this.perfFrames,
+      drawCalls: info.render.calls,
+      triangles: info.render.triangles,
+      geometries: info.memory.geometries,
+      textures: info.memory.textures,
+      programs: info.programs?.length ?? 0,
+      pixelRatio: this.renderer.getPixelRatio(),
+      unitCount: this.units.size,
+      width: canvas.clientWidth,
+      height: canvas.clientHeight,
+    });
+
+    this.perfFrames = 0;
+    this.perfElapsedMs = 0;
+  }
 
   dispose(): void {
     cancelAnimationFrame(this.raf);

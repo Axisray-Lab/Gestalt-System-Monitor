@@ -11,8 +11,9 @@
   ],
   "scripts": {
     "dev": "npm run dev -w @gsm/web",
-    "agent": "npm run start -w @gsm/agent",
-    "agent:mock": "npm run mock -w @gsm/agent",
+    "agent": "npm run start -w @gsm/agent --",
+    "agent:mock": "npm run mock -w @gsm/agent --",
+    "agent:scenario": "npm run scenario -w @gsm/agent --",
     "build": "npm run build -w @gsm/web",
     "typecheck": "npm run typecheck -w @gsm/web && npm run typecheck -w @gsm/agent"
   },

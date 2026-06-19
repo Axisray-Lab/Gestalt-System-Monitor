@@ -13,12 +13,41 @@ Browsers cannot listen to UDP broadcast, so a thin Node **discovery agent** does
 it for them, and is otherwise out of the data path:
 
 - **Discovery agent** — sniffs the `udp/7999` LAN beacon, tracks live matches,
-  and serves the resulting process list to the browser over its own WebSocket
-  (`ws://localhost:7788` by default). With `--mock` it also synthesizes a fake LAN
-  (beacons + feeds) so the front-end runs with zero game-side work.
+  scans local Steam libraries for the installed game, exposes host resource
+  headroom, and serves this local state to the browser over its own localhost
+  WebSocket (`ws://localhost:7788` by default). With `--mock` it also synthesizes
+  a fake LAN (beacons + feeds) so the front-end runs with zero game-side work.
 - **Browser SPA** — reads the process list from the agent, then connects
   **directly** to each match's WebSocket (`ws://<ip>:<wsPort>`) and renders the
   passive telemetry feed. The agent never relays match data.
+
+The agent is the only process that performs privileged local actions. Its browser
+API binds to `localhost` and accepts local origins only.
+
+### Local launcher API
+
+The agent pushes two message kinds over the browser WebSocket:
+
+- `{ kind: "processes", processes }` — live LAN match list.
+- `{ kind: "launcherStatus", status }` — installed-game candidate, launch args,
+  resource snapshot, and locally-started headless process states.
+
+It also serves:
+
+- `GET /processes` — current match list.
+- `GET /launcher` — current launcher status.
+- `POST /launch` — `{ count, installId?, force? }`; launches `count` headless
+  processes when the install is ready and current CPU/RAM budget allows it.
+
+The launcher discovers Steam installs by reading `libraryfolders.vdf` and matching
+`appmanifest_*.acf` by public app name (`Gestalt System`) or configured app id.
+The headless command line is configuration (`--headless-args` /
+`GSM_HEADLESS_ARGS`), defaulting to `--headless`; the monitor does not encode
+private game implementation details.
+
+`recommendedAdditionalMatches` is intentionally stable rather than instantaneous:
+CPU load is smoothed before capacity is estimated, and slot changes must persist
+briefly before the recommendation moves.
 
 ---
 
@@ -93,7 +122,7 @@ interface Vec3 { x: number; y: number; z: number; }   // UE cm, Z-up, left-hande
 
 ### Coordinate mapping
 
-`packages/web/src/three/coords.ts`: `three.x = ue.x`, `three.y = ue.z`,
+`packages/web/src/three/coords.ts`: `three.x = -ue.x`, `three.y = ue.z`,
 `three.z = -ue.y`, scaled cm → m (`0.01`). Uniform scale preserves directions, so
 the same transform is reused for vehicle headings.
 
@@ -117,9 +146,10 @@ Map geometry needs **no** game-side push: the monitor places the arena client-si
 from the beacon's `mapId` plus the static placement config, falling back to a
 wireframe only for maps it has no model for.
 
-For *launching* matches from the monitor, a headless launch entrypoint is also
-needed. These items are coordinated on the game side and tracked separately; the
-monitor is built so they can land independently.
+For *launching* matches from the monitor, a packaged / scriptable headless launch
+entrypoint is also needed. The monitor-side agent can already discover the Steam
+install, invoke a configured entrypoint, and guard launches with a conservative
+CPU/RAM budget; the game-side entrypoint itself is coordinated separately.
 
 > Security: the game WebSocket has no auth / origin check. Exposing it on the LAN
 > is fine for a trusted network; consider a bind-allowlist before wider exposure.

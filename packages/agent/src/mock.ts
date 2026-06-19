@@ -4,6 +4,9 @@
  * the agent's own listener discovers them, and (2) runs one WebSocket feed server
  * per fake match, emitting the target `monitor.mapGeometry` + `monitor.worldSnapshot`
  * JSON-RPC notifications the real game is expected to add (see docs/ARCHITECTURE.md).
+ *
+ * With `--scenario` flag, uses realistic RMUC2026 Map-9 AI match simulation instead
+ * of simple oval-loop vehicles.
  */
 import dgram from 'node:dgram';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -20,6 +23,7 @@ import {
   type VehicleState,
   type Vec3,
 } from '@gsm/protocol';
+import { MockMatchSimulator, createMatchSimulators, makeMap9Wireframe, MOCK_LINEUP } from './mock-match-data.js';
 
 const TEAMS = ['red', 'blue'];
 
@@ -141,4 +145,79 @@ export function startMock(): void {
       for (const ws of wss.clients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
     }
   }, 1000 * dt);
+}
+
+/** Realistic RMUC2026 Map-9 AI match mock (4 parallel matches, ~420s each). */
+export function startScenarioMock(): void {
+  const matchCount = 4;
+  const sims = createMatchSimulators(matchCount);
+  const dtMs = 50; // 20Hz update
+  const matchDurationMs = 430_000; // 430s (420s match + margin)
+  const dtFraction = dtMs / 1000;
+
+  const feeds = sims.map((sim, i) => {
+    const port = 9201 + i;
+    const wss = new WebSocketServer({ port });
+    wss.on('connection', (ws) => {
+      ws.send(JSON.stringify({
+        type: EJSONRPCType.Request,
+        method: METHOD_MAP_GEOMETRY,
+        params: sim.map,
+      }));
+    });
+    wss.on('listening', () =>
+      console.log(`[mock:scenario] "${sim.matchId}" on ws/${port}`)
+    );
+    return { sim, wss, port, beaconPayload: {
+      matchId: sim.matchId,
+      name: `Map9 AI ${i + 1}`,
+      mapId: 'RMUC2026_Map9',
+      wsPort: port,
+      playerCount: 22,
+      maxPlayers: 22,
+      version: '0.1.9-AI-mock',
+    }};
+  });
+
+  // UDP beacon
+  const beacon = dgram.createSocket({ type: 'udp4' });
+  const beaconInterval = setInterval(() => {
+    for (const f of feeds) {
+      const json = Buffer.from(JSON.stringify(f.beaconPayload), 'utf8');
+      const buf = Buffer.alloc(4 + json.length);
+      buf.writeUInt32LE(DISCOVERY_MAGIC, 0);
+      json.copy(buf, 4);
+      beacon.send(buf, DISCOVERY_PORT, '127.0.0.1');
+    }
+  }, BROADCAST_INTERVAL_MS);
+
+  // Simulation loop
+  let frame = 0;
+  let elapsed = 0;
+  const simLoop = setInterval(() => {
+    elapsed += dtMs;
+    frame++;
+    if (elapsed > matchDurationMs) {
+      console.log(`[mock:scenario] match duration reached (${matchDurationMs}ms); stopping.`);
+      clearInterval(simLoop);
+      clearInterval(beaconInterval);
+      beacon.close();
+      for (const f of feeds) f.wss.close();
+      return;
+    }
+    for (const { sim, wss } of feeds) {
+      sim.tick(dtMs);
+      const snap = sim.snapshot(frame);
+      const msg = JSON.stringify({
+        type: EJSONRPCType.Request,
+        method: METHOD_WORLD_SNAPSHOT,
+        params: snap,
+      });
+      for (const ws of wss.clients) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+      }
+    }
+  }, dtMs);
+
+  console.log(`[mock:scenario] running ${matchCount} matches, ~${matchDurationMs / 1000}s duration`);
 }

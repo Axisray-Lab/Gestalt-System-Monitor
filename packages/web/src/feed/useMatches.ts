@@ -4,11 +4,13 @@ import { createMockFeed } from './mockFeed';
 import { createWsFeed } from './wsFeed';
 import type { FeedSource, MatchView } from './types';
 
-/** Stable key for the always-present in-browser mock match. */
-export const MOCK_KEY = 'mock';
-const MOCK_LABEL = 'RMUC2026AI (mock)';
-
 const keyOf = (p: DiscoveredProcess) => `${p.matchId}@${p.sourceIp}`;
+
+/** Options for {@link useMatches}. */
+export interface UseMatchesOptions {
+  /** How many built-in mock matches to spawn (all render the RMUC2026 arena). Default 1. */
+  mockCount?: number;
+}
 
 /** Side-effect hooks into the renderer — kept here so unit lifecycle ordering lives in one place. */
 export interface MatchHooks {
@@ -34,7 +36,12 @@ interface Entry {
  * `hooks` are not invoked until `start()` is called, so the caller can defer the
  * first reconcile until the renderer exists.
  */
-export function useMatches(processes: Ref<DiscoveredProcess[]>, hooks: MatchHooks) {
+export function useMatches(
+  processes: Ref<DiscoveredProcess[]>,
+  hooks: MatchHooks,
+  opts: UseMatchesOptions = {}
+) {
+  const mockKeys = Array.from({ length: opts.mockCount ?? 1 }, (_, i) => `mock-${i}`);
   const entries = new Map<string, Entry>();
   const matches = ref<MatchView[]>([]);
   let started = false;
@@ -63,7 +70,7 @@ export function useMatches(processes: Ref<DiscoveredProcess[]>, hooks: MatchHook
 
   function reconcile(procs: DiscoveredProcess[]): void {
     const desired = new Map<string, DiscoveredProcess | null>();
-    desired.set(MOCK_KEY, null); // mock is always desired
+    for (const k of mockKeys) desired.set(k, null); // built-in mocks always present
     for (const p of procs) desired.set(keyOf(p), p);
 
     for (const [key, p] of desired) {
@@ -76,8 +83,8 @@ export function useMatches(processes: Ref<DiscoveredProcess[]>, hooks: MatchHook
         }
         continue;
       }
-      if (key === MOCK_KEY) add(MOCK_KEY, MOCK_LABEL, createMockFeed());
-      else if (p) add(key, p.name ?? p.matchId, createWsFeed(p.wsUrl), p.playerCount);
+      if (mockKeys.includes(key)) add(key, `RMUC2026AI #${mockKeys.indexOf(key) + 1}`, createMockFeed());
+      else if (p) add(key, p.name ?? p.matchId, createWsFeed(p.wsUrl, p.mapId), p.playerCount);
     }
     for (const key of [...entries.keys()]) {
       if (!desired.has(key)) remove(key);

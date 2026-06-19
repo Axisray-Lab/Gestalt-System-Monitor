@@ -42,3 +42,7 @@ export interface AgentProcessListMessage {
   kind: 'processes';
   processes: DiscoveredProcess[];
 }
+
+export type AgentBrowserMessage =
+  | AgentProcessListMessage
+  | import('./launcher').AgentLauncherStatusMessage;

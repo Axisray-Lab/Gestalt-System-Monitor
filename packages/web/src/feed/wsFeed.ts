@@ -1,32 +1,91 @@
 import {
-  METHOD_MAP_GEOMETRY,
-  METHOD_WORLD_SNAPSHOT,
+  METHOD_WATCH_ATTRIBUTE_MAPS,
+  METHOD_WATCH_ATTRIBUTE_MAPS_RESULT,
+  makeWatchParams,
   isNotification,
   type JSONRPCMessage,
   type MapWireframe,
+  type WatchAttributeMapsResult,
   type WorldSnapshot,
 } from '@gsm/protocol';
+import { AttributeStore } from './attributeStore';
 import type { FeedSource, FeedStatus } from './types';
 
 /**
- * Connects directly to a game process's WebSocket and listens for the
- * `monitor.mapGeometry` + `monitor.worldSnapshot` notifications. Reconnects on
- * drop (game processes come and go). Purely passive — it never sends, so it
- * does not consume a player slot or disturb the in-game UI.
+ * Live feed: connects to a game process's WebSocket and consumes the SAME
+ * `attribute.watchAttributeMaps` stream (plain JSON). On connect it subscribes
+ * (WatchContinuous); each `watchAttributeMaps.result` push is folded into an
+ * AttributeStore and projected to a WorldSnapshot for the renderer. Passive aside
+ * from subscribe requests.
+ *
+ * NOTE: the set of attribute_map_ids that covers ALL vehicles normally comes from
+ * a bootstrap chain (global ids -> per-player maps -> battle maps). We start with
+ * a broad low-id watch and then subscribe to referenced ids as they appear.
  */
-export function createWsFeed(url: string): FeedSource {
+
+// All attribute maps live in a LOW id space (~1..200) and stream back fine. Per-robot
+// combat data is in BATTLE maps (odd low ids, e.g. 95..119) carrying Health/Team/Class;
+// bases (class 2001)/outposts (2002)/buildings (1007) sit alongside. NOTE: `80000+` is
+// NOT a map id — it is a player-id band. Battle/player
+// maps recycle as bots die/respawn, so watching a broad low span keeps catching them.
+// The dynamic global->player->battle bootstrap below fills in any ids outside the
+// initial low span.
+const DEFAULT_WATCH_MAP_IDS = Array.from({ length: 256 }, (_, i) => i + 1);
+const RMUC_FIELD_HALF_X_CM = 836;
+const RMUC_FIELD_HALF_Y_CM = 1500;
+
+export function createWsFeed(url: string, mapId?: string | number): FeedSource {
   let ws: WebSocket | null = null;
   let closedByUser = false;
+  let reqId = 1;
+  let watched = new Set<number>();
+  const store = new AttributeStore();
   let mapCb: ((m: MapWireframe) => void) | null = null;
   let snapCb: ((s: WorldSnapshot) => void) | null = null;
   let statusCb: ((s: FeedStatus) => void) | null = null;
 
   const setStatus = (s: FeedStatus) => statusCb?.(s);
 
+  function watch(ids: Iterable<number>): void {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const fresh = [...ids]
+      .map((id) => Math.round(id))
+      .filter((id) => Number.isFinite(id) && id > 0 && !watched.has(id));
+    if (fresh.length === 0) return;
+    for (const id of fresh) watched.add(id);
+    ws.send(
+      JSON.stringify({
+        type: 0,
+        id: reqId++,
+        method: METHOD_WATCH_ATTRIBUTE_MAPS,
+        params: makeWatchParams(fresh),
+      })
+    );
+  }
+
   function connect() {
     setStatus('connecting');
     ws = new WebSocket(url);
-    ws.onopen = () => setStatus('open');
+    ws.onopen = () => {
+      setStatus('open');
+      watched = new Set<number>();
+      // Subscribe to attribute-map streaming.
+      watch(DEFAULT_WATCH_MAP_IDS);
+      watch(store.referencedMapIds());
+      // Load the arena model from the beacon's mapId (telemetry is independent of this).
+      // Bounds = the real RMUC field extent in UE cm (long axis is Y), so the model
+      // scale + world-position attributes share one coordinate frame.
+      if (mapId != null) {
+        mapCb?.({
+          mapId,
+          lines: [],
+          bounds: {
+            min: { x: -RMUC_FIELD_HALF_X_CM, y: -RMUC_FIELD_HALF_Y_CM, z: 0 },
+            max: { x: RMUC_FIELD_HALF_X_CM, y: RMUC_FIELD_HALF_Y_CM, z: 0 },
+          },
+        });
+      }
+    };
     ws.onerror = () => setStatus('error');
     ws.onclose = () => {
       setStatus('closed');
@@ -40,8 +99,11 @@ export function createWsFeed(url: string): FeedSource {
         return;
       }
       if (!isNotification(msg)) return;
-      if (msg.method === METHOD_WORLD_SNAPSHOT) snapCb?.(msg.params as WorldSnapshot);
-      else if (msg.method === METHOD_MAP_GEOMETRY) mapCb?.(msg.params as MapWireframe);
+      if (msg.method === METHOD_WATCH_ATTRIBUTE_MAPS_RESULT) {
+        store.applyResult(msg.params as WatchAttributeMapsResult);
+        watch(store.referencedMapIds());
+        snapCb?.(store.toSnapshot());
+      }
     };
   }
 

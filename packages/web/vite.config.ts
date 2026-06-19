@@ -12,6 +12,15 @@ export default defineConfig({
       '@gsm/protocol': fileURLToPath(new URL('../protocol/src/index.ts', import.meta.url)),
     },
   },
+  build: {
+    rollupOptions: {
+      input: {
+        // Two independent pages: the monitor (index) and the dock-strip deck.
+        main: fileURLToPath(new URL('./index.html', import.meta.url)),
+        deck: fileURLToPath(new URL('./deck.html', import.meta.url)),
+      },
+    },
+  },
   server: {
     host: '0.0.0.0', // reachable across the LAN, like the game's own dev server
     port: 5180,
