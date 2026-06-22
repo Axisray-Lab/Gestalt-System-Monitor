@@ -5,16 +5,14 @@ Gestalt-System-Monitor is a **public** repository: a passive LAN match monitor
 
 ## Confidentiality (important)
 
-This repo is public; the game it monitors is a separate, private project. Keep all
-contributions to the **player-observable wire contract** only:
-
-- **OK to reference:** the LAN beacon format, ports, the JSON-RPC envelope, the
-  `monitor.*` / `externalAim.*` / `lobby.*` method names, and the coordinate
-  mapping — see [`packages/protocol`](packages/protocol) and
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-- **Do NOT introduce** references to the game's internal source paths, internal
-  class names, private repository hosts, or internal architecture/roadmap. Use the
-  name **"Gestalt System"** for the game.
+This repo is **public**; the game it monitors is a separate, private project. Keep
+contributions to what this product needs to run on its own (it stays self-contained),
+plus the **player-observable wire contract** — the LAN beacon, ports, the JSON-RPC
+envelope, the `monitor.*` / `externalAim.*` / `lobby.*` method names, and the
+coordinate mapping (see [`packages/protocol`](packages/protocol) and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)). Anything internal to the private
+project stays out. Use the name **"Gestalt System"** for the game; when unsure, ask
+before committing.
 
 ## Layout
 
