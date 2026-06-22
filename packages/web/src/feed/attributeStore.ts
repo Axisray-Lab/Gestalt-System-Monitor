@@ -44,6 +44,16 @@ const ROBOT_CLASSES = new Set<number>([
   CLASS_ID.Aerial,
 ]);
 
+const CAREER_NAME: Record<number, string> = {
+  [CLASS_ID.Hero]: 'Hero',
+  [CLASS_ID.Engineer]: 'Engineer',
+  [CLASS_ID.Infantry]: 'Infantry',
+  [CLASS_ID.Sentry]: 'Sentry',
+  [CLASS_ID.Aerial]: 'Aerial',
+  [CLASS_ID.Radar]: 'Radar',
+  [CLASS_ID.Dart]: 'Dart',
+};
+
 const ROBOT_MAP_TTL_MS = 3500;
 
 type UnitKind = NonNullable<VehicleState['kind']>;
@@ -79,6 +89,12 @@ const RUNE_FALLBACK_POS: Vec3 = { x: 0, y: 0, z: 90 };
  * Buff pips, mirroring the spectator panel's curated slots (fixed order):
  * base buffs/debuffs plus sentry-only mode/boost keys emitted below.
  */
+// Generic (rune / zone / terrain) buffs, read from VALUE positions (a multiplier
+// or value > 0), NOT flags. Each gain can have several source attributes; duplicate
+// keys collapse to one pip. The SENTRY's own mode gains are deliberately NOT here:
+// its gain-type slots carry an always-on base (damage ≈ 250) plus the boosted mode
+// gain, so they need boost-thresholded single-gain selection (see `sentryGain`),
+// which a plain v>0 test would get wrong (it would light every slot every mode).
 const BUFF_DEFS: { key: string; id: AttrId; on: (v: number) => boolean }[] = [
   { key: 'inv', id: AttrId.Invincible, on: (v) => v === 1 },
   { key: 'heat', id: AttrId.Overheated, on: (v) => v === 1 },
@@ -86,16 +102,17 @@ const BUFF_DEFS: { key: string; id: AttrId; on: (v: number) => boolean }[] = [
   { key: 'atk', id: AttrId.AttackMultiplierThou, on: (v) => v > 0 },
   { key: 'heal', id: AttrId.RecoverMultiplierThou, on: (v) => v > 0 },
   { key: 'power', id: AttrId.PowerMultiplierThou, on: (v) => v > 0 }, // 功率增益
-  { key: 'cool', id: AttrId.ColdMultiplierThou, on: (v) => v > 0 }, // 冷却增益
+  // 冷却增益 — rune(神符) / fortress(碉堡) / terrain-crossing(过洞). Sentry cooling
+  // is a mode gain, handled in `sentryGain`, not here.
+  { key: 'cool', id: AttrId.ColdMultiplierThou, on: (v) => v > 0 },
+  { key: 'cool', id: AttrId.FortressCoolingValue, on: (v) => v > 0 },
+  { key: 'cool', id: AttrId.TerrainCrossingColdMultiplierThou, on: (v) => v > 0 },
   { key: 'weak', id: AttrId.Weakened, on: (v) => v === 1 }, // 虚弱
   { key: 'blind', id: AttrId.DartInterferenceEffectTrigger, on: (v) => v > 0 }, // 致盲
+  // 易伤 — DamageMultiplierThou is a DEBUFF (damage TAKEN multiplier), not a gain;
+  // fires independently of AttackMultiplierThou on Hero/Infantry/Sentry.
+  { key: 'vuln', id: AttrId.DamageMultiplierThou, on: (v) => v > 0 },
 ];
-
-const SENTRY_MODE_BUFFS: Record<number, { icon: string; marker: string }> = {
-  1: { icon: 'def', marker: 'sentry-mode-def' },
-  2: { icon: 'power', marker: 'sentry-mode-power' },
-  3: { icon: 'cool', marker: 'sentry-mode-cool' },
-};
 
 export class AttributeStore {
   /** attribute_map_id -> { "<attrId>": value } */
@@ -111,6 +128,12 @@ export class AttributeStore {
     const now = Date.now();
     for (const u of res?.watch_attribute_maps_results ?? []) this.applyUpdate(u, now);
     this.t++;
+    // NOTE: we deliberately do NOT evict stale maps. The store is naturally bounded
+    // by the broad-but-fixed low-id subscription, and stale maps are already kept
+    // out of rendering by the per-map freshness check (isFreshRobotMap) in kindFor.
+    // Deleting maps broke cross-match continuity: when the next match resumed with
+    // INCREMENTAL (sync_type 1) updates, the evicted base state was gone, so the
+    // board stayed empty until a full browser refresh re-subscribed (sync_type 0).
   }
 
   private applyUpdate(u: AttributeMapUpdate, now: number): void {
@@ -123,7 +146,10 @@ export class AttributeStore {
       m = {};
       this.maps.set(u.attribute_map_id, m);
     }
-    for (const [k, v] of Object.entries(u.attributes ?? {})) m[k] = v;
+    // Object.assign over a for-of of Object.entries: same own-enumerable copy, but
+    // no per-update pairs-array allocation — this runs ~14k×/s across all feeds, so
+    // the avoided garbage is the difference between smooth and GC-stutter.
+    if (u.attributes) Object.assign(m, u.attributes);
 
     const currentBattleMapId = this.num(m, AttrId.PlayerBattleAttributeMapID);
     const battleMapId = currentBattleMapId ?? oldBattleMapId;
@@ -165,20 +191,41 @@ export class AttributeStore {
     if (progress != null && progressMax != null && progressMax > 0) {
       return clamp01(progress / progressMax);
     }
-    return this.unitRatio(this.num(m, AttrId.HealthRatio)) ?? health;
+    return this.unitRatio(this.num(m, AttrId.HP_Progress)) ?? health;
   }
 
-  private addRangeValues(
+  /**
+   * Single allocation-free pass over one map's keys, routing base/outpost/rune id
+   * VALUES into the given sets and reporting whether the map carries ANY
+   * structure-range KEY (value-agnostic — matches the old hasRegisteredStructureIds).
+   * Replaces three `Object.entries` sweeps per map (the dominant per-message cost
+   * when a live match streams hundreds of maps).
+   */
+  private collectStructureIds(
     m: Record<string, number>,
-    first: AttrId,
-    last: AttrId,
-    out: Set<number>
-  ): void {
-    for (const [k, v] of Object.entries(m)) {
+    bases: Set<number>,
+    outposts: Set<number>,
+    runes: Set<number>
+  ): boolean {
+    let hasStructureKey = false;
+    for (const k in m) {
       const attr = Number(k);
-      if (attr < first || attr > last) continue;
-      if (typeof v === 'number' && Number.isFinite(v) && v > 0) out.add(Math.round(v));
+      const v = m[k];
+      const ok = typeof v === 'number' && Number.isFinite(v) && v > 0;
+      if (attr >= AttrId.G_BaseId_0 && attr <= AttrId.G_BaseId_MAX) {
+        hasStructureKey = true;
+        if (ok) bases.add(Math.round(v));
+      }
+      if (attr >= AttrId.G_OutpostId_0 && attr <= AttrId.G_OutpostId_MAX) {
+        hasStructureKey = true;
+        if (ok) outposts.add(Math.round(v));
+      }
+      if (attr >= AttrId.G_BuffStationId_0 && attr <= AttrId.G_BuffStationId_MAX) {
+        hasStructureKey = true;
+        if (ok) runes.add(Math.round(v));
+      }
     }
+    return hasStructureKey;
   }
 
   private registeredIds(): RegisteredIds {
@@ -197,22 +244,9 @@ export class AttributeStore {
         if (battleMapId != null && battleMapId > 0) ids.hidden.add(Math.round(battleMapId));
       }
       if (!hidden && battleMapId != null && battleMapId > 0) ids.robots.add(Math.round(battleMapId));
-      this.addRangeValues(m, AttrId.G_BaseId_0, AttrId.G_BaseId_MAX, ids.bases);
-      this.addRangeValues(m, AttrId.G_OutpostId_0, AttrId.G_OutpostId_MAX, ids.outposts);
-      this.addRangeValues(m, AttrId.G_BuffStationId_0, AttrId.G_BuffStationId_MAX, ids.runes);
+      this.collectStructureIds(m, ids.bases, ids.outposts, ids.runes);
     }
     return ids;
-  }
-
-  private hasRegisteredStructureIds(m: Record<string, number>): boolean {
-    return Object.keys(m).some((k) => {
-      const attr = Number(k);
-      return (
-        (attr >= AttrId.G_BaseId_0 && attr <= AttrId.G_BaseId_MAX) ||
-        (attr >= AttrId.G_OutpostId_0 && attr <= AttrId.G_OutpostId_MAX) ||
-        (attr >= AttrId.G_BuffStationId_0 && attr <= AttrId.G_BuffStationId_MAX)
-      );
-    });
   }
 
   /**
@@ -227,14 +261,14 @@ export class AttributeStore {
       const battleMapId = this.num(m, AttrId.PlayerBattleAttributeMapID);
       if (battleMapId != null && battleMapId > 0) ids.add(Math.round(battleMapId));
 
-      this.addRangeValues(m, AttrId.G_BaseId_0, AttrId.G_BaseId_MAX, ids);
-      this.addRangeValues(m, AttrId.G_OutpostId_0, AttrId.G_OutpostId_MAX, ids);
-      this.addRangeValues(m, AttrId.G_BuffStationId_0, AttrId.G_BuffStationId_MAX, ids);
-
-      if (!this.hasRegisteredStructureIds(m)) continue;
-      for (const [k, v] of Object.entries(m)) {
+      // base/outpost/rune ids all go into the one referenced-id set; the return
+      // gates harvesting referenced PlayerIDs (only on maps that carry structures).
+      const hasStructureKey = this.collectStructureIds(m, ids, ids, ids);
+      if (!hasStructureKey) continue;
+      for (const k in m) {
         const attr = Number(k);
         if (attr <= AttrId.PlayerID_0 || attr >= AttrId.PlayerID_MAX) continue;
+        const v = m[k];
         if (typeof v === 'number' && Number.isFinite(v) && v > 0) ids.add(Math.round(v));
       }
     }
@@ -328,17 +362,39 @@ export class AttributeStore {
     return this.fallbackPos(kind, teamId) ?? this.layoutPos(i, n);
   }
 
-  private displayName(kind: UnitKind, id: number): string {
+  private displayName(kind: UnitKind, id: number, classId?: number): string {
     if (kind === 'base') return 'Base';
     if (kind === 'outpost') return 'Outpost';
     if (kind === 'rune') return 'RUNE';
     if (kind === 'building') return 'Building';
+    if (classId && CAREER_NAME[classId]) return CAREER_NAME[classId];
     return `Car ${id}`;
   }
 
   private snapshotId(mapId: number, m: Record<string, number>, kind: UnitKind): number {
     const pid = this.num(m, AttrId.PlayerID);
     return kind === 'robot' && pid != null && pid > AttrId.PlayerID_0 ? pid : mapId;
+  }
+
+  /**
+   * The sentry's single mode gain, read from its VALUE positions. The sentry has
+   * exactly THREE modes — Defense / Cooling / Movement — and each drives ONE gain
+   * slot positive. There is NO attack mode: the damage slot
+   * (SentryDamageMultiplierThou) is an always-on ~250 base, NOT a gain, so it is
+   * ignored here. The gain magnitudes differ by mode — defense runs small (~250–990,
+   * enhanced ≈990), cooling large (~1000, enhanced ≈1e6) — so each slot is tested
+   * for "on" (>0) rather than a shared threshold (a threshold tuned for cooling
+   * would miss the whole defense mode). Movement shows as the power coefficient
+   * going POSITIVE; that same slot is negative (a debuff) in the other two modes.
+   * Verified against 67 recordings: these slots never co-occur except for stray
+   * single-frame transitions, where reading the value (not the lagging mode number)
+   * is still the right call. Returns the pip key, or null while the sentry is down.
+   */
+  private sentryGain(m: Record<string, number>): 'def' | 'cool' | 'power' | null {
+    if ((this.num(m, AttrId.SentryColdMultiplierThou) ?? 0) > 0) return 'cool';
+    if ((this.num(m, AttrId.SentryDefenseMultiplierThou) ?? 0) > 0) return 'def';
+    if ((this.num(m, AttrId.SentryPowerCoefficientThou) ?? 0) > 0) return 'power';
+    return null;
   }
 
   toSnapshot(): WorldSnapshot {
@@ -374,7 +430,7 @@ export class AttributeStore {
       const hp = this.num(m, AttrId.Health);
       const hpMax = this.num(m, AttrId.HealthMax);
       const defeatedAttr = this.num(m, AttrId.Defeated);
-      const healthRatio = this.unitRatio(this.num(m, AttrId.HealthRatio));
+      const healthRatio = this.unitRatio(this.num(m, AttrId.HP_Progress));
       const health =
         hp != null && hpMax != null && hpMax > 0
           ? clamp01(hp / hpMax)
@@ -418,19 +474,24 @@ export class AttributeStore {
             : 0
           : undefined;
       const reviveProgressMax = this.num(m, AttrId.ReviveProgressMax);
-      const deployedAttr = kind === 'base' ? this.num(m, AttrId.BaseDeployed) : undefined;
+      // Base 展开/deploy state = BC_State(73000001)===1 (the base controller opens up,
+      // exposing its core just before it can be destroyed). NOT 10000101 (Tech_L4).
+      const deployedAttr = kind === 'base' ? this.num(m, AttrId.BC_State) : undefined;
       const repairProgress =
         kind === 'outpost' ? this.outpostRepairProgress(m, health, defeated) : undefined;
 
-      const buffs = BUFF_DEFS.filter((d) => d.on(this.num(m, d.id) ?? 0)).map((d) => d.key);
+      // Buffs come from VALUE positions (BUFF_DEFS); dedupe since several gains have
+      // multiple source attributes (e.g. cool = rune/fortress/terrain-crossing).
+      const buffs = [...new Set(BUFF_DEFS.filter((d) => d.on(this.num(m, d.id) ?? 0)).map((d) => d.key))];
+      // The sentry shows exactly ONE mode gain (def/atk/cool), picked from its value
+      // positions. Enhanced mode amplifies only THAT gain, so we tag it `enh:<key>`
+      // and let the panel glow just that one pip (not every active buff).
       if (classId === CLASS_ID.Sentry) {
-        const mode = this.num(m, AttrId.SentryMode);
-        const modeBuff = mode != null ? SENTRY_MODE_BUFFS[Math.round(mode)] : undefined;
-        if (modeBuff) {
-          if (!buffs.includes(modeBuff.icon)) buffs.push(modeBuff.icon);
-          buffs.push(modeBuff.marker);
+        const gain = this.sentryGain(m);
+        if (gain) {
+          if (!buffs.includes(gain)) buffs.push(gain);
+          if (this.num(m, AttrId.SentryModeEnhanced) === 1) buffs.push(`enh:${gain}`);
         }
-        if ((this.num(m, AttrId.SentryEnhanced) ?? 0) > 0) buffs.push('sentry-enhanced');
       }
 
       const pos = this.resolvePos(m, kind, teamId, i, n);
@@ -445,7 +506,7 @@ export class AttributeStore {
         attributeMapId: mapId,
         kind,
         classId,
-        name: this.displayName(kind, id),
+        name: this.displayName(kind, id, classId),
         team,
         teamNumber: teamNumber != null && teamNumber >= 0 ? teamNumber : undefined,
         pos,
@@ -460,7 +521,7 @@ export class AttributeStore {
           deploymentMode != null
             ? deploymentMode > 0
             : deployedAttr != null
-              ? deployedAttr > 0
+              ? deployedAttr === 1
               : undefined,
         repairProgress,
         repairCount:
@@ -476,6 +537,8 @@ export class AttributeStore {
         ammo42: a42,
         firingLocked,
         heat,
+        score: this.num(m, AttrId.DamageAppliedTotal) ?? 0,
+        damageTaken: this.num(m, AttrId.DamageTakenTotal) ?? 0,
       };
     });
     return { t: this.t, vehicles };

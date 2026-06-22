@@ -10,3 +10,10 @@ dist/
 !.env.example
 packages/*/dist/
 packages/*/node_modules/
+# Recorded match telemetry — large, and summary.json embeds absolute local paths.
+# Keep out of this PUBLIC repo.
+packages/agent/traces/
+*.trace.json
+*.summary.json
+# Dev-only perf telemetry sink output (real-browser stats streamed to disk).
+packages/web/perf-telemetry.log

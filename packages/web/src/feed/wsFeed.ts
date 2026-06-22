@@ -9,6 +9,7 @@ import {
   type WorldSnapshot,
 } from '@gsm/protocol';
 import { AttributeStore } from './attributeStore';
+import { feedPerf } from './feedPerf';
 import type { FeedSource, FeedStatus } from './types';
 
 /**
@@ -31,6 +32,11 @@ import type { FeedSource, FeedStatus } from './types';
 // The dynamic global->player->battle bootstrap below fills in any ids outside the
 // initial low span.
 const DEFAULT_WATCH_MAP_IDS = Array.from({ length: 256 }, (_, i) => i + 1);
+// Cap snapshot projection rate. A live match streams ~30 Hz, but the renderer
+// interpolates between snapshots (and replays are 10 Hz and look fine), so
+// projecting more than ~20 Hz just burns the main thread. applyResult still runs
+// on every message, so no state is lost — only the expensive projection is coalesced.
+const MIN_PROJECT_MS = 50;
 const RMUC_FIELD_HALF_X_CM = 836;
 const RMUC_FIELD_HALF_Y_CM = 1500;
 
@@ -39,6 +45,8 @@ export function createWsFeed(url: string, mapId?: string | number): FeedSource {
   let closedByUser = false;
   let reqId = 1;
   let watched = new Set<number>();
+  let active = true;
+  let lastProjectAt = 0;
   const store = new AttributeStore();
   let mapCb: ((m: MapWireframe) => void) | null = null;
   let snapCb: ((s: WorldSnapshot) => void) | null = null;
@@ -93,16 +101,32 @@ export function createWsFeed(url: string, mapId?: string | number): FeedSource {
     };
     ws.onmessage = (ev) => {
       let msg: JSONRPCMessage;
+      const tParse = performance.now();
       try {
         msg = JSON.parse(ev.data as string);
       } catch {
         return;
       }
+      feedPerf.parseMs += performance.now() - tParse;
+      feedPerf.messages += 1;
       if (!isNotification(msg)) return;
       if (msg.method === METHOD_WATCH_ATTRIBUTE_MAPS_RESULT) {
+        // Always fold the update in (cheap) so the store stays warm; only do the
+        // expensive id-scan + snapshot projection when this board actually renders.
+        const tApply = performance.now();
         store.applyResult(msg.params as WatchAttributeMapsResult);
-        watch(store.referencedMapIds());
-        snapCb?.(store.toSnapshot());
+        feedPerf.applyMs += performance.now() - tApply;
+        if (active) {
+          const now = performance.now();
+          if (now - lastProjectAt >= MIN_PROJECT_MS) {
+            lastProjectAt = now;
+            watch(store.referencedMapIds());
+            const tProject = performance.now();
+            const snap = store.toSnapshot();
+            feedPerf.projectMs += performance.now() - tProject;
+            snapCb?.(snap);
+          }
+        }
       }
     };
   }
@@ -120,6 +144,18 @@ export function createWsFeed(url: string, mapId?: string | number): FeedSource {
       closedByUser = true;
       ws?.close();
       ws = null;
+    },
+    setActive: (a) => {
+      if (a === active) return;
+      active = a;
+      // On activation, catch up immediately: subscribe to any newly-referenced
+      // battle ids and emit a snapshot now so the board renders on its next frame,
+      // not only on its next ~100ms message.
+      if (a && ws?.readyState === WebSocket.OPEN) {
+        watch(store.referencedMapIds());
+        snapCb?.(store.toSnapshot());
+        lastProjectAt = performance.now();
+      }
     },
   };
 }

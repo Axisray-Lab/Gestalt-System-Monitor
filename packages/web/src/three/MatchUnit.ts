@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { MapWireframe, VehicleState, WorldSnapshot } from '@gsm/protocol';
 import { ueToThree } from './coords';
 import {
@@ -44,13 +45,9 @@ const BUFF_ORDER = [
   'cool',
   'weak',
   'blind',
+  'vuln',
 ] as const;
 type BuffKey = (typeof BUFF_ORDER)[number];
-const SENTRY_MODE_MARKERS: Record<string, BuffKey> = {
-  'sentry-mode-def': 'def',
-  'sentry-mode-power': 'power',
-  'sentry-mode-cool': 'cool',
-};
 interface BuffIconDef {
   color: string;
   title: string;
@@ -105,9 +102,16 @@ const BUFF_ICONS: Record<BuffKey, BuffIconDef> = {
     title: '致盲',
     path: 'M2 12s4-6.5 10-6.5S22 12 22 12s-4 6.5-10 6.5S2 12 2 12zM12 9.5a2.5 2.5 0 100 5 2.5 2.5 0 000-5M3 3l18 18',
   }, // eye + slash
+  vuln: {
+    color: '#ff4d4d',
+    title: '易伤',
+    // 易伤 (takes more damage) — a cracked shield: shield outline + jagged fissure
+    path: 'M12 2l8 3v6c0 5-3.5 8.5-8 11-4.5-2.5-8-6-8-11V5zM12 5l-2 5 3 1.5-2 5',
+  }, // cracked shield
 };
-/** A vehicle not seen for this long is dropped. */
-const STALE_MS = 2000;
+/** A vehicle not seen for this long is dropped. Generous so bursty replay/feed
+ *  delivery (many matches streaming at once) doesn't drop pieces between bursts. */
+const STALE_MS = 5000;
 const PLINTH_HEIGHT = 0.4;
 const PLINTH_TOP_Y = -0.05;
 const PROJECTION_RAY_PAD = 4;
@@ -195,7 +199,7 @@ function sparkColor(team: string | number | undefined): number {
 const clampPct = (n: number): number => Math.max(0, Math.min(100, n));
 
 /** Max discrete 50-HP cells before the bar collapses to one continuous fill. */
-const MAX_CELLS = 10;
+const MAX_CELLS = 20;
 const RESPAWN_DEFAULT_MS = 60_000;
 const RESPAWN_MAX_MS = 120_000;
 const RESPAWN_SEGMENT_MS = 15_000;
@@ -483,6 +487,7 @@ export class MatchUnit {
   private pendingShots: PendingShot[] = [];
   private recentDamageTargets: DamageTarget[] = [];
   private state: UnitState = 'normal';
+  private _occluded = false;
   /** Loaded 3D sandbox model for maps that have one (else the wireframe is shown). */
   private model: LoadedMapModel | null = null;
   private baseAnchorRed = new THREE.Vector3();
@@ -492,6 +497,12 @@ export class MatchUnit {
   private sandboxCalibration = { scaleZ: 1, positionZ: 0 };
   /** Bumped each setMap so a stale async model load can be discarded. */
   private modelLoadId = 0;
+  /** Sandbox model load is deferred until the board is visible, so a deep stack
+   *  doesn't merge dozens of hidden models at once (which blocks the main thread
+   *  and starves the feeds). Holds the pending fit params; nulled once loaded. */
+  private pendingSandbox:
+    | { mapId: string | number | undefined; cx: number; cz: number; sx: number; sz: number }
+    | null = null;
   private disposed = false;
   private surfaceProjectionPool: SurfaceProjection[] = Array.from(
     { length: MAX_SURFACE_PROJECTIONS },
@@ -503,8 +514,10 @@ export class MatchUnit {
   onBoundsChange?: () => void;
   /** Local-space bounds (plinth footprint + a little height); placeholder until setMap. */
   private _localBounds = new THREE.Box3(
-    new THREE.Vector3(-20, -0.45, -15),
-    new THREE.Vector3(20, 1, 15)
+    // Sized to the RMUC field footprint (all matches are map 9) so the grid spacing
+    // doesn't visibly shrink when each board's real bounds arrive via setMap.
+    new THREE.Vector3(-9.4, -0.45, -16.8),
+    new THREE.Vector3(9.4, 1, 16.8)
   );
 
   private tmpDir = new THREE.Vector3();
@@ -526,6 +539,10 @@ export class MatchUnit {
   private projectionHits: THREE.Intersection[] = [];
   private projectileRay = new THREE.Raycaster();
   private projectileHits: THREE.Intersection[] = [];
+  private vehicleInst: THREE.InstancedMesh | null = null;
+  /** Scratch for the overview instanced-dot rebuild (avoid per-frame allocation). */
+  private tmpInstDummy = new THREE.Object3D();
+  private tmpInstColor = new THREE.Color();
   private static readonly UP = new THREE.Vector3(0, 1, 0);
   private static readonly DOWN = new THREE.Vector3(0, -1, 0);
   private static readonly ORIGIN = new THREE.Vector3(0, 0, 0);
@@ -543,10 +560,39 @@ export class MatchUnit {
     this.plaque.position.set(0, 2.6, 0);
     this.plaque.center.set(0.5, 1);
     this.root.add(this.plaque);
+    // Overview LOD markers: non-focused robots render as cheap instanced dots.
+    // - Colour via `instanceColor` (setColorAt), NOT `vertexColors` — the latter,
+    //   with no geometry colour attribute, multiplies diffuse by black → invisible.
+    // - The sandbox model is transparent (opacity 0.92), so three.js draws it in
+    //   the transparent pass AFTER all opaque objects. If the dots were opaque they
+    //   would be drawn first and then blended over by the model surface (looks like
+    //   an "invisible plane" hiding them from the top). So mark the dots transparent
+    //   too and give them a high renderOrder: within the transparent pass they then
+    //   render LAST, and depthTest:false keeps them on top from every angle.
+    const sphereGeo = new THREE.SphereGeometry(0.32, 8, 6);
+    const sphereMat = new THREE.MeshBasicMaterial({
+      toneMapped: false,
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.vehicleInst = new THREE.InstancedMesh(sphereGeo, sphereMat, 200);
+    this.vehicleInst.count = 0;
+    this.vehicleInst.frustumCulled = false;
+    this.vehicleInst.renderOrder = 999;
+    this.root.add(this.vehicleInst);
   }
 
   setLabel(label: string): void {
     this.plaqueEl.textContent = label;
+  }
+
+  plaqueText(): string {
+    return this.plaqueEl.textContent ?? '';
+  }
+
+  setPlaqueVisible(v: boolean): void {
+    this.plaque.visible = v;
   }
 
   setMap(map: MapWireframe): void {
@@ -610,7 +656,19 @@ export class MatchUnit {
     this.pendingShots.length = 0;
     this.recentDamageTargets.length = 0;
     this.invalidateProjectionSurfaces();
-    this.loadSandbox(map.mapId, cx, cz, sx, sz);
+    // Defer the (expensive) 3D model load + merge until this board is actually
+    // visible — in a deep stack only the top board renders, so we avoid merging
+    // dozens of hidden models that would block the main thread and starve feeds.
+    this.pendingSandbox = { mapId: map.mapId, cx, cz, sx, sz };
+    this.maybeLoadSandbox();
+  }
+
+  /** Load the deferred sandbox model once the board is visible (see setMap). */
+  private maybeLoadSandbox(): void {
+    const p = this.pendingSandbox;
+    if (!p || this._occluded) return;
+    this.pendingSandbox = null;
+    this.loadSandbox(p.mapId, p.cx, p.cz, p.sx, p.sz);
   }
 
   /**
@@ -685,6 +743,7 @@ export class MatchUnit {
         installSurfaceProjectionMaterial(m.material);
         this.mapGroup.add(m.object);
         this.model = m;
+        this.mergeModelGeometries(m);
         this.applySandboxBaseCalibration();
         clearSurfaceProjectionMaterial(this.plinthMat);
         this.surfaceProjectionActive = false;
@@ -699,6 +758,28 @@ export class MatchUnit {
 
   private setLinesVisible(visible: boolean): void {
     for (const line of this.lines) line.visible = visible;
+  }
+
+  private mergeModelGeometries(m: LoadedMapModel): void {
+    const root = m.object;
+    root.updateWorldMatrix(true, true);
+    const rootWorldInv = root.matrixWorld.clone().invert();
+    const geoms: THREE.BufferGeometry[] = [];
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (mesh.isMesh && mesh.geometry) {
+        const cloned = mesh.geometry.clone();
+        cloned.applyMatrix4(rootWorldInv.clone().multiply(mesh.matrixWorld));
+        geoms.push(cloned);
+      }
+    });
+    if (geoms.length <= 1) return;
+    const merged = mergeGeometries(geoms);
+    while (root.children.length > 0) root.remove(root.children[0]);
+    const single = new THREE.Mesh(merged, m.material);
+    single.matrixAutoUpdate = false;
+    single.matrix.identity();
+    root.add(single);
   }
 
   private applyStateToModel(mat = this.model?.material): void {
@@ -740,6 +821,7 @@ export class MatchUnit {
 
   updateSnapshot(snap: WorldSnapshot): void {
     const now = performance.now();
+    const focused = this.state === 'focused';
     const seen = new Set<number>();
     const damagedThisFrame: DamageTarget[] = [];
     const dartBlindStarts: VehicleState[] = [];
@@ -749,18 +831,24 @@ export class MatchUnit {
       if (!viz) viz = this.createVehicle(v);
       const prev = viz.lastV;
       this.applyVehicle(viz, v);
-      const damage = prev ? this.damageAmount(prev, v) : 0;
-      if (damage > 0) {
-        damagedThisFrame.push({ id: v.id, viz, vehicle: v, amount: damage, seenAt: now });
-      }
-      if (prev && !this.hasBuff(prev, 'blind') && this.hasBuff(v, 'blind')) {
-        dartBlindStarts.push(v);
+      // Projectile/dart effects only render on the focused unit, so skip the
+      // damage/blind bookkeeping that feeds them in overview.
+      if (focused) {
+        const damage = prev ? this.damageAmount(prev, v) : 0;
+        if (damage > 0) {
+          damagedThisFrame.push({ id: v.id, viz, vehicle: v, amount: damage, seenAt: now });
+        }
+        if (prev && !this.hasBuff(prev, 'blind') && this.hasBuff(v, 'blind')) {
+          dartBlindStarts.push(v);
+        }
       }
       viz.lastSeen = now;
     }
-    for (const target of dartBlindStarts) this.spawnDartStrikeForTarget(target, snap.vehicles, now);
-    this.addRecentDamageTargets(damagedThisFrame, now);
-    this.resolvePendingShots(now);
+    if (focused) {
+      for (const target of dartBlindStarts) this.spawnDartStrikeForTarget(target, snap.vehicles, now);
+      this.addRecentDamageTargets(damagedThisFrame, now);
+      this.resolvePendingShots(now);
+    }
     for (const [id, viz] of this.vehicles) {
       if (!seen.has(id) || now - viz.lastSeen > STALE_MS) {
         this.removeVehicle(viz);
@@ -826,7 +914,7 @@ export class MatchUnit {
     if (changed) {
       this.invalidateProjectionSurfaces();
       for (const viz of this.vehicles.values()) {
-        if (viz.lastV && buildingModelKind(viz.lastV)) this.snapBuildingToSurface(viz.tgtPos);
+        if (viz.lastV && buildingModelKind(viz.lastV)) this.snapBuildingToSurface(viz, viz.tgtPos);
       }
       if (this.surfaceProjectionActive) this.flushSurfaceProjections();
     }
@@ -834,10 +922,22 @@ export class MatchUnit {
 
   /** Advance interpolation toward the latest snapshot. Called every frame. */
   update(dt: number): void {
+    if (this._occluded) {
+      // Keep transforms tracking the latest snapshot (no interpolation cost) so
+      // un-hiding the unit later doesn't pop/slide from a frozen position.
+      for (const viz of this.vehicles.values()) {
+        viz.curPos.copy(viz.tgtPos);
+        viz.curQuat.copy(viz.tgtQuat);
+      }
+      return;
+    }
     const alpha = 1 - Math.exp(-SMOOTH * dt);
     const now = performance.now();
-    this.root.updateWorldMatrix(true, true);
-    const showProjection = this.state === 'focused';
+    const focused = this.state === 'focused';
+    // Only the focused unit reads root.matrixWorld this frame (surface-projection
+    // raycast); for the rest the renderer's own matrix pass suffices.
+    if (focused) this.root.updateWorldMatrix(true, true);
+    const showProjection = focused;
     this.surfaceProjections.length = 0;
     for (const viz of this.vehicles.values()) {
       if (!viz.placed) continue;
@@ -855,7 +955,7 @@ export class MatchUnit {
           buildingDeployed(viz.lastV)
         );
       }
-      viz.bodyCorruptionUniforms.time.value = now * 0.001 + viz.group.id * 0.017;
+      if (focused) viz.bodyCorruptionUniforms.time.value = now * 0.001 + viz.group.id * 0.017;
       if (this.state === 'focused' && viz.panel && viz.lastV && vehicleDefeated(viz.lastV)) {
         this.updatePanel(viz, viz.lastV, now);
       }
@@ -875,7 +975,28 @@ export class MatchUnit {
     }
     if (showProjection) this.flushSurfaceProjections();
     else this.clearSurfaceProjections();
-    this.updateProjectiles(now);
+    // Overview LOD: non-focused robots render as cheap instanced dots (one draw
+    // call) instead of per-vehicle shaded bodies. Buildings keep their own model,
+    // so they're excluded from the dots. Scratch dummy/colour avoid per-frame allocs.
+    if (this.state === 'normal' && this.vehicleInst) {
+      let ci = 0;
+      const d = this.tmpInstDummy;
+      for (const viz of this.vehicles.values()) {
+        if (!viz.placed || now - viz.lastSeen > STALE_MS) continue;
+        if (viz.lastV && buildingModelKind(viz.lastV)) continue;
+        if (ci >= 200) break;
+        d.position.copy(viz.curPos);
+        d.position.y += 0.55;
+        d.updateMatrix();
+        this.vehicleInst.setMatrixAt(ci, d.matrix);
+        this.vehicleInst.setColorAt(ci, this.tmpInstColor.setHex(teamColor(viz.lastTeam)));
+        ci++;
+      }
+      this.vehicleInst.count = ci;
+      this.vehicleInst.instanceMatrix.needsUpdate = true;
+      if (this.vehicleInst.instanceColor) this.vehicleInst.instanceColor.needsUpdate = true;
+    }
+    if (focused) this.updateProjectiles(now);
     for (const [id, viz] of this.vehicles) {
       if (now - viz.lastSeen > STALE_MS) {
         this.removeVehicle(viz);
@@ -896,11 +1017,22 @@ export class MatchUnit {
     this.lineMat.opacity = focused ? OPACITY_FOCUSED : state === 'dim' ? OPACITY_DIM : OPACITY_NORMAL;
     this.plinthMat?.emissive.setHex(focused ? 0x10202c : 0x000000);
     this.applyStateToModel();
-    if (!focused) this.clearSurfaceProjections();
+    if (!focused) {
+      // Leaving focus: drop the per-focus effects so overview stays cheap.
+      this.clearSurfaceProjections();
+      this.clearProjectiles();
+      this.pendingShots.length = 0;
+      this.recentDamageTargets.length = 0;
+    }
+    // Overview LOD: robot dots only in the overview (normal) state — the focused
+    // unit shows full bodies, and dim units (another match focused) recede to just
+    // their board, so always-on-top dots don't bleed over the focused scene.
+    if (this.vehicleInst) this.vehicleInst.visible = state === 'normal';
     for (const viz of this.vehicles.values()) {
       this.applyProjectionStyle(viz);
       this.applyBodyStyle(viz);
       this.applyBuildingStyle(viz);
+      this.updateBodyVisibility(viz);
       if (focused) {
         this.ensurePanel(viz);
         if (viz.lastV) this.updatePanel(viz, viz.lastV);
@@ -1106,6 +1238,22 @@ export class MatchUnit {
     return this._localBounds;
   }
 
+  setOccluded(v: boolean): void {
+    if (this._occluded === v) return;
+    this._occluded = v;
+    this.root.visible = !v;
+    if (!v) this.maybeLoadSandbox(); // becoming visible: load any deferred model
+  }
+
+  get occluded(): boolean {
+    return this._occluded;
+  }
+
+  /** Number of vehicles currently tracked/interpolated on this board. */
+  get vehicleCount(): number {
+    return this.vehicles.size;
+  }
+
   worldBounds(target = new THREE.Box3()): THREE.Box3 {
     // Valid because root carries only translation (no rotation/scale).
     return target.copy(this._localBounds).translate(this.root.position);
@@ -1128,6 +1276,12 @@ export class MatchUnit {
     }
     for (const viz of this.vehicles.values()) this.removeVehicle(viz);
     this.vehicles.clear();
+    if (this.vehicleInst) {
+      this.root.remove(this.vehicleInst);
+      this.vehicleInst.geometry.dispose();
+      (this.vehicleInst.material as THREE.Material).dispose();
+      this.vehicleInst = null;
+    }
     for (const line of this.lines) line.geometry.dispose();
     this.lines = [];
     this.lineMat.dispose();
@@ -1150,11 +1304,15 @@ export class MatchUnit {
       metalness: 0.05,
       transparent: true,
       opacity: 1,
-      depthWrite: true,
+      // Bodies only render while focused; draw them over the (transparent,
+      // render-order-0) sandbox model so the see-through surface can't hide them.
+      depthTest: false,
+      depthWrite: false,
     });
     bodyMaterial.toneMapped = false;
     installSurfaceCorruptionMaterial(bodyMaterial, bodyCorruptionUniforms, 'vehicle-body');
     const body = new THREE.Mesh(this.shared.bodyGeo, bodyMaterial);
+    body.renderOrder = 4;
     group.add(body);
     this.root.add(group);
 
@@ -1262,6 +1420,16 @@ export class MatchUnit {
       : 0;
   }
 
+  /**
+   * Overview LOD: a robot body renders only while this unit is focused (the cheap
+   * instanced dots stand in otherwise). Buildings show their own model, falling
+   * back to the body only until that model has loaded.
+   */
+  private updateBodyVisibility(viz: VehicleViz): void {
+    const isBuilding = !!viz.lastV && !!buildingModelKind(viz.lastV);
+    viz.body.visible = isBuilding ? !viz.buildingModel : this.state === 'focused';
+  }
+
   private applyBuildingPlacement(viz: VehicleViz): void {
     if (!viz.buildingModel) return;
     const offset = viz.buildingModel.worldOffset;
@@ -1291,7 +1459,7 @@ export class MatchUnit {
 
   private applyVehicle(viz: VehicleViz, v: VehicleState): void {
     ueToThree(v.pos, viz.tgtPos);
-    if (buildingModelKind(v)) this.snapBuildingToSurface(viz.tgtPos);
+    if (buildingModelKind(v)) this.snapBuildingToSurface(viz, viz.tgtPos);
     if (typeof v.yaw === 'number') {
       const a = THREE.MathUtils.degToRad(v.yaw);
       // Heading as a direction in three-space, then the same orientation
@@ -1319,10 +1487,11 @@ export class MatchUnit {
       viz.lastTeam = v.team;
       this.applyProjectionStyle(viz);
     }
-    this.queueProjectileShot(viz, v);
+    if (this.state === 'focused') this.queueProjectileShot(viz, v);
     viz.lastV = v;
     this.applyBodyStyle(viz);
     this.syncBuildingModel(viz, v);
+    this.updateBodyVisibility(viz);
     if (this.state === 'focused') {
       this.ensurePanel(viz);
       this.updatePanel(viz, v);
@@ -1939,8 +2108,28 @@ export class MatchUnit {
     };
   }
 
-  private snapBuildingToSurface(pos: THREE.Vector3): void {
-    if (this.projectToSurface(pos.x, pos.z, this.tmpHitLocal)) pos.y = this.tmpHitLocal.y;
+  private snapBuildingToSurface(viz: VehicleViz, pos: THREE.Vector3): void {
+    // Bases/outposts are static, but the snapshot re-delivers their XZ every tick.
+    // The ground raycast is against the un-BVH'd merged sandbox model (linear in
+    // triangle count) and was running for every building on every snapshot — a
+    // dominant per-snapshot cost with many active boards. Cache the result and only
+    // re-raycast when the building's XZ actually moves. Reuses the projection-surface
+    // cache fields (unused for buildings — they have no drop-line), so a sandbox
+    // calibration or model load, which call invalidateProjectionSurfaces(), correctly
+    // force a re-snap.
+    const dx = pos.x - viz.projectionSurfaceX;
+    const dz = pos.z - viz.projectionSurfaceZ;
+    if (viz.projectionSurfaceValid && dx * dx + dz * dz < PROJECTION_SURFACE_MOVE_EPS_SQ) {
+      pos.y = viz.projectionSurfaceY;
+      return;
+    }
+    if (this.projectToSurface(pos.x, pos.z, this.tmpHitLocal)) {
+      viz.projectionSurfaceX = pos.x;
+      viz.projectionSurfaceZ = pos.z;
+      viz.projectionSurfaceY = this.tmpHitLocal.y;
+      viz.projectionSurfaceValid = true;
+      pos.y = this.tmpHitLocal.y;
+    }
   }
 
   private ensurePanel(viz: VehicleViz): void {
@@ -2137,19 +2326,20 @@ export class MatchUnit {
     const buffs = (v.buffs ?? []).join(',');
     if (buffs !== p.last.buffs) {
       const set = new Set(v.buffs ?? []);
-      let enhancedModeKey: BuffKey | null = null;
-      if (set.has('sentry-enhanced')) {
-        for (const [marker, key] of Object.entries(SENTRY_MODE_MARKERS)) {
-          if (set.has(marker)) {
-            enhancedModeKey = key;
-            break;
-          }
+      // Enhanced mode glows ONLY the sentry's own gain pip, tagged `enh:<key>` by
+      // the store — not every active buff.
+      let enhancedKey: string | null = null;
+      for (const b of set) {
+        if (b.startsWith('enh:')) {
+          enhancedKey = b.slice(4);
+          break;
         }
       }
       for (const key of BUFF_ORDER) {
         const pip = p.buffPips[key];
-        pip.hidden = !set.has(key);
-        pip.classList.toggle('enhanced', enhancedModeKey === key);
+        const shown = set.has(key);
+        pip.hidden = !shown;
+        pip.classList.toggle('enhanced', shown && key === enhancedKey);
       }
       p.last.buffs = buffs;
     }
@@ -2172,3 +2362,6 @@ export class MatchUnit {
     }
   }
 }
+
+
+

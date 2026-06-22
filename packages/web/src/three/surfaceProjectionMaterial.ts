@@ -79,32 +79,39 @@ varying vec3 gsmProjectionRootPosition;`
       .replace(
         '#include <dithering_fragment>',
         `
-vec3 gsmProjectionBestColor = vec3(0.0);
-float gsmProjectionBestAlpha = 0.0;
-vec3 gsmProjectionDx = dFdx(gsmProjectionRootPosition);
-vec3 gsmProjectionDy = dFdy(gsmProjectionRootPosition);
-vec3 gsmProjectionFaceNormal = cross(gsmProjectionDx, gsmProjectionDy);
-float gsmProjectionUp = abs(gsmProjectionFaceNormal.y / max(length(gsmProjectionFaceNormal), 0.0001));
-float gsmProjectionSurfaceMask = smoothstep(0.025, 0.08, gsmProjectionUp);
-for (int gsmProjectionIndex = 0; gsmProjectionIndex < GSM_MAX_SURFACE_PROJECTIONS; gsmProjectionIndex++) {
-  float gsmProjectionEnabled = 1.0 - step(float(gsmProjectionCount), float(gsmProjectionIndex));
-  vec4 gsmRing = gsmProjectionRing[gsmProjectionIndex];
-  float gsmDistance = length(gsmProjectionRootPosition.xz - gsmRing.xy);
-  float gsmEdge = max(fwidth(gsmDistance) * 1.5, 0.008);
-  float gsmRingMask =
-    smoothstep(gsmRing.z - gsmEdge, gsmRing.z + gsmEdge, gsmDistance) *
-    (1.0 - smoothstep(gsmRing.w - gsmEdge, gsmRing.w + gsmEdge, gsmDistance)) *
-    gsmProjectionSurfaceMask *
-    gsmProjectionEnabled;
-  float gsmAlpha = gsmRingMask * gsmProjectionOpacity;
-  if (gsmAlpha > gsmProjectionBestAlpha) {
-    gsmProjectionBestAlpha = gsmAlpha;
-    gsmProjectionBestColor = gsmProjectionColor[gsmProjectionIndex];
+// All work here is gated on a uniform count, so a board with no active
+// projections (overview, dimmed, or any non-focused board — count stays 0)
+// pays only one uniform branch instead of a full 32-iteration per-fragment
+// loop. This matters most in focus, where the (transparent, overdrawn) sandbox
+// model fills the viewport. Because the loop bound is a uniform, control flow
+// stays uniform across the quad and the in-loop fwidth derivatives are valid.
+if (gsmProjectionCount > 0) {
+  vec3 gsmProjectionBestColor = vec3(0.0);
+  float gsmProjectionBestAlpha = 0.0;
+  vec3 gsmProjectionDx = dFdx(gsmProjectionRootPosition);
+  vec3 gsmProjectionDy = dFdy(gsmProjectionRootPosition);
+  vec3 gsmProjectionFaceNormal = cross(gsmProjectionDx, gsmProjectionDy);
+  float gsmProjectionUp = abs(gsmProjectionFaceNormal.y / max(length(gsmProjectionFaceNormal), 0.0001));
+  float gsmProjectionSurfaceMask = smoothstep(0.025, 0.08, gsmProjectionUp);
+  for (int gsmProjectionIndex = 0; gsmProjectionIndex < GSM_MAX_SURFACE_PROJECTIONS; gsmProjectionIndex++) {
+    if (gsmProjectionIndex >= gsmProjectionCount) break;
+    vec4 gsmRing = gsmProjectionRing[gsmProjectionIndex];
+    float gsmDistance = length(gsmProjectionRootPosition.xz - gsmRing.xy);
+    float gsmEdge = max(fwidth(gsmDistance) * 1.5, 0.008);
+    float gsmRingMask =
+      smoothstep(gsmRing.z - gsmEdge, gsmRing.z + gsmEdge, gsmDistance) *
+      (1.0 - smoothstep(gsmRing.w - gsmEdge, gsmRing.w + gsmEdge, gsmDistance)) *
+      gsmProjectionSurfaceMask;
+    float gsmAlpha = gsmRingMask * gsmProjectionOpacity;
+    if (gsmAlpha > gsmProjectionBestAlpha) {
+      gsmProjectionBestAlpha = gsmAlpha;
+      gsmProjectionBestColor = gsmProjectionColor[gsmProjectionIndex];
+    }
   }
-}
-if (gsmProjectionBestAlpha > 0.0) {
-  gl_FragColor.rgb = mix(gl_FragColor.rgb, gsmProjectionBestColor, min(gsmProjectionBestAlpha, 0.86));
-  gl_FragColor.rgb += gsmProjectionBestColor * gsmProjectionBestAlpha * 0.24;
+  if (gsmProjectionBestAlpha > 0.0) {
+    gl_FragColor.rgb = mix(gl_FragColor.rgb, gsmProjectionBestColor, min(gsmProjectionBestAlpha, 0.86));
+    gl_FragColor.rgb += gsmProjectionBestColor * gsmProjectionBestAlpha * 0.24;
+  }
 }
 #include <dithering_fragment>`
       );
