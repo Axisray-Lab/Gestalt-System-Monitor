@@ -67,10 +67,15 @@ export interface AgentLauncherStatusMessage {
   status: LauncherStatus;
 }
 
+import type { HeadlessMatchConfig } from './team';
+
 export interface LaunchHeadlessRequest {
   count?: number;
   installId?: string;
   force?: boolean;
+  /** Optional custom-match roster. When set, the agent launches one match with
+   *  this config (the roster is passed as an autostart parameter). */
+  match?: HeadlessMatchConfig;
 }
 
 export interface LaunchHeadlessResponse {
