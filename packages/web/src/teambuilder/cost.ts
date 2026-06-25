@@ -6,7 +6,7 @@
  * (命中率) cost is Monte-Carlo-derived (velocity jitter dominates for slow 42mm,
  * so a geometric formula is not reliable) — encoded here as GUN_HIT_COST data.
  */
-import { CareerId, type RosterSlotConfig, type SlotTuning, type TeamConfig } from './team';
+import { CareerId, type RosterSlotConfig, type SlotTuning, type TeamConfig } from '@gsm/protocol';
 
 export type BuildTier = 0 | 5;
 
@@ -129,5 +129,5 @@ export const estimateGunHitCost = (maxEnclosingCm: number, bulletRadiusCm: numbe
   return Math.max(0, round2((r100m - 3) / 2));
 };
 
-/** Self-check anchors: a default RMUC2026 roster ≈ ranged 79.0 / melee 86.7. */
+/** Self-check anchors: an example RMUC2026 roster ≈ ranged 79.0 / melee 86.7. */
 export const RMUC2026_SAMPLE = { rangedTeamCost: 79.0, meleeTeamCost: 86.7 } as const;

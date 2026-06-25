@@ -4,7 +4,7 @@
  * any value comes from ./cost COST.*.
  */
 import { CONSTRUCT_DEFAULTS } from './cost';
-import type { SlotTuning } from './team';
+import type { SlotTuning } from '@gsm/protocol';
 
 export type TuningKey = 'discharge' | 'ammo17' | 'ammo42' | 'fireRateHz' | 'spreadMax' | 'spreadMin' | 'speedSpread';
 

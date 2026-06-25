@@ -2,8 +2,12 @@
  * Team-builder wire contract — the custom-match roster the SPA authors and the
  * agent launches (carried as an autostart parameter to a headless match).
  *
- * This is the player-observable launch interface. R&D 费 (cost) is a monitor-side
- * visualization metric (see ./cost) and is never read by the game.
+ * TARGET CONTRACT: defined for the SPA to build against. The agent does not yet
+ * forward LaunchHeadlessRequest.match into an autostart parameter, and the game's
+ * -roster parse is pending (game-side support, tracked separately).
+ *
+ * R&D 费 (cost) is a monitor-side visualization metric (computed in the SPA) and is
+ * never part of this payload / never read by the game.
  */
 
 /** Career id = the Class attribute value; fixed by the slot (read-only in the UI). */
@@ -38,13 +42,13 @@ export interface RosterSlotConfig {
   careerId: number; // fixed by the slot; echo-only
   entityType: number; // chosen construct id
   tuning?: SlotTuning; // sparse overrides; unset axes use the construct default
-  slotCost?: number; // UI-side only (computed by ./cost); not sent to the game
+  // SEAM: AI strategy (move/target/fire modes) is added here by the Coach /
+  // Unit-Strategy agent. Unset → the game uses its built-in per-team default.
 }
 
 export interface TeamConfig {
   teamId: number; // 0 / 1
   slots: RosterSlotConfig[];
-  teamCost?: number; // UI-side only
 }
 
 export interface HeadlessMatchConfig {

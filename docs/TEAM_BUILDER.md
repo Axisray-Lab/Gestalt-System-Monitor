@@ -1,73 +1,77 @@
-# Team Builder — custom-match roster (wire contract)
+# Team Builder — custom-match roster
 
 Lets the SPA author a custom AI-vs-AI match (per-team roster + per-slot construct
-and settings) and launch it through the agent. This doc covers only the
-**player-observable launch interface**; cost/scoring and any game-internal balance
-are **supplied at runtime** (see "Cost & scoring" below) and are not part of this
-repo.
+and settings) and launch it through the agent.
 
-> Status: contract scaffold. Types live in `packages/protocol/src/team.ts`. The
-> SPA can build the UI against them now (style-first); the launch wiring and the
-> runtime cost config land alongside the game-side support.
+- **Wire contract** (the launch payload) lives in `packages/protocol/src/team.ts`.
+- **Domain + UI logic** (catalog, R&D 费 cost, 赛制 templates, slider specs, state)
+  lives in `packages/web/src/teambuilder/` — it is monitor-side only and never
+  crosses the wire / is never read by the game.
+
+> Status: scaffold. The SPA can build the UI against it now (style-first). The
+> launch wiring is a TARGET CONTRACT — the agent does not yet forward
+> `LaunchHeadlessRequest.match`, and the game's `-roster` parse is pending
+> (game-side support, tracked separately).
 
 ## Flow
 
 ```
-[web : TeamBuilder view]
-  pick map → pick slot (career fixed by slot) → pick construct → tune settings
-  show team cost (from runtime cost config; UI-side only)  → "Launch with this team"
-        │ HeadlessMatchConfig
+[web : TeamBuilder view (useTeamBuilder)]
+  pick 赛制 → pick slot (career fixed) → pick construct → tune → live 费
+        │ HeadlessMatchConfig                                   → "Launch with this team"
         ▼  POST /launch  { match }
-[agent : LaunchManager]
-  writes the roster to a temp file and launches one headless match using the
-  CONFIGURED launch arg shape (the same configurable mechanism as `--headless-args`;
-  no game-specific flag names are baked into this repo)
+[agent : LaunchManager]   (TARGET) writes the roster to a temp file and launches one
+  headless match via the CONFIGURED launch arg shape (same mechanism as
+  --headless-args; no game-specific flag names baked into this public repo)
         ▼
 [match] advertises the LAN beacon → the SPA auto-discovers and spectates it
-        (same attribute stream as any other watched match)
 ```
 
-## Types (`@gsm/protocol`)
+## Wire contract (`packages/protocol/src/team.ts`)
 
-- `RosterSlotConfig` — one slot: `teamNumber`, fixed `careerId`, chosen `entityType`
-  (construct), and a sparse `tuning: SlotTuning` (any unset axis = the construct
-  default).
+- `RosterSlotConfig` — one slot: `teamNumber`, fixed `careerId`, chosen `entityType`,
+  and a sparse `tuning: SlotTuning` (any unset axis = the construct default). Carries
+  a SEAM comment where the **Coach / Unit-Strategy agent** adds AI move/target/fire
+  modes.
 - `SlotTuning` — the research surface: `discharge / ammo17 / ammo42 / fireRateHz /
   spreadMax / spreadMin / speedSpread`, plus structured `dart / engineer / radar`.
-- `TeamConfig` — `{ teamId, slots }`; `HeadlessMatchConfig` — `{ mapId, nettype,
-  teams[], aiFill, attrrecord? }`.
-- `LaunchHeadlessRequest.match?` — carries a `HeadlessMatchConfig`; the roster
-  crosses the wire as an autostart parameter (a temp-file path), so it is not
-  size-limited by OS command-line limits.
+- `TeamConfig` `{ teamId, slots }`; `HeadlessMatchConfig` `{ mapId, nettype, teams[],
+  aiFill, attrrecord? }`; `LaunchHeadlessRequest.match?`.
 
-### Data the UI drives from
+## Domain + UI (`packages/web/src/teambuilder/`)
 
 - **`roster.ts`** — `RuleSet`, `RULESETS[ruleSet]` (slot layout per 赛制),
-  `buildDefaultRoster(ruleSet, teamId)`, and `CAREER_RULES` (read-only HP / 底盘功率 /
-  热容 / 散热 / 电容 for the info panel).
-- **`cost.ts`** — `ENTITY_CATALOG`, `constructsForCareer(careerId)`,
-  `CONSTRUCT_DEFAULTS`, `computeSlotCost` / `computeTeamCost`.
-- **`params.ts`** — `TUNABLE_PARAMS` + `paramsForConstruct(entityType)` (slider
-  specs), `defaultsForConstruct`, `hasDart/hasEngineer/hasRadar`, and the option
-  sets `ENGINEER_ASSEMBLY_LEVELS / ENGINEER_CORE_POOLS / DART_BASE_MODES /
+  `CAREER_RULES` (read-only HP/底盘功率/热容/散热/电容 panel), and the **example**
+  lineups: `buildExampleRoster(ruleSet, teamId)`, `exampleMatch(ruleSet)`,
+  `EXAMPLE_LABEL`. These are *editable starting templates the player copies* — NOT
+  the game's immutable internal default roster; hence the `example*` naming.
+- **`cost.ts`** — `ENTITY_CATALOG`, `constructsForCareer`, `CONSTRUCT_DEFAULTS`,
+  `computeSlotCost` / `computeTeamCost`, `RMUC2026_SAMPLE` (ranged 79.0 / melee 86.7).
+- **`params.ts`** — `TUNABLE_PARAMS` + `paramsForConstruct` (slider specs),
+  `defaultsForConstruct`, `hasDart/hasEngineer/hasRadar`, and the option sets
+  `ENGINEER_ASSEMBLY_LEVELS / ENGINEER_CORE_POOLS / DART_BASE_MODES /
   RADAR_DETECTION_MODES`.
-
-## Cost & scoring
-
-R&D「费」(cost) is a **monitor-side visualization metric only** — it compares the
-two teams' build strength and is **never sent into / read by the game**. The model
-lives in `packages/protocol/src/cost.ts`: `ENTITY_CATALOG` (career → constructs),
-the per-axis `COST` formulas, `computeSlotCost` / `computeTeamCost`, and self-check
-anchors (`RMUC2026_SAMPLE`). Raw 费 are summed directly (no 0-100 scale).
+- **`useTeamBuilder.ts`** — the state composable: holds two editable teams seeded
+  from the example lineup, `setConstruct` / `setTuning` / `loadExample`, and live
+  `teamCosts` / `costDelta`.
 
 ## Building the UI style-first
 
-1. Pick a `RuleSet` → `RULESETS[ruleSet].slots` lays out the team; seed each team
-   with `buildDefaultRoster(ruleSet, teamId)`.
-2. Per slot: `constructsForCareer(slot.careerId)` fills the construct dropdown;
-   `paramsForConstruct(entityType)` gives the sliders, `defaultsForConstruct` seeds
-   them, and `hasDart/hasEngineer/hasRadar` gate the structured controls.
-3. `computeSlotCost(slot)` / `computeTeamCost(team)` drive the cost badges +
-   side-by-side compare; `CAREER_RULES[careerId]` fills the read-only stat panel.
-4. `RMUC2026_SAMPLE` (ranged 79.0 / melee 86.7) is the calibration reference — a
-   default RMUC2026 roster should reproduce it.
+```ts
+import { useTeamBuilder } from '@/teambuilder/useTeamBuilder';
+import { constructsForCareer } from '@/teambuilder/cost';
+import { paramsForConstruct, hasDart, DART_BASE_MODES } from '@/teambuilder/params';
+import { RuleSet, EXAMPLE_LABEL, CAREER_RULES } from '@/teambuilder/roster';
+
+const tb = useTeamBuilder(RuleSet.RMUC2026); // tb.match seeded from the example lineup
+```
+
+1. `tb.match.teams` lays out red/blue; each `slot.careerId` is fixed.
+2. Per slot: `constructsForCareer(slot.careerId)` → construct dropdown (`tb.setConstruct`);
+   `paramsForConstruct(slot.entityType)` → sliders (`tb.setTuning`); `hasDart/…` gate the
+   structured controls; `CAREER_RULES[slot.careerId]` → read-only stat panel.
+3. `tb.teamCosts` / `tb.costDelta` drive the cost badges + side-by-side compare.
+4. `RMUC2026_SAMPLE` is the calibration reference — the example RMUC2026 lineup
+   reproduces it (red 79.0 / blue 86.7).
+
+R&D「费」is display-only and never sent into / read by the game.
