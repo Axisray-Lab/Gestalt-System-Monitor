@@ -21,6 +21,7 @@ const CLASS_ID = {
   Infantry: 1003,
   Sentry: 1004,
   Aerial: 1005,
+  Dart: 1007,
   Base: 2001,
   Outpost: 2002,
   Building: 2000,
@@ -147,6 +148,32 @@ const RED_CENTER_PATH: Vec3[] = [
 ];
 
 const ROBOTS: ReplayRobot[] = [
+  {
+    mapId: 3008,
+    pid: -1,
+    team: 0,
+    teamNumber: 9,
+    classId: CLASS_ID.Dart,
+    level: 1,
+    hpMax: 180,
+    ammoMax: 4,
+    heatMax: 100,
+    phase: 0.05,
+    path: [{ x: 330, y: -1290, z: 2 }],
+  },
+  {
+    mapId: 3018,
+    pid: -1,
+    team: 1,
+    teamNumber: 9,
+    classId: CLASS_ID.Dart,
+    level: 1,
+    hpMax: 180,
+    ammoMax: 4,
+    heatMax: 100,
+    phase: 0.55,
+    path: [{ x: -320, y: 1370, z: 2 }],
+  },
   {
     mapId: 3001,
     pid: 1,
@@ -321,17 +348,24 @@ function robotAttributes(r: ReplayRobot, replayT: number): Record<string, number
   const turretPitch = -5 - wave01(u * 2.6, r.phase) * 4;
   const damage = 0.1 + wave01(u, r.team * 0.17 + r.teamNumber * 0.09) * 0.36;
   const heat = Math.round((0.08 + wave01(u * 3.2, r.phase) * 0.88) * r.heatMax);
-  const ammo = Math.max(0, r.ammoMax - Math.floor(((u + r.phase) % 1) * r.ammoMax * 0.82));
+  const dartCycle = ((replayT + r.phase * REPLAY_SECONDS) % 34) / 34;
+  const ammo =
+    r.classId === CLASS_ID.Dart
+      ? Math.max(0, r.ammoMax - Math.floor(dartCycle * r.ammoMax))
+      : Math.max(0, r.ammoMax - Math.floor(((u + r.phase) % 1) * r.ammoMax * 0.82));
   const ammo42 =
     r.classId === CLASS_ID.Hero
       ? Math.max(0, 8 - Math.floor(((u * 0.34 + r.phase * 0.23) % 1) * 6))
       : 0;
   const deploymentMode =
     r.classId === CLASS_ID.Hero && activeWindow(u + r.phase * 0.3, 0.58, 0.22);
+  // Sentry modes: 1=Defense, 2=Cooling, 3=Movement. There is NO attack mode — the
+  // damage slot is an always-on base. Each mode drives exactly one gain slot
+  // positive (def / cool / power), mirroring real recordings; enhanced amplifies it.
   const sentryMode =
     r.classId === CLASS_ID.Sentry ? (Math.floor(u * 3) % 3) + 1 : undefined;
   const sentryEnhanced =
-    sentryMode != null && activeWindow(u, 0.14, 0.34) ? sentryMode * 100 : 0;
+    sentryMode != null && activeWindow(u, 0.14, 0.34) ? 1 : 0;
 
   return {
     [AttrId.PlayerID]: r.pid,
@@ -360,14 +394,32 @@ function robotAttributes(r: ReplayRobot, replayT: number): Record<string, number
     [AttrId.PowerMultiplierThou]: activeWindow(u, 0.36, 0.12) && r.team === 1 ? 1200 : 0,
     [AttrId.ColdMultiplierThou]: activeWindow(u, 0.76, 0.1) ? 1300 : 0,
     [AttrId.Weakened]: activeWindow(u, 0.52, 0.08) && r.teamNumber === 3 ? 1 : 0,
-    [AttrId.DartInterferenceEffectTrigger]: activeWindow(u, 0.82, 0.06) && r.teamNumber === 7 ? 1 : 0,
+    [AttrId.Blocked]: activeWindow(u, 0.82, 0.06) && r.teamNumber === 7 ? 1 : 0,
+    ...(r.classId === CLASS_ID.Dart
+      ? {
+          [AttrId.RealDartAmmoCount]: ammo,
+          [AttrId.AmmoDartCount]: ammo,
+          [AttrId.DartRemainingShots]: ammo,
+        }
+      : {}),
+    // 易伤 debuff (damage taken), independent of attack — fires on its own.
+    [AttrId.DamageMultiplierThou]: activeWindow(u, 0.48, 0.1) && r.teamNumber === 4 ? 1000 : 0,
     ...(r.classId === CLASS_ID.Hero
       ? { [AttrId.IsInDeploymentMode]: deploymentMode ? 1 : 0 }
       : {}),
     ...(sentryMode != null
       ? {
           [AttrId.SentryMode]: sentryMode,
-          [AttrId.SentryEnhanced]: sentryEnhanced,
+          [AttrId.SentryModeEnhanced]: sentryEnhanced,
+          // Damage slot = always-on ~250 base, NEVER a mode gain.
+          [AttrId.SentryDamageMultiplierThou]: 250,
+          // Defense mode: small positive defense gain (enhanced ≈990, else 500).
+          [AttrId.SentryDefenseMultiplierThou]: sentryMode === 1 ? (sentryEnhanced ? 990 : 500) : 0,
+          // Cooling mode: large cooling gain (enhanced amplifies hugely).
+          [AttrId.SentryColdMultiplierThou]: sentryMode === 2 ? (sentryEnhanced ? 1_000_000 : 2000) : 0,
+          // Movement mode: the power coefficient goes POSITIVE (it is negative — a
+          // debuff — in the other two modes); that positive value is the move gain.
+          [AttrId.SentryPowerCoefficientThou]: sentryMode === 3 ? (sentryEnhanced ? 5000 : 500) : -500,
         }
       : {}),
   } as Record<string, number>;
@@ -384,6 +436,10 @@ function structureAttributes(s: ReplayStructure, replayT: number): Record<string
   const healthRatio = s.hpMax > 0 ? hp / s.hpMax : 1;
   const deployed =
     s.kind === 'base' ? wave01(replayT / 9, (s.team ?? 0) * 0.31) > 0.68 : false;
+  const dartHits =
+    s.kind === 'base' && s.team != null
+      ? Math.floor(((replayT + (s.team === 0 ? 17 : 0)) % 136) / 34)
+      : undefined;
   return {
     [AttrId.Class]:
       s.kind === 'base'
@@ -394,7 +450,7 @@ function structureAttributes(s: ReplayStructure, replayT: number): Record<string
     ...(s.team != null ? { [AttrId.TeamID]: s.team } : {}),
     [AttrId.Health]: hp,
     [AttrId.HealthMax]: s.hpMax,
-    [AttrId.HealthRatio]: healthRatio,
+    [AttrId.HP_Progress]: healthRatio,
     [AttrId.WorldPosX]: s.pos.x,
     [AttrId.WorldPosY]: s.pos.y,
     [AttrId.WorldPosZ]: s.pos.z,
@@ -402,8 +458,9 @@ function structureAttributes(s: ReplayStructure, replayT: number): Record<string
     ...(s.kind === 'base' && s.team != null
       ? {
           [AttrId.TM_Coins]: Math.round(200 + pulse * 160 + s.team * 40),
+          [AttrId.TM_BaseDamageCount]: dartHits ?? 0,
           [AttrId.TM_OutPostRebuildCount]: 0,
-          [AttrId.BaseDeployed]: deployed ? 1 : 0,
+          [AttrId.BC_State]: deployed ? 1 : 0, // base 展开/deploy state
         }
       : {}),
     ...(s.kind === 'outpost'
@@ -452,37 +509,57 @@ function replayFrame(replayT: number): WatchAttributeMapsResult {
   };
 }
 
-function recordedDartTargetIds(replay: RecordedReplay): number[] {
-  const outposts = new Set<number>();
+function recordedDartTargetIds(replay: RecordedReplay): { bases: number[]; robots: number[] } {
   const bases = new Set<number>();
+  const robots = new Set<number>();
   for (const frame of replay.frames) {
     for (const entry of frame.result.watch_attribute_maps_results) {
       const classId = entry.attributes?.[AttrId.Class];
-      if (classId === CLASS_ID.Outpost) outposts.add(entry.attribute_map_id);
-      else if (classId === CLASS_ID.Base) bases.add(entry.attribute_map_id);
+      if (classId === CLASS_ID.Base) bases.add(entry.attribute_map_id);
+      else if (classId !== CLASS_ID.Dart && entry.attributes?.[AttrId.Blocked] != null) {
+        robots.add(entry.attribute_map_id);
+      }
     }
-    if (outposts.size >= 2) break;
+    if (bases.size >= 2 && robots.size >= 2) break;
   }
-  const targets = outposts.size > 0 ? [...outposts] : [...bases];
-  return targets.length > 0 ? targets : RECORDED_DART_FALLBACK_TARGET_IDS;
+  return {
+    bases: bases.size > 0 ? [...bases] : RECORDED_DART_FALLBACK_TARGET_IDS,
+    robots: [...robots],
+  };
 }
 
-function recordedDartOverlay(replayTMs: number, targetIds: number[]): WatchAttributeMapsResult {
-  if (targetIds.length === 0) {
+function recordedDartOverlay(
+  replayTMs: number,
+  targets: { bases: number[]; robots: number[] }
+): WatchAttributeMapsResult {
+  if (targets.bases.length === 0 && targets.robots.length === 0) {
     return { cycle_event_type: 0, watch_attribute_maps_results: [] };
   }
   const cycleMs = 34_000;
   const phase = replayTMs % cycleMs;
-  const active = phase >= 18_000 && phase < 19_250;
-  const target = targetIds[Math.floor(replayTMs / cycleMs) % targetIds.length];
+  const cycle = Math.floor(replayTMs / cycleMs);
+  const hitApplied = phase >= 18_000;
+  const active = hitApplied && phase < 19_250;
+  const baseCount = Math.max(1, targets.bases.length);
+  const baseIndex = cycle % baseCount;
+  const robotTarget = targets.robots[cycle % Math.max(1, targets.robots.length)];
   return {
     cycle_event_type: 0,
     watch_attribute_maps_results: [
-      ...targetIds.map((id) => ({
+      ...targets.bases.map((id, i) => ({
         sync_type: 1,
         attribute_map_id: id,
         attributes: {
-          [AttrId.DartInterferenceEffectTrigger]: active && id === target ? 1 : 0,
+          [AttrId.TM_BaseDamageCount]:
+            Math.floor((cycle + baseCount - 1 - i) / baseCount) +
+            (hitApplied && i === baseIndex ? 1 : 0),
+        } as Record<string, number>,
+      })),
+      ...targets.robots.map((id) => ({
+        sync_type: 1,
+        attribute_map_id: id,
+        attributes: {
+          [AttrId.Blocked]: active && id === robotTarget ? 1 : 0,
         } as Record<string, number>,
       })),
     ],
@@ -527,7 +604,7 @@ export function createMockFeed(): FeedSource {
   let recordedReplay: RecordedReplay | null = null;
   let recordedReplayStartedAt = 0;
   let recordedReplayIndex = 0;
-  let recordedDartTargets: number[] = [];
+  let recordedDartTargets: { bases: number[]; robots: number[] } = { bases: [], robots: [] };
   let lastRecordedReplayT = 0;
   let startToken = 0;
   let mapCb: ((m: MapWireframe) => void) | null = null;
@@ -586,6 +663,7 @@ export function createMockFeed(): FeedSource {
     onMap: (cb) => (mapCb = cb),
     onSnapshot: (cb) => (snapCb = cb),
     onStatus: (cb) => (statusCb = cb),
+    setActive: () => {}, // the mock is lightweight and not visibility-gated
     start: () => {
       if (timer != null) return;
       const token = ++startToken;
@@ -595,7 +673,7 @@ export function createMockFeed(): FeedSource {
         store = new AttributeStore();
         frame = 0;
         recordedReplay = replay;
-        recordedDartTargets = replay ? recordedDartTargetIds(replay) : [];
+        recordedDartTargets = replay ? recordedDartTargetIds(replay) : { bases: [], robots: [] };
         recordedReplayStartedAt = performance.now();
         recordedReplayIndex = 0;
         lastRecordedReplayT = 0;
@@ -609,7 +687,7 @@ export function createMockFeed(): FeedSource {
         timer = null;
       }
       recordedReplay = null;
-      recordedDartTargets = [];
+      recordedDartTargets = { bases: [], robots: [] };
       statusCb?.('closed');
     },
   };

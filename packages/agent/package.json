@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "mock": "tsx src/index.ts --mock",
     "scenario": "tsx src/index.ts --scenario",
+    "replay": "tsx src/index.ts --trace",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

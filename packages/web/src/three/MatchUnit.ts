@@ -147,16 +147,18 @@ const HERO_LOB_MIN_DAMAGE = 150;
 const ARC_TRAIL_SAMPLES = 10;
 const HERO_LOB_MIN_TRAVEL_MS = 900;
 const HERO_LOB_MAX_TRAVEL_MS = 1450;
-const DART_MIN_TRAVEL_MS = 1200;
-const DART_MAX_TRAVEL_MS = 1900;
+const DART_MIN_TRAVEL_MS = 650;
+const DART_MAX_TRAVEL_MS = 2800;
 const HERO_LOB_SPEED = 12;
-const DART_SPEED = 17;
+const DART_SPEED = 19;
+const DART_GRAVITY = 9.81;
 const HERO_LOB_ARC_MIN = 2.4;
-const DART_ARC_MIN = 4.2;
+const DART_ARC_MIN = 0.45;
+const DART_ARC_MAX = 2.8;
 const EXPLOSION_SMALL_TTL_MS = 620;
 const EXPLOSION_LARGE_TTL_MS = 900;
 const CLASS_HERO = 1001;
-const CLASS_AERIAL = 1005;
+const CLASS_DART = 1007;
 /**
  * Exponential-smoothing rate (1/sec) used to interpolate vehicle transforms
  * toward the latest snapshot every frame. `alpha = 1 - exp(-SMOOTH*dt)` is
@@ -453,6 +455,10 @@ function buildingDestroyed(v: VehicleState | null): boolean {
 
 function robotDestroyed(v: VehicleState | null): boolean {
   return !!v && !buildingModelKind(v) && vehicleDefeated(v);
+}
+
+function hiddenDartSource(v: VehicleState | null): boolean {
+  return v?.classId === CLASS_DART;
 }
 
 function buildingDeployed(v: VehicleState | null): boolean | undefined {
@@ -824,7 +830,7 @@ export class MatchUnit {
     const focused = this.state === 'focused';
     const seen = new Set<number>();
     const damagedThisFrame: DamageTarget[] = [];
-    const dartBlindStarts: VehicleState[] = [];
+    const dartHitTargets: VehicleState[] = [];
     for (const v of snap.vehicles) {
       seen.add(v.id);
       let viz = this.vehicles.get(v.id);
@@ -838,14 +844,12 @@ export class MatchUnit {
         if (damage > 0) {
           damagedThisFrame.push({ id: v.id, viz, vehicle: v, amount: damage, seenAt: now });
         }
-        if (prev && !this.hasBuff(prev, 'blind') && this.hasBuff(v, 'blind')) {
-          dartBlindStarts.push(v);
-        }
+        if (prev && this.dartHitCountDelta(prev, v) > 0) dartHitTargets.push(v);
       }
       viz.lastSeen = now;
     }
     if (focused) {
-      for (const target of dartBlindStarts) this.spawnDartStrikeForTarget(target, snap.vehicles, now);
+      for (const target of dartHitTargets) this.spawnDartImpactForTarget(target, snap.vehicles, now);
       this.addRecentDamageTargets(damagedThisFrame, now);
       this.resolvePendingShots(now);
     }
@@ -959,7 +963,8 @@ export class MatchUnit {
       if (this.state === 'focused' && viz.panel && viz.lastV && vehicleDefeated(viz.lastV)) {
         this.updatePanel(viz, viz.lastV, now);
       }
-      const showUnitProjection = showProjection && !(viz.lastV && buildingModelKind(viz.lastV));
+      const showUnitProjection =
+        showProjection && !(viz.lastV && (buildingModelKind(viz.lastV) || hiddenDartSource(viz.lastV)));
       if (showUnitProjection) {
         if (
           this.updateProjection(viz, now) &&
@@ -984,6 +989,7 @@ export class MatchUnit {
       for (const viz of this.vehicles.values()) {
         if (!viz.placed || now - viz.lastSeen > STALE_MS) continue;
         if (viz.lastV && buildingModelKind(viz.lastV)) continue;
+        if (hiddenDartSource(viz.lastV)) continue;
         if (ci >= 200) break;
         d.position.copy(viz.curPos);
         d.position.y += 0.55;
@@ -1033,7 +1039,7 @@ export class MatchUnit {
       this.applyBodyStyle(viz);
       this.applyBuildingStyle(viz);
       this.updateBodyVisibility(viz);
-      if (focused) {
+      if (focused && !hiddenDartSource(viz.lastV)) {
         this.ensurePanel(viz);
         if (viz.lastV) this.updatePanel(viz, viz.lastV);
       } else if (viz.label?.parent) {
@@ -1426,6 +1432,10 @@ export class MatchUnit {
    * back to the body only until that model has loaded.
    */
   private updateBodyVisibility(viz: VehicleViz): void {
+    if (hiddenDartSource(viz.lastV)) {
+      viz.body.visible = false;
+      return;
+    }
     const isBuilding = !!viz.lastV && !!buildingModelKind(viz.lastV);
     viz.body.visible = isBuilding ? !viz.buildingModel : this.state === 'focused';
   }
@@ -1492,9 +1502,11 @@ export class MatchUnit {
     this.applyBodyStyle(viz);
     this.syncBuildingModel(viz, v);
     this.updateBodyVisibility(viz);
-    if (this.state === 'focused') {
+    if (this.state === 'focused' && !hiddenDartSource(v)) {
       this.ensurePanel(viz);
       this.updatePanel(viz, v);
+    } else if (viz.label?.parent) {
+      viz.group.remove(viz.label);
     }
   }
 
@@ -1502,6 +1514,10 @@ export class MatchUnit {
     const prev = viz.lastV;
     if (!prev || prev.kind !== 'robot' || v.kind !== 'robot') return;
     if (vehicleDefeated(prev) || vehicleDefeated(v)) return;
+    if (prev.classId === CLASS_DART || v.classId === CLASS_DART) {
+      this.queueDartLaunch(viz, v);
+      return;
+    }
     const totalDrop =
       typeof prev.ammo === 'number' && typeof v.ammo === 'number' ? prev.ammo - v.ammo : 0;
     const ammo42Drop =
@@ -1534,6 +1550,38 @@ export class MatchUnit {
     viz.lastShotAt = now;
   }
 
+  private queueDartLaunch(viz: VehicleViz, v: VehicleState): void {
+    const prev = viz.lastV;
+    if (!prev || prev.classId !== CLASS_DART || v.classId !== CLASS_DART) return;
+    if (vehicleDefeated(prev) || vehicleDefeated(v)) return;
+    const drop =
+      typeof prev.dartAmmo === 'number' && typeof v.dartAmmo === 'number'
+        ? prev.dartAmmo - v.dartAmmo
+        : 0;
+    if (drop < 0.9 || drop > 4) return;
+
+    const now = performance.now();
+    if (now - viz.lastShotAt < DART_MIN_TRAVEL_MS * 0.45) return;
+
+    const target = this.findEnemyBaseTarget(v);
+    const fallbackEnd = target ? this.targetAimPoint(target, new THREE.Vector3()) : null;
+    const sourcePoint = viz.placed ? viz.group.position : viz.tgtPos;
+    const dir = fallbackEnd
+      ? fallbackEnd.clone().sub(sourcePoint).normalize()
+      : this.projectileDirection(v, new THREE.Vector3());
+    this.pendingShots.push({
+      viz,
+      vehicle: v,
+      start: this.projectileMuzzlePoint(viz, dir, new THREE.Vector3()),
+      dir: dir.clone(),
+      fallbackEnd: fallbackEnd?.clone(),
+      bornAt: now,
+      kind: 'dart',
+      explosionSize: 'none',
+    });
+    viz.lastShotAt = now;
+  }
+
   private spawnProjectile(shot: PendingShot, impact: ProjectileImpact | null, now: number): void {
     const heroDirect = shot.kind === 'direct' && shot.vehicle.classId === CLASS_HERO;
     const start = shot.start.clone();
@@ -1556,15 +1604,15 @@ export class MatchUnit {
         ? { point: end.clone(), normal: MatchUnit.UP.clone(), distance }
         : null);
     const trajectory = shot.kind === 'direct' ? 'line' : 'arc';
+    const arcProfile = trajectory === 'arc' ? this.arcProfile(shot.kind, start, end, distance) : null;
     const travelMs =
-      trajectory === 'arc'
-        ? this.arcTravelMs(shot.kind, start, end)
-        : THREE.MathUtils.clamp(
-            (distance / PROJECTILE_SPEED) * 1000,
-            PROJECTILE_MIN_TRAVEL_MS,
-            PROJECTILE_MAX_TRAVEL_MS
-          );
-    const arcHeight = trajectory === 'arc' ? this.arcHeight(shot.kind, distance) : 0;
+      arcProfile?.travelMs ??
+      THREE.MathUtils.clamp(
+        (distance / PROJECTILE_SPEED) * 1000,
+        PROJECTILE_MIN_TRAVEL_MS,
+        PROJECTILE_MAX_TRAVEL_MS
+      );
+    const arcHeight = arcProfile?.arcHeight ?? 0;
     const trailSamples = trajectory === 'arc' ? ARC_TRAIL_SAMPLES : 1;
     const trailOpacity = heroDirect ? HERO_DIRECT_TRAIL_OPACITY : PROJECTILE_TRAIL_OPACITY;
 
@@ -1677,26 +1725,73 @@ export class MatchUnit {
     return out;
   }
 
-  private arcTravelMs(kind: ShotKind, start: THREE.Vector3, end: THREE.Vector3): number {
+  private arcProfile(
+    kind: ShotKind,
+    start: THREE.Vector3,
+    end: THREE.Vector3,
+    distance: number
+  ): { travelMs: number; arcHeight: number } {
+    if (kind === 'dart') return this.dartArcProfile(start, end, distance);
     const horizontal = Math.hypot(end.x - start.x, end.z - start.z);
-    if (kind === 'dart') {
-      return THREE.MathUtils.clamp(
-        (horizontal / DART_SPEED) * 1000,
-        DART_MIN_TRAVEL_MS,
-        DART_MAX_TRAVEL_MS
-      );
-    }
-    return THREE.MathUtils.clamp(
-      (horizontal / HERO_LOB_SPEED) * 1000,
-      HERO_LOB_MIN_TRAVEL_MS,
-      HERO_LOB_MAX_TRAVEL_MS
-    );
+    return {
+      travelMs: THREE.MathUtils.clamp(
+        (horizontal / HERO_LOB_SPEED) * 1000,
+        HERO_LOB_MIN_TRAVEL_MS,
+        HERO_LOB_MAX_TRAVEL_MS
+      ),
+      arcHeight: Math.max(HERO_LOB_ARC_MIN, distance * 0.24),
+    };
   }
 
-  private arcHeight(kind: ShotKind, distance: number): number {
-    return kind === 'dart'
-      ? Math.max(DART_ARC_MIN, distance * 0.34)
-      : Math.max(HERO_LOB_ARC_MIN, distance * 0.24);
+  private dartArcProfile(
+    start: THREE.Vector3,
+    end: THREE.Vector3,
+    distance: number
+  ): { travelMs: number; arcHeight: number } {
+    const horizontal = Math.hypot(end.x - start.x, end.z - start.z);
+    if (horizontal < 0.001) {
+      return { travelMs: DART_MIN_TRAVEL_MS, arcHeight: DART_ARC_MIN };
+    }
+
+    const dy = end.y - start.y;
+    const speedSq = DART_SPEED * DART_SPEED;
+    const discriminant =
+      speedSq * speedSq -
+      DART_GRAVITY * (DART_GRAVITY * horizontal * horizontal + 2 * dy * speedSq);
+    if (discriminant >= 0) {
+      const launchAngle = Math.atan(
+        (speedSq - Math.sqrt(discriminant)) / (DART_GRAVITY * horizontal)
+      );
+      const cos = Math.cos(launchAngle);
+      if (cos > 0.001) {
+        const travelSec = horizontal / (DART_SPEED * cos);
+        const midT = travelSec * 0.5;
+        const midY =
+          start.y + DART_SPEED * Math.sin(launchAngle) * midT - 0.5 * DART_GRAVITY * midT * midT;
+        const linearMidY = (start.y + end.y) * 0.5;
+        return {
+          travelMs: THREE.MathUtils.clamp(
+            travelSec * 1000,
+            DART_MIN_TRAVEL_MS,
+            DART_MAX_TRAVEL_MS
+          ),
+          arcHeight: THREE.MathUtils.clamp(
+            midY - linearMidY,
+            DART_ARC_MIN,
+            DART_ARC_MAX
+          ),
+        };
+      }
+    }
+
+    return {
+      travelMs: THREE.MathUtils.clamp(
+        (distance / DART_SPEED) * 1000,
+        DART_MIN_TRAVEL_MS,
+        DART_MAX_TRAVEL_MS
+      ),
+      arcHeight: THREE.MathUtils.clamp(horizontal * 0.08, DART_ARC_MIN, DART_ARC_MAX),
+    };
   }
 
   private projectileMissDistance(kind: ShotKind): number {
@@ -1732,24 +1827,24 @@ export class MatchUnit {
     return v.health * (typeof v.hpMax === 'number' && v.hpMax > 0 ? v.hpMax : 1000);
   }
 
-  private hasBuff(v: VehicleState, key: string): boolean {
-    return (v.buffs ?? []).includes(key);
+  private dartHitCountDelta(prev: VehicleState, next: VehicleState): number {
+    if (prev.kind !== 'base' || next.kind !== 'base') return 0;
+    if (typeof prev.dartHitCount !== 'number' || typeof next.dartHitCount !== 'number') return 0;
+    return Math.max(0, next.dartHitCount - prev.dartHitCount);
   }
 
-  private spawnDartStrikeForTarget(
-    blindedTarget: VehicleState,
+  private spawnDartImpactForTarget(
+    hitTarget: VehicleState,
     vehicles: VehicleState[],
     now: number
   ): void {
-    const source = this.findDartSourceForTarget(blindedTarget, vehicles);
-    const target =
-      source?.target ??
-      (this.isDartStructureTarget(blindedTarget)
-        ? blindedTarget
-        : this.findDartStructureTarget(blindedTarget));
+    const source = this.findDartSourceForTarget(hitTarget, vehicles);
+    const target = this.isDartStructureTarget(hitTarget)
+      ? hitTarget
+      : (source?.target ?? this.findDartStructureTarget(hitTarget));
     const targetViz = this.vehicles.get(target.id);
     if (!targetViz) return;
-    this.spawnDartStrike(source?.viz ?? targetViz, source?.vehicle, targetViz, target, now);
+    this.spawnDartImpact(source?.vehicle, targetViz, target, now);
   }
 
   private findDartSourceForTarget(
@@ -1758,14 +1853,17 @@ export class MatchUnit {
   ): { vehicle: VehicleState; viz: VehicleViz; target: VehicleState } | null {
     let fallback: { vehicle: VehicleState; viz: VehicleViz; target: VehicleState } | null = null;
     for (const vehicle of vehicles) {
-      if (vehicle.classId !== CLASS_AERIAL || vehicle.dartTargetId == null) continue;
-      const resolvedTarget = vehicles.find((v) => v.id === vehicle.dartTargetId);
-      if (!resolvedTarget) continue;
-      if (!this.isDartStructureTarget(resolvedTarget)) continue;
+      if (vehicle.classId !== CLASS_DART) continue;
       const viz = this.vehicles.get(vehicle.id);
       if (!viz) continue;
-      const candidate = { vehicle, viz, target: resolvedTarget };
-      if (resolvedTarget.id !== target.id) {
+      const resolvedTarget =
+        vehicle.dartTargetId != null ? vehicles.find((v) => v.id === vehicle.dartTargetId) : undefined;
+      const sourceTarget =
+        resolvedTarget && this.isDartStructureTarget(resolvedTarget)
+          ? resolvedTarget
+          : this.findDartStructureTarget(vehicle);
+      const candidate = { vehicle, viz, target: sourceTarget };
+      if (sourceTarget.id !== target.id) {
         fallback ??= candidate;
         continue;
       }
@@ -1789,7 +1887,7 @@ export class MatchUnit {
       if (!candidate || !this.isDartStructureTarget(candidate)) continue;
       const enemy =
         reference.team != null && candidate.team != null && reference.team !== candidate.team;
-      const kindScore = candidate.kind === 'outpost' ? 0 : 3;
+      const kindScore = candidate.kind === 'base' ? 0 : 3;
       const teamScore = enemy ? 0 : 12;
       const score = kindScore + teamScore;
       if (!best || score < best.score) best = { vehicle: candidate, score };
@@ -1797,8 +1895,7 @@ export class MatchUnit {
     return best?.vehicle ?? reference;
   }
 
-  private spawnDartStrike(
-    sourceViz: VehicleViz,
+  private spawnDartImpact(
     source: VehicleState | undefined,
     targetViz: VehicleViz,
     target: VehicleState,
@@ -1811,38 +1908,55 @@ export class MatchUnit {
     );
     const enemyTeam = target.team === 'red' ? 'blue' : target.team === 'blue' ? 'red' : target.team;
     const owner = source ?? { ...target, team: enemyTeam };
-    const sourcePoint = sourceViz.placed ? sourceViz.group.position : sourceViz.tgtPos;
-    const sourceDir = new THREE.Vector3().subVectors(impactPoint, sourcePoint).normalize();
-    const start =
-      source && sourceViz.placed
-        ? this.projectileMuzzlePoint(sourceViz, sourceDir, new THREE.Vector3())
-        : impactPoint
-            .clone()
-            .add(
-              new THREE.Vector3(
-                target.team === 'red' ? 2.2 : -2.2,
-                4.6,
-                target.team === 'red' ? -7.5 : 7.5
-              )
-            );
-    const dir = new THREE.Vector3().subVectors(impactPoint, start).normalize();
-    this.spawnProjectile(
-      {
-        viz: sourceViz,
-        vehicle: owner,
-        start,
-        dir,
-        bornAt: now,
-        kind: 'dart',
-        explosionSize: 'large',
-      },
-      {
-        point: impactPoint,
-        normal: MatchUnit.UP.clone(),
-        distance: start.distanceTo(impactPoint),
-      },
-      now
+    const incoming = new THREE.Vector3(
+      target.team === 'red' ? -0.22 : 0.22,
+      -0.72,
+      target.team === 'red' ? 0.66 : -0.66
+    ).normalize();
+    this.spawnImpactBurst(impactPoint, MatchUnit.UP.clone(), incoming, owner, now, 'large');
+  }
+
+  private spawnImpactBurst(
+    point: THREE.Vector3,
+    normal: THREE.Vector3,
+    incoming: THREE.Vector3,
+    owner: VehicleState,
+    now: number,
+    explosionSize: Exclude<ExplosionSize, 'none'>
+  ): void {
+    const sparks = this.createSparkBurst(point, normal, incoming, owner, now, 1.15);
+    const explosion = this.createExplosionBurst(point, teamColor(owner.team), explosionSize, now);
+    const trailGeo = new THREE.BufferGeometry();
+    const trailPos = new THREE.BufferAttribute(new Float32Array(6), 3);
+    trailPos.setXYZ(0, point.x, point.y, point.z);
+    trailPos.setXYZ(1, point.x, point.y, point.z);
+    trailGeo.setAttribute('position', trailPos);
+    const trail = new THREE.Line(
+      trailGeo,
+      new THREE.LineBasicMaterial({ transparent: true, opacity: 0, depthWrite: false })
     );
+    trail.visible = false;
+    const group = new THREE.Group();
+    group.add(trail, sparks.line, explosion.group);
+    this.root.add(group);
+    this.projectiles.push({
+      group,
+      trail,
+      trailPos,
+      trailSamples: 1,
+      beam: null,
+      sparks,
+      explosion,
+      start: point.clone(),
+      end: point.clone(),
+      distance: 0.001,
+      travelMs: 1,
+      trajectory: 'line',
+      arcHeight: 0,
+      trailOpacity: 0,
+      bornAt: now,
+      ttl: Math.max(PROJECTILE_SPARK_TTL_MS, EXPLOSION_LARGE_TTL_MS) + 80,
+    });
   }
 
   private respawnDisplay(

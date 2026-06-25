@@ -1,3 +1,5 @@
+@import "./ui/tokens.css";
+
 :root {
   --bg: #0b0f14;
   --panel: #131a22;
@@ -8,7 +10,7 @@
   --accent: #4f9fe0;
   --red: #e5564e;
   --blue: #4e8ce5;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: var(--gsm-font-sans);
   color-scheme: dark;
 }
 

@@ -3,9 +3,11 @@ import {
   AGENT_BROWSER_PORT,
   type AgentBrowserMessage,
   type AgentLauncherStatusMessage,
+  type AgentProcessListMessage,
   type DiscoveredProcess,
   type LauncherStatus,
   type LaunchHeadlessResponse,
+  type StopHeadlessResponse,
 } from '@gsm/protocol';
 
 /**
@@ -32,7 +34,7 @@ export function useDiscovery(agentUrl = defaultAgentUrl()) {
     ws.onerror = () => (connected.value = false);
     ws.onclose = () => {
       connected.value = false;
-      launcherStatus.value = null;
+      void refreshAgentSnapshot();
       scheduleRetry();
     };
     ws.onmessage = (ev) => {
@@ -50,6 +52,7 @@ export function useDiscovery(agentUrl = defaultAgentUrl()) {
     if (retry == null)
       retry = window.setTimeout(() => {
         retry = null;
+        void refreshAgentSnapshot();
         connect();
       }, 3000);
   }
@@ -61,25 +64,48 @@ export function useDiscovery(agentUrl = defaultAgentUrl()) {
   });
 
   async function refreshLauncher() {
-    if (!connected.value) return;
     try {
       const response = await fetch(`${agentHttpBase}/launcher`);
       const msg = (await response.json()) as AgentLauncherStatusMessage;
       if (msg.kind === 'launcherStatus') launcherStatus.value = msg.status;
+      connected.value = true;
       launcherError.value = null;
     } catch (err) {
+      connected.value = false;
       launcherError.value = err instanceof Error ? err.message : String(err);
     }
   }
 
-  async function launchHeadlessMatches(count: number): Promise<LaunchHeadlessResponse> {
+  async function refreshAgentSnapshot() {
+    try {
+      const [launcherResponse, processResponse] = await Promise.all([
+        fetch(`${agentHttpBase}/launcher`),
+        fetch(`${agentHttpBase}/processes`),
+      ]);
+      const launcherMsg = (await launcherResponse.json()) as AgentLauncherStatusMessage;
+      const processMsg = (await processResponse.json()) as AgentProcessListMessage;
+      if (launcherMsg.kind === 'launcherStatus') launcherStatus.value = launcherMsg.status;
+      if (processMsg.kind === 'processes') processes.value = processMsg.processes;
+      connected.value = true;
+      launcherError.value = null;
+    } catch {
+      connected.value = false;
+    }
+  }
+
+  async function launchHeadlessMatches(options: {
+    targetMatches: number;
+    parallelism: number;
+    autoSave: boolean;
+    force?: boolean;
+  }): Promise<LaunchHeadlessResponse> {
     launcherBusy.value = true;
     launcherError.value = null;
     try {
       const response = await fetch(`${agentHttpBase}/launch`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ count }),
+        body: JSON.stringify(options),
       });
       const payload = (await response.json()) as LaunchHeadlessResponse;
       launcherStatus.value = payload.status;
@@ -95,6 +121,30 @@ export function useDiscovery(agentUrl = defaultAgentUrl()) {
     }
   }
 
+  async function stopHeadlessLaunch(id: string): Promise<StopHeadlessResponse> {
+    launcherError.value = null;
+    try {
+      const response = await fetch(`${agentHttpBase}/launch/stop`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+      const payload = (await response.json()) as StopHeadlessResponse;
+      launcherStatus.value = payload.status;
+      if (!response.ok || !payload.ok) {
+        launcherError.value = payload.error ?? 'Stop failed.';
+      }
+      return payload;
+    } catch (err) {
+      launcherError.value = err instanceof Error ? err.message : String(err);
+      throw err;
+    }
+  }
+
+  async function stopHeadlessLaunches(ids: string[]): Promise<void> {
+    for (const id of ids) await stopHeadlessLaunch(id);
+  }
+
   return {
     processes,
     connected,
@@ -103,6 +153,8 @@ export function useDiscovery(agentUrl = defaultAgentUrl()) {
     launcherError,
     refreshLauncher,
     launchHeadlessMatches,
+    stopHeadlessLaunch,
+    stopHeadlessLaunches,
   };
 }
 

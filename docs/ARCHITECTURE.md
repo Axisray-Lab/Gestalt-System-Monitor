@@ -36,14 +36,36 @@ It also serves:
 
 - `GET /processes` — current match list.
 - `GET /launcher` — current launcher status.
-- `POST /launch` — `{ count, installId?, force? }`; launches `count` headless
-  processes when the install is ready and current CPU/RAM budget allows it.
+- `POST /launch` — `{ targetMatches, parallelism, autoSave, installId?, force? }`;
+  starts a local headless batch when the install is ready and current CPU/RAM
+  budget allows the requested parallel workers. The legacy `{ count }` shape is
+  accepted as a compatibility alias, but the desktop UI sends the explicit batch
+  fields.
+- `POST /launch/stop` — `{ id }` or `{ pid }`; terminates a local launch process.
 
 The launcher discovers Steam installs by reading `libraryfolders.vdf` and matching
 `appmanifest_*.acf` by public app name (`Gestalt System`) or configured app id.
+It also accepts a configured executable path. In standalone profile mode,
+`GSM_STANDALONE_EXE` is used as the configured install candidate when
+`GSM_GAME_EXE` is not set, so editor-built standalone binaries can be launched
+without depending on a Steam install.
+
 The headless command line is configuration (`--headless-args` /
-`GSM_HEADLESS_ARGS`), defaulting to `--headless`; the monitor does not encode
-private game implementation details.
+`GSM_HEADLESS_ARGS`) or a local profile (`GSM_HEADLESS_PROFILE=standalone` with
+`GSM_STANDALONE_EXE`, or `GSM_HEADLESS_PROFILE=ue` with `GSM_UE_EXE` /
+`GSM_UE_PROJECT`). Launching stays disabled until such a command is configured;
+the monitor does not encode private game implementation details. Autosave is
+agent-managed only for the `standalone` and `ue` profiles: the agent adds
+`-attrrecord`, assigns per-worker `-abslog` and `-UserDir` paths, counts completed
+matches from `[ATTR-RECORD]` game-time resets, stops the batch at
+`targetMatches`, writes `combined.log`, and starts the local trace analyzer in
+the batch save directory. With raw `GSM_HEADLESS_ARGS`, autosave is reported as
+unavailable because the agent cannot safely assign the log contract.
+
+For local standalone development, `GSM_STANDALONE_LOG` can be used as a fallback
+to read the launched process's WebSocket port from the local game log when the
+LAN beacon is not available yet. When autosave assigns a per-run `-abslog`, that
+launch log is preferred for the WebSocket-port fallback.
 
 `recommendedAdditionalMatches` is intentionally stable rather than instantaneous:
 CPU load is smoothed before capacity is estimated, and slot changes must persist
@@ -115,10 +137,13 @@ interface VehicleState {
 interface Vec3 { x: number; y: number; z: number; }   // UE cm, Z-up, left-handed
 ```
 
-> **Pending attribute ids:** world **position** and **chassis/turret heading** are
-> not in the attribute map yet. Until the game writes them in (see *Game-side
-> requirements* below), `VehicleState.pos` uses a deterministic placeholder layout
-> so the parse chain and per-unit panels stay testable.
+> **Position & heading:** world **position** (`WorldPosX/Y/Z`) and **chassis/turret
+> heading** (`ChassisYaw`/`TurretYaw`/`TurretPitch`) are present in the robot
+> attribute maps — confirmed in recorded `[ATTR-RECORD]` traces (real per-frame UE
+> coordinates), so trace **replay** places and orients robots for real. When these
+> attrs are absent (an older build, or a live channel not yet verified to stream
+> them), `VehicleState.pos` falls back to a deterministic placeholder layout so the
+> parse chain and per-unit panels stay testable.
 
 ### Coordinate mapping
 
@@ -138,9 +163,10 @@ real matches needs the game side to:
    without any UI interaction.
 2. **Expose per-robot state on the `attribute.watchAttributeMaps` channel** — the
    same channel the in-game HUD already streams. Health / max-health / team /
-   player-id are already present; the monitor additionally needs **world position**
-   and **chassis + turret heading** written into each robot's attribute map so it
-   can place and orient pieces on the board.
+   player-id, **world position** and **chassis + turret heading** are all written
+   into the robot attribute maps (verified in `[ATTR-RECORD]` recordings — the game
+   computes and stores them). The one open item is a live integration pass
+   confirming the live watch streams the position band end-to-end.
 
 Map geometry needs **no** game-side push: the monitor places the arena client-side
 from the beacon's `mapId` plus the static placement config, falling back to a

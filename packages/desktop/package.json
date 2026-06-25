@@ -1,0 +1,14 @@
+{
+  "name": "@gsm/desktop",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Gestalt-System-Monitor desktop dock (Tauri) — a bottom-edge AppBar companion that loads the monitor's deck UI.",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

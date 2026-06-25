@@ -51,17 +51,40 @@ npm run dev        # http://localhost:5180
 ## Local launcher
 
 The same agent also owns privileged local actions for the browser: it scans Steam
-libraries for an installed **Gestalt System**, reports host CPU/RAM headroom, and
-can start one or more headless matches through the configured headless entrypoint.
+libraries or a configured standalone executable for **Gestalt System**, reports
+host CPU/RAM headroom, and can start headless match batches through the configured
+headless entrypoint.
 
-By default it looks for a Steam app manifest named `Gestalt System` and launches
-the discovered executable with `--headless`. Public configuration can override the
-scan and launch shape without baking game-side implementation details into this
-repo:
+By default it looks for a Steam app manifest named `Gestalt System`, but launching
+is disabled until a real headless auto-battle command is configured. Public
+configuration can provide that launch shape without baking game-side implementation
+details into this repo:
 
 ```bash
-npm run agent -- --game-exe "C:\Games\Gestalt System\Gestalt System.exe" --headless-args "--headless"
+npm run agent -- --game-exe "C:\Games\Gestalt System\Gestalt System.exe" --headless-args "--your-headless-auto-battle-args"
 ```
+
+For local development against an editor-built standalone, prefer the standalone
+profile. If `GSM_GAME_EXE` is not set, `GSM_STANDALONE_EXE` is also used as the
+configured install candidate, so the launcher does not depend on Steam discovery:
+
+```bash
+GSM_HEADLESS_PROFILE=standalone
+GSM_STANDALONE_EXE=D:\Builds\GestaltSystem\RobotBridgeDemo\Binaries\Win64\RobotBridgeDemo.exe
+GSM_HEADLESS_MATCH_INTERVAL_SEC=5
+GSM_HEADLESS_ATTR_RECORD=1
+```
+
+Launch requests separate total work from concurrency:
+
+```json
+{ "targetMatches": 50, "parallelism": 1, "autoSave": true }
+```
+
+`targetMatches` is the number of matches the batch should run before the agent
+stops its worker process(es). `parallelism` is the number of standalone/UE worker
+processes to run at the same time. The older `{ "count": N }` shape is still
+accepted for compatibility, but the desktop UI now sends the explicit batch shape.
 
 Useful overrides:
 
@@ -71,14 +94,28 @@ Useful overrides:
 | `--game-dir` | `GSM_GAME_DIR` | Steam library scan |
 | `--game-exe` | `GSM_GAME_EXE` | executable inferred from install name |
 | `--game-exe-name` | `GSM_GAME_EXE_NAME` | executable inferred from install name |
-| `--headless-args` | `GSM_HEADLESS_ARGS` | `--headless` |
+| `--headless-args` | `GSM_HEADLESS_ARGS` | disabled until configured |
+| `--headless-profile` | `GSM_HEADLESS_PROFILE` | optional; `standalone` or `ue` build common headless commands |
+| `--standalone-exe` | `GSM_STANDALONE_EXE` | required for `GSM_HEADLESS_PROFILE=standalone` |
+| `--standalone-cwd` | `GSM_STANDALONE_CWD` | executable directory |
+| `--standalone-log` | `GSM_STANDALONE_LOG` | optional dev fallback; reads the latest standalone WebSocket port from the local log |
+| `--standalone-ws-port` | `GSM_STANDALONE_WS_PORT` | optional fixed-port dev fallback when the launched process does not beacon |
+| `--autosave-dir` | `GSM_AUTOSAVE_DIR` | `traces/autosave` |
+| `--ue-exe` | `GSM_UE_EXE` | required for `GSM_HEADLESS_PROFILE=ue` |
+| `--ue-project` | `GSM_UE_PROJECT` | required for `GSM_HEADLESS_PROFILE=ue` |
+| `--mapid` / `--map-id` | `GSM_HEADLESS_MAP_ID` | `9` for the UE profile |
 | `--match-memory-mb` | `GSM_HEADLESS_MEMORY_MB` | `2048` |
 | `--match-cpu-cores` | `GSM_HEADLESS_CPU_CORES` | `2` |
 | `--reserve-memory-mb` | `GSM_RESERVE_MEMORY_MB` | `2048` |
 
-The SPA disables launch when the agent estimates there is not enough remaining
-CPU/RAM for the requested count. The real headless match entrypoint is the GS-2
-game-side capability described in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+The SPA warns when the local service estimates there is not enough remaining
+CPU/RAM for the requested parallel workers; a deliberate click still launches the
+batch. When `autoSave` is enabled on the
+`standalone` or `ue` profile, the agent adds `-attrrecord`, assigns per-worker
+`-abslog` / `-UserDir` paths, counts completed matches from `[ATTR-RECORD]` game
+time resets, writes `combined.log`, and runs the local trace analyzer into the
+batch save directory. The real headless match entrypoint is the GS-2 game-side
+capability described in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 If another agent already owns `7788`, run a second one with `--port 7790` and open
 the SPA with `?agent=ws://localhost:7790`.

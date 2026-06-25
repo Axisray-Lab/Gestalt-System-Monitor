@@ -35,6 +35,10 @@ export interface DiscoveredProcess extends BeaconPayload {
   lastSeen: number;
   /** Convenience: ws://<sourceIp>:<wsPort> the browser connects to directly. */
   wsUrl: string;
+  /** Local launcher id when this process was started by the desktop monitor. */
+  localLaunchId?: string;
+  /** Local OS process id when this process was started by the desktop monitor. */
+  localLaunchPid?: number;
 }
 
 /** Message the agent pushes to the browser over its own WS channel. */

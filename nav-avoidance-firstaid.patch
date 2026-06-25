@@ -1,0 +1,84 @@
+diff --git a/DASH_Configs/Common/Global/Hive/AICore.csv b/DASH_Configs/Common/Global/Hive/AICore.csv
+index 4a96243b..f6358696 100644
+--- a/DASH_Configs/Common/Global/Hive/AICore.csv
++++ b/DASH_Configs/Common/Global/Hive/AICore.csv
+@@ -1,2 +1,2 @@
+ CodeFix,fStopRadiusM,fSpinBandMinM,fSpinBandMaxM,fFriendRadiusM,fAvoidMarginM,fMaxPushM,fDroneDetectHeightM,fDroneFlyHeightM,fRetreatHpPct
+-AI_Default,3.0,2.0,5.0,0.3,0.3,1.0,1.5,2.5,0.2
++AI_Default,3.0,2.0,5.0,0.6,0.6,1.5,1.5,2.5,0.2
+diff --git a/Source/Hive/HiveSystem/Private/AI/AI_MoveMode.cpp b/Source/Hive/HiveSystem/Private/AI/AI_MoveMode.cpp
+index 1bf4dc9f..6fe51ae2 100644
+--- a/Source/Hive/HiveSystem/Private/AI/AI_MoveMode.cpp
++++ b/Source/Hive/HiveSystem/Private/AI/AI_MoveMode.cpp
+@@ -205,7 +205,8 @@ namespace
+             && Component::IsAerial::Backend::IsSet(A, R);
+     }
+ 
+-    // Lateral push to avoid friendly ground units on the direct own→goal path.
++    // Lateral push to keep clear of OTHER ground units (friend AND foe) on the
++    // direct own→goal path: friends to unstack, foes to not ram & lock.
+     FORCEINLINE void ApplyObstacleAvoidance(
+         uint8 A, int32 R, int32 OwnTeam, float OwnX, float OwnY,
+         float& GoalX, float& GoalY)
+@@ -230,11 +231,13 @@ namespace
+             {
+                 if (FriendA == A && FriendR == R) continue;
+                 const Component::TeamComp::FReader Team{ FriendA, FriendR };
+-                if (Component::TeamComp::TeamID(Team) != OwnTeam) continue;
++                // Consider BOTH friends and foes: friends to stop stacking, foes to
++                // not ram & lock at chokepoints/objectives (foes get a lighter push).
++                const bool bSameTeam = (Component::TeamComp::TeamID(Team) == OwnTeam);
+                 const Component::ChassisPosition::FReader Pos{ FriendA, FriendR };
+                 const float Fx = Component::ChassisPosition::X(Pos);
+                 const float Fy = Component::ChassisPosition::Y(Pos);
+-                if (IsAerialUnit(FriendA, FriendR)) continue; // skip aerial friendlies (was |Fz|>2m)
++                if (IsAerialUnit(FriendA, FriendR)) continue; // skip aerials (handled elsewhere)
+ 
+                 const float Dfx = Fx - OwnX;
+                 const float Dfy = Fy - OwnY;
+@@ -244,12 +247,27 @@ namespace
+                     const float PerpX = Dfx - Proj * Nx;
+                     const float PerpY = Dfy - Proj * Ny;
+                     float PerpDist = FMath::Sqrt(PerpX * PerpX + PerpY * PerpY);
+-                    float DirX = -Ny, DirY = Nx;
+-                    if (PerpDist > KINDA_SMALL_NUMBER) { DirX = -PerpX / PerpDist; DirY = -PerpY / PerpDist; }
+-                    else { PerpDist = 0.f; }
++                    float DirX, DirY;
++                    if (PerpDist > KINDA_SMALL_NUMBER)
++                    {
++                        DirX = -PerpX / PerpDist;  // push straight away from blocker (mirror-symmetric)
++                        DirY = -PerpY / PerpDist;
++                    }
++                    else
++                    {
++                        // Collinear (head-on / directly behind): split the pair to
++                        // OPPOSITE sides by stable (Arch,Row) order instead of the old
++                        // fixed left-hand (-Ny,Nx); that was not mirror-symmetric across
++                        // the field and made facing pairs stack on the same side.
++                        const bool bSelfFirst = (A < FriendA) || (A == FriendA && R < FriendR);
++                        DirX = bSelfFirst ? -Ny :  Ny;
++                        DirY = bSelfFirst ?  Nx : -Nx;
++                        PerpDist = 0.f;
++                    }
++                    const float TeamScale = bSameTeam ? 1.0f : 0.6f;
+                     const float Weight = 1.f - FMath::Min(PerpDist / kAvoidThresholdM, 1.f);
+-                    PushX += DirX * Weight * kMaxPushM;
+-                    PushY += DirY * Weight * kMaxPushM;
++                    PushX += DirX * Weight * kMaxPushM * TeamScale;
++                    PushY += DirY * Weight * kMaxPushM * TeamScale;
+                 }
+             }
+         });
+diff --git a/Source/Hive/HiveSystem/Private/Auto/AutoMove.cpp b/Source/Hive/HiveSystem/Private/Auto/AutoMove.cpp
+index 533f1b0a..3efa0528 100644
+--- a/Source/Hive/HiveSystem/Private/Auto/AutoMove.cpp
++++ b/Source/Hive/HiveSystem/Private/Auto/AutoMove.cpp
+@@ -45,7 +45,7 @@ namespace
+     // URobotAutoPathProxy at a larger radius, so only final-goal precision
+     // is affected.
+     inline constexpr float kArrivalEpsM = 0.25f;
+-    inline constexpr float kMinCruiseSpeedMps = 10.0f; // prevent near-zero stall before waypoint handoff
++    inline constexpr float kMinCruiseSpeedMps = 2.0f; // creep, not ram: low floor lets the slowdown envelope + avoidance separate near contact (was 10.0)
+ }
+ 
+ void Tick(uint32 Frame)

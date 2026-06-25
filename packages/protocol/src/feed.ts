@@ -72,6 +72,10 @@ export interface VehicleState {
   buffs?: string[];
   /** Optional resolved target id hint, used for dart visualisation when supplied. */
   dartTargetId?: number;
+  /** Dart unit launch allowance, used to detect dart launches from ammo drops. */
+  dartAmmo?: number;
+  /** Base-side dart hit counter; increments when an enemy dart lands on this base. */
+  dartHitCount?: number;
   /** Robot upgrade level (1..N). */
   level?: number;
   /** Launch allowance (17mm + 42mm), matching the OB panel's ammo readout. */
@@ -84,6 +88,8 @@ export interface VehicleState {
   firingLocked?: boolean;
   /** Firing heat, 0..1 (current / max). */
   heat?: number;
+  /** Accumulated damage taken (from DamageTakenTotal attribute). */
+  damageTaken?: number;
 }
 
 export interface WorldSnapshot {

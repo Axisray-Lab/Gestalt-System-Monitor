@@ -7,14 +7,19 @@
   "workspaces": [
     "packages/protocol",
     "packages/agent",
-    "packages/web"
+    "packages/web",
+    "packages/desktop"
   ],
   "scripts": {
     "dev": "npm run dev -w @gsm/web",
     "agent": "npm run start -w @gsm/agent --",
     "agent:mock": "npm run mock -w @gsm/agent --",
     "agent:scenario": "npm run scenario -w @gsm/agent --",
+    "agent:replay": "npm run replay -w @gsm/agent --",
     "build": "npm run build -w @gsm/web",
+    "build:web": "npm exec -w @gsm/web -- vite build",
+    "desktop:dev": "npm run dev -w @gsm/desktop",
+    "desktop:build": "npm run build:web && npm run build -w @gsm/desktop",
     "typecheck": "npm run typecheck -w @gsm/web && npm run typecheck -w @gsm/agent"
   },
   "license": "UNLICENSED"
