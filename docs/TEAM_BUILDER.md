@@ -29,16 +29,28 @@ repo.
 
 ## Types (`@gsm/protocol`)
 
-- `RosterSlotConfig` — one slot: `teamNumber`, fixed `careerId`, chosen
-  `entityType` (construct), a sparse `paramOverrides` map (attributeId → value),
-  and optional per-slot settings the slot exposes.
-- `TeamConfig` — `{ teamId, slots }`.
-- `HeadlessMatchConfig` — `{ mapId, nettype, teams[], aiFill, attrrecord? }`.
-- `LaunchHeadlessRequest.match?` — carries a `HeadlessMatchConfig`; when present the
-  agent launches exactly one match with it.
+- `RosterSlotConfig` — one slot: `teamNumber`, fixed `careerId`, chosen `entityType`
+  (construct), and a sparse `tuning: SlotTuning` (any unset axis = the construct
+  default).
+- `SlotTuning` — the research surface: `discharge / ammo17 / ammo42 / fireRateHz /
+  spreadMax / spreadMin / speedSpread`, plus structured `dart / engineer / radar`.
+- `TeamConfig` — `{ teamId, slots }`; `HeadlessMatchConfig` — `{ mapId, nettype,
+  teams[], aiFill, attrrecord? }`.
+- `LaunchHeadlessRequest.match?` — carries a `HeadlessMatchConfig`; the roster
+  crosses the wire as an autostart parameter (a temp-file path), so it is not
+  size-limited by OS command-line limits.
 
-The roster crosses the wire as an autostart parameter (a temp-file path), so it is
-not size-limited by OS command-line limits.
+### Data the UI drives from
+
+- **`roster.ts`** — `RuleSet`, `RULESETS[ruleSet]` (slot layout per 赛制),
+  `buildDefaultRoster(ruleSet, teamId)`, and `CAREER_RULES` (read-only HP / 底盘功率 /
+  热容 / 散热 / 电容 for the info panel).
+- **`cost.ts`** — `ENTITY_CATALOG`, `constructsForCareer(careerId)`,
+  `CONSTRUCT_DEFAULTS`, `computeSlotCost` / `computeTeamCost`.
+- **`params.ts`** — `TUNABLE_PARAMS` + `paramsForConstruct(entityType)` (slider
+  specs), `defaultsForConstruct`, `hasDart/hasEngineer/hasRadar`, and the option
+  sets `ENGINEER_ASSEMBLY_LEVELS / ENGINEER_CORE_POOLS / DART_BASE_MODES /
+  RADAR_DETECTION_MODES`.
 
 ## Cost & scoring
 
@@ -50,7 +62,12 @@ anchors (`RMUC2026_SAMPLE`). Raw 费 are summed directly (no 0-100 scale).
 
 ## Building the UI style-first
 
-1. Import the types + cost helpers from `@gsm/protocol`.
-2. `constructsForCareer(careerId)` drives each slot's construct dropdown.
-3. `computeTeamCost(team)` drives the per-team cost badge + side-by-side compare.
-4. `RMUC2026_SAMPLE` is the calibration reference while iterating.
+1. Pick a `RuleSet` → `RULESETS[ruleSet].slots` lays out the team; seed each team
+   with `buildDefaultRoster(ruleSet, teamId)`.
+2. Per slot: `constructsForCareer(slot.careerId)` fills the construct dropdown;
+   `paramsForConstruct(entityType)` gives the sliders, `defaultsForConstruct` seeds
+   them, and `hasDart/hasEngineer/hasRadar` gate the structured controls.
+3. `computeSlotCost(slot)` / `computeTeamCost(team)` drive the cost badges +
+   side-by-side compare; `CAREER_RULES[careerId]` fills the read-only stat panel.
+4. `RMUC2026_SAMPLE` (ranged 79.0 / melee 86.7) is the calibration reference — a
+   default RMUC2026 roster should reproduce it.
