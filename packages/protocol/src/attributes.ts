@@ -373,6 +373,11 @@ export enum AttrId {
   G_ControlZone1_TeamID = 74000020,
   G_ControlZone2_TeamID = 74000021,
   TM_FortAmmoCapMax = 74000022,
+  TM_DartOutpostHitCount = 74000023,
+  TM_DartBaseHitCount = 74000024,
+  TM_DartOutpostDamageTotal = 74000025,
+  TM_DartBaseDamageTotal = 74000026,
+  TM_DartSuppressedHitCount = 74000027,
 
   // zone controller (75) — 占垒/占点 progress lives here
   TB_MarkerId = 75000001,

@@ -5,6 +5,7 @@ import {
   type AgentLauncherStatusMessage,
   type AgentProcessListMessage,
   type DiscoveredProcess,
+  type HeadlessMatchConfig,
   type LauncherStatus,
   type LaunchHeadlessResponse,
   type StopHeadlessResponse,
@@ -98,6 +99,7 @@ export function useDiscovery(agentUrl = defaultAgentUrl()) {
     parallelism: number;
     autoSave: boolean;
     force?: boolean;
+    match?: HeadlessMatchConfig;
   }): Promise<LaunchHeadlessResponse> {
     launcherBusy.value = true;
     launcherError.value = null;

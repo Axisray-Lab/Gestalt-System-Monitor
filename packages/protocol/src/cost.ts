@@ -6,7 +6,7 @@
  * Per-construct accuracy (命中率) cost is Monte-Carlo-derived, so it is encoded
  * here as catalog data (GUN_HIT_COST) rather than recomputed in TS.
  */
-import { CareerId, type RosterSlotConfig, type TeamConfig } from './team';
+import { CareerId, RosterAttrId, type RosterSlotConfig, type TeamConfig } from './team';
 
 export type BuildTier = 0 | 5;
 
@@ -47,6 +47,30 @@ export const GUN_HIT_COST: Record<number, number> = {
   66000002: 1.33, 66000008: 1.33, 66000007: 1.33, 66000009: 1.33, // 17mm infantry
   66000005: 1.33, 66000010: 1.33, 66000011: 1.33, 66000012: 1.33, // 17mm sentry
   66000013: 1.33, // DRONE 17mm gun
+};
+
+export interface ConstructDefaultTuning {
+  dischargeW?: number;
+  ammo17?: number;
+  ammo42?: number;
+  fireRateHz?: number;
+  engineer?: { maxAssemblyLevel: 1 | 2 | 3 | 4; corePool: 2 | 4 | 6 };
+}
+
+export const CONSTRUCT_DEFAULTS: Record<number, ConstructDefaultTuning> = {
+  66000001: { dischargeW: 120, ammo42: 100, fireRateHz: 13.5 },
+  66000017: { dischargeW: 120, ammo17: 800, fireRateHz: 25 },
+  66000003: { dischargeW: 120, ammo17: 800, fireRateHz: 25 },
+  66000002: { dischargeW: 120, ammo17: 1000, fireRateHz: 25 },
+  66000008: { dischargeW: 120, ammo17: 1000, fireRateHz: 25 },
+  66000007: { dischargeW: 120, ammo17: 1000, fireRateHz: 25 },
+  66000009: { dischargeW: 120, ammo17: 1000, fireRateHz: 25 },
+  66000005: { dischargeW: 120, ammo17: 1000, fireRateHz: 25 },
+  66000010: { dischargeW: 120, ammo17: 1000, fireRateHz: 25 },
+  66000011: { dischargeW: 120, ammo17: 1000, fireRateHz: 25 },
+  66000012: { dischargeW: 120, ammo17: 1000, fireRateHz: 25 },
+  66000013: { dischargeW: 120, ammo17: 1000, fireRateHz: 25 },
+  66000014: { engineer: { maxAssemblyLevel: 4, corePool: 6 } },
 };
 
 /** Cost-axis formulas (zero-floor: weakest setting = 0 费). */
@@ -90,15 +114,54 @@ export const DRONE_DART_DEFAULT_COST = 13 + COST.dartHit; // 19
 
 export function computeSlotCost(slot: RosterSlotConfig): number {
   const base = SLOT_DEFAULT_COST[slot.entityType];
-  if (slot.paramOverrides == null && slot.dart == null && slot.engineer == null && slot.radar == null && base != null) {
+  if (
+    slot.paramOverrides == null &&
+    slot.firingIntervalMs == null &&
+    slot.dart == null &&
+    slot.engineer == null &&
+    slot.radar == null &&
+    base != null
+  ) {
     return base;
   }
-  let cost = COST.buildTier(slot.entityType) + COST.gunHit(slot.entityType);
-  if (slot.dart) cost += COST.dart(slot.dart) + COST.dartHit;
-  if (slot.engineer) cost += COST.engineerAssembly(slot.engineer.maxAssemblyLevel) + COST.engineerPool(slot.engineer.corePool);
+
+  const defaults = CONSTRUCT_DEFAULTS[slot.entityType];
+  let cost = base ?? (COST.buildTier(slot.entityType) + COST.gunHit(slot.entityType));
+  cost += numericDelta(
+    overridden(slot, RosterAttrId.CapacityEnergyPowerMax),
+    defaults?.dischargeW,
+    COST.discharge,
+    base == null,
+  );
+  cost += numericDelta(
+    overridden(slot, RosterAttrId.Real17mmAmmoCount, RosterAttrId.Ammo17mmCount),
+    defaults?.ammo17,
+    COST.ammo17,
+    base == null,
+  );
+  cost += numericDelta(
+    overridden(slot, RosterAttrId.Real42mmAmmoCount, RosterAttrId.Ammo42mmCount),
+    defaults?.ammo42,
+    COST.ammo42,
+    base == null,
+  );
+
+  const fireRateHz = slot.firingIntervalMs != null && slot.firingIntervalMs > 0
+    ? 1000 / slot.firingIntervalMs
+    : undefined;
+  cost += numericDelta(fireRateHz, defaults?.fireRateHz, COST.fireRate, base == null);
+
+  if (slot.dart && (slot.dart.canOutpost || slot.dart.canBase)) cost += COST.dart(slot.dart) + COST.dartHit;
+  if (slot.engineer) {
+    cost +=
+      COST.engineerAssembly(slot.engineer.maxAssemblyLevel) -
+      COST.engineerAssembly(defaults?.engineer?.maxAssemblyLevel ?? 1);
+    cost +=
+      COST.engineerPool(slot.engineer.corePool) -
+      COST.engineerPool(defaults?.engineer?.corePool ?? 2);
+  }
   if (slot.radar) cost += COST.radar(slot.radar);
-  // TODO: add 放电/弹药/射频 deltas from slot.paramOverrides vs construct defaults.
-  return cost;
+  return Math.max(0, Math.round(cost * 100) / 100);
 }
 
 export const computeTeamCost = (team: TeamConfig): number =>
@@ -106,3 +169,22 @@ export const computeTeamCost = (team: TeamConfig): number =>
 
 /** Self-check anchors: a default RMUC2026 roster ≈ ranged 79.0 / melee 86.7. */
 export const RMUC2026_SAMPLE = { rangedTeamCost: 79.0, meleeTeamCost: 86.7 } as const;
+
+function overridden(slot: RosterSlotConfig, ...attrIds: RosterAttrId[]): number | undefined {
+  for (const attrId of attrIds) {
+    const value = slot.paramOverrides?.[attrId];
+    if (value != null && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function numericDelta(
+  value: number | undefined,
+  baseline: number | undefined,
+  costFn: (value: number) => number,
+  absoluteWhenMissingBaseline: boolean,
+): number {
+  if (value == null) return 0;
+  if (baseline == null) return absoluteWhenMissingBaseline ? costFn(value) : 0;
+  return costFn(value) - costFn(baseline);
+}

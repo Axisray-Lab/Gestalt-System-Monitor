@@ -4,8 +4,9 @@ import { useDiscovery } from '@/discovery/useDiscovery';
 import { useMatches, type MatchHooks } from '@/feed/useMatches';
 import { drainFeedPerf, feedPerf } from '@/feed/feedPerf';
 import { DioramaScene, type ThreePerformanceStats } from '@/three/DioramaScene';
-import type { WorldSnapshot } from '@gsm/protocol';
+import type { HeadlessMatchConfig, WorldSnapshot } from '@gsm/protocol';
 import MatchList from '@/components/MatchList.vue';
+import TeamBuilderPanel from '@/components/TeamBuilderPanel.vue';
 
 const PERF_HUD_STORAGE_KEY = 'gsm.performanceHud';
 const numberFormatter = new Intl.NumberFormat('en-US');
@@ -13,6 +14,10 @@ const numberFormatter = new Intl.NumberFormat('en-US');
 const {
   processes,
   connected,
+  launcherStatus,
+  launcherBusy,
+  launcherError,
+  launchHeadlessMatches,
 } = useDiscovery();
 
 // Single source of truth for which unit is focused, two-way synced with the scene.
@@ -149,6 +154,15 @@ function loadPerformanceHudSetting(): boolean {
   }
 }
 
+function launchCustomMatch(match: HeadlessMatchConfig): void {
+  void launchHeadlessMatches({
+    targetMatches: 1,
+    parallelism: 1,
+    autoSave: match.attrrecord === true,
+    match,
+  });
+}
+
 function formatCount(value: number): string {
   return numberFormatter.format(Math.round(value));
 }
@@ -278,6 +292,13 @@ onBeforeUnmount(() => {
       :snapshot-map="snapshotMap"
       @focus="focusedKey = $event"
       @overview="focusedKey = null"
+    />
+    <TeamBuilderPanel
+      :agent-connected="connected"
+      :launcher-status="launcherStatus"
+      :launcher-busy="launcherBusy"
+      :launcher-error="launcherError"
+      @launch-match="launchCustomMatch"
     />
     <main class="stage">
       <div ref="host" class="canvas-host" />

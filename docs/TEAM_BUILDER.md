@@ -6,9 +6,9 @@ and settings) and launch it through the agent. This doc covers only the
 are **supplied at runtime** (see "Cost & scoring" below) and are not part of this
 repo.
 
-> Status: contract scaffold. Types live in `packages/protocol/src/team.ts`. The
-> SPA can build the UI against them now (style-first); the launch wiring and the
-> runtime cost config land alongside the game-side support.
+> Status: implemented on the Monitor side. The SPA edits the roster, posts
+> `LaunchHeadlessRequest.match`, and the agent launches one headless match with
+> the compact `-roster=` autostart payload.
 
 ## Flow
 
@@ -19,9 +19,8 @@ repo.
         │ HeadlessMatchConfig
         ▼  POST /launch  { match }
 [agent : LaunchManager]
-  writes the roster to a temp file and launches one headless match using the
-  CONFIGURED launch arg shape (the same configurable mechanism as `--headless-args`;
-  no game-specific flag names are baked into this repo)
+  normalizes the request to a single local launch, folds the match into the
+  configured UE / standalone profile, and appends the compact roster parameter
         ▼
 [match] advertises the LAN beacon → the SPA auto-discovers and spectates it
         (same attribute stream as any other watched match)
@@ -37,8 +36,20 @@ repo.
 - `LaunchHeadlessRequest.match?` — carries a `HeadlessMatchConfig`; when present the
   agent launches exactly one match with it.
 
-The roster crosses the wire as an autostart parameter (a temp-file path), so it is
-not size-limited by OS command-line limits.
+The roster crosses the wire as a compact autostart parameter:
+
+```text
+-roster="team,teamNumber,entityType[,attrId=value|attrId=value];..."
+```
+
+Example:
+
+```text
+0,1,66000001;0,3,66000002,60000021=140|10000031=1200
+```
+
+`packages/protocol/src/team.ts` owns `buildRosterSpec()` so the SPA and agent never
+hand-roll this string independently.
 
 ## Cost & scoring
 
@@ -48,9 +59,9 @@ lives in `packages/protocol/src/cost.ts`: `ENTITY_CATALOG` (career → construct
 the per-axis `COST` formulas, `computeSlotCost` / `computeTeamCost`, and self-check
 anchors (`RMUC2026_SAMPLE`). Raw 费 are summed directly (no 0-100 scale).
 
-## Building the UI style-first
+## UI entry points
 
-1. Import the types + cost helpers from `@gsm/protocol`.
-2. `constructsForCareer(careerId)` drives each slot's construct dropdown.
-3. `computeTeamCost(team)` drives the per-team cost badge + side-by-side compare.
-4. `RMUC2026_SAMPLE` is the calibration reference while iterating.
+- `RuleSet` / `RULESETS` seed RMUC, RMUL, and 1v1 rosters.
+- `constructsForCareer(careerId)` drives each slot's construct dropdown.
+- `computeSlotCost()` / `computeTeamCost()` drive the cost badges.
+- `buildRosterSpec(match)` is displayed in the footer and sent by the agent.

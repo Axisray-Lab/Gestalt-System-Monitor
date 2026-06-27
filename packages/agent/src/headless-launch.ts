@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { buildRosterSpec, type HeadlessMatchConfig } from '@gsm/protocol';
 
 export interface HeadlessLaunchConfig {
   args: string[];
@@ -7,7 +8,7 @@ export interface HeadlessLaunchConfig {
   windowsVerbatimArguments?: boolean;
   autoSaveAvailable?: boolean;
   autoSaveEnabled?: boolean;
-  autoSaveMode?: 'attrrecord-log' | 'configured-args' | 'off';
+  autoSaveMode?: 'watch-ws' | 'attrrecord-log' | 'configured-args' | 'off';
   error?: string;
 }
 
@@ -28,6 +29,7 @@ export interface UeHeadlessLaunchOptions {
   exec?: string;
   execCmds?: string;
   matchIntervalSec: number;
+  match?: HeadlessMatchConfig;
 }
 
 export interface StandaloneHeadlessLaunchOptions {
@@ -47,6 +49,7 @@ export interface StandaloneHeadlessLaunchOptions {
   exec?: string;
   execCmds?: string;
   matchIntervalSec: number;
+  match?: HeadlessMatchConfig;
 }
 
 const RENDER_TOKENS: Record<UeHeadlessLaunchOptions['render'], string[]> = {
@@ -63,6 +66,7 @@ export function buildUeHeadlessLaunch(options: UeHeadlessLaunchOptions): Headles
     return { args: [], error: 'UE headless launch needs --ue-project or GSM_UE_PROJECT.' };
   }
 
+  const match = matchLaunchValues(options);
   const args = [
     q(options.projectPath),
     '-game',
@@ -72,15 +76,17 @@ export function buildUeHeadlessLaunch(options: UeHeadlessLaunchOptions): Headles
     ...(options.userDir ? [`-UserDir=${q(options.userDir)}`] : []),
     '-blockexitprogram',
     '-autostart',
-    `-mapid=${options.mapId}`,
-    `-nettype=${options.netType}`,
+    `-mapid=${match.mapId}`,
+    `-nettype=${match.netType}`,
     `-connmethod=${options.connMethod}`,
     `-autostartdelay=${options.autostartDelayMs}`,
     `-execdelay=${options.execDelayMs}`,
-    `-hudhidden=${options.hudHidden}`,
-    ...(options.exec ? [`-exec=${q(options.exec)}`] : []),
+    `-hudhidden=${match.hudHidden}`,
+    ...(match.exec ? [`-exec=${q(match.exec)}`] : []),
     ...(options.execCmds ? [`-ExecCmds=${q(options.execCmds)}`] : []),
-    ...(options.attrRecord ? ['-attrrecord', `-attrrecordhz=${options.attrHz}`] : []),
+    ...(match.attrRecord ? ['-attrrecord', `-attrrecordhz=${match.attrHz}`] : []),
+    ...(options.match?.aiFill ? ['-aifill'] : []),
+    ...headlessMatchArgs(options.match),
     ...(options.matchIntervalSec > 0 ? [`-matchinterval=${options.matchIntervalSec}`] : []),
   ];
 
@@ -90,8 +96,8 @@ export function buildUeHeadlessLaunch(options: UeHeadlessLaunchOptions): Headles
     executablePath: options.executablePath,
     windowsVerbatimArguments: true,
     autoSaveAvailable: true,
-    autoSaveEnabled: options.attrRecord,
-    autoSaveMode: 'attrrecord-log',
+    autoSaveEnabled: false,
+    autoSaveMode: 'watch-ws',
   };
 }
 
@@ -100,6 +106,7 @@ export function buildStandaloneHeadlessLaunch(options: StandaloneHeadlessLaunchO
     return { args: [], error: 'Standalone headless launch needs --standalone-exe or GSM_STANDALONE_EXE.' };
   }
 
+  const match = matchLaunchValues(options);
   const args = [
     ...RENDER_TOKENS[options.render],
     '-log',
@@ -107,15 +114,17 @@ export function buildStandaloneHeadlessLaunch(options: StandaloneHeadlessLaunchO
     ...(options.userDir ? [`-UserDir=${q(options.userDir)}`] : []),
     '-blockexitprogram',
     '-autostart',
-    `-mapid=${options.mapId}`,
-    `-nettype=${options.netType}`,
+    `-mapid=${match.mapId}`,
+    `-nettype=${match.netType}`,
     `-connmethod=${options.connMethod}`,
     `-autostartdelay=${options.autostartDelayMs}`,
     `-execdelay=${options.execDelayMs}`,
-    `-hudhidden=${options.hudHidden}`,
-    ...(options.exec ? [`-exec=${q(options.exec)}`] : []),
+    `-hudhidden=${match.hudHidden}`,
+    ...(match.exec ? [`-exec=${q(match.exec)}`] : []),
     ...(options.execCmds ? [`-ExecCmds=${q(options.execCmds)}`] : []),
-    ...(options.attrRecord ? ['-attrrecord', `-attrrecordhz=${options.attrHz}`] : []),
+    ...(match.attrRecord ? ['-attrrecord', `-attrrecordhz=${match.attrHz}`] : []),
+    ...(options.match?.aiFill ? ['-aifill'] : []),
+    ...headlessMatchArgs(options.match),
     ...(options.matchIntervalSec > 0 ? [`-matchinterval=${options.matchIntervalSec}`] : []),
   ];
 
@@ -125,8 +134,8 @@ export function buildStandaloneHeadlessLaunch(options: StandaloneHeadlessLaunchO
     executablePath: options.executablePath,
     windowsVerbatimArguments: true,
     autoSaveAvailable: true,
-    autoSaveEnabled: options.attrRecord,
-    autoSaveMode: 'attrrecord-log',
+    autoSaveEnabled: false,
+    autoSaveMode: 'watch-ws',
   };
 }
 
@@ -166,6 +175,65 @@ export function splitArgs(value: string | undefined, preserveQuotes = false): st
 
   if (current) args.push(current);
   return args;
+}
+
+export function applyHeadlessMatchArgs(
+  args: string[],
+  match: HeadlessMatchConfig | undefined,
+  options: { quoteExec?: boolean } = {},
+): string[] {
+  if (!match) return args;
+  return [
+    ...args.filter((arg) => !isMatchManagedArg(arg)),
+    '-autostart',
+    `-mapid=${match.mapId}`,
+    `-nettype=${match.nettype}`,
+    ...(match.aiFill ? ['-aifill'] : []),
+    ...(match.hudHidden == null ? [] : [`-hudhidden=${match.hudHidden ? 1 : 0}`]),
+    `-exec=${options.quoteExec ? q('SetMatchStatus 1') : 'SetMatchStatus 1'}`,
+    ...headlessMatchArgs(match),
+  ];
+}
+
+function headlessMatchArgs(match: HeadlessMatchConfig | undefined): string[] {
+  if (!match) return [];
+  return [
+    `-roster=${buildRosterSpec(match)}`,
+  ];
+}
+
+function matchLaunchValues(
+  options: Pick<
+    UeHeadlessLaunchOptions,
+    'mapId' | 'netType' | 'hudHidden' | 'attrRecord' | 'attrHz' | 'exec' | 'match'
+  >,
+): { mapId: number; netType: number; hudHidden: number; attrRecord: boolean; attrHz: number; exec?: string } {
+  const match = options.match;
+  return {
+    mapId: match?.mapId ?? options.mapId,
+    netType: match?.nettype ?? options.netType,
+    hudHidden: match?.hudHidden == null ? options.hudHidden : match.hudHidden ? 1 : 0,
+    attrRecord: options.attrRecord,
+    attrHz: options.attrHz,
+    exec: options.exec ?? (match ? 'SetMatchStatus 1' : undefined),
+  };
+}
+
+function isMatchManagedArg(arg: string): boolean {
+  const lower = arg.toLowerCase();
+  if (lower === '-autostart' || lower === '-aifill' || lower === '-attrrecord') return true;
+  return [
+    '-mapid=',
+    '-map-id=',
+    '-nettype=',
+    '-net-type=',
+    '-hudhidden=',
+    '-hud-hidden=',
+    '-attrrecordhz=',
+    '-attr-hz=',
+    '-roster=',
+    '-exec=',
+  ].some((prefix) => lower.startsWith(prefix));
 }
 
 function q(value: string | number): string {

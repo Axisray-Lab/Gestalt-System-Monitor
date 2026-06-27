@@ -76,7 +76,7 @@ export interface HeadlessLaunchBatch {
 export interface LauncherAutoSaveStatus {
   available: boolean;
   enabledByDefault: boolean;
-  mode: 'attrrecord-log' | 'configured-args' | 'off';
+  mode: 'watch-ws' | 'attrrecord-log' | 'configured-args' | 'off';
   defaultSaveDir?: string;
   reason?: string;
 }
