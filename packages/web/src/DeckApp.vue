@@ -19,9 +19,16 @@ import {
 } from 'reka-ui';
 import {
   CareerId,
+  CONSTRUCT_DEFAULTS,
+  RULESETS,
+  RosterAttrId,
+  RuleSet,
+  buildRosterSpec,
   computeSlotCost,
   computeTeamCost,
   constructsForCareer,
+  createDefaultMatch,
+  type HeadlessMatchConfig,
   type RosterSlotConfig,
   type TeamConfig,
   type WorldSnapshot,
@@ -72,6 +79,12 @@ interface DesktopMonitorSettings {
   monitors: DesktopMonitorInfo[];
 }
 
+interface DesktopLaunchSettings {
+  source: string; // 'standalone' | 'steam'
+  applied: boolean;
+  detail: string;
+}
+
 interface FolderCrumb {
   id: string | null;
   label: string;
@@ -98,6 +111,7 @@ interface MapOption {
   id: number;
   label: string;
   detail: string;
+  ruleSet: RuleSet;
 }
 
 interface RoundOption {
@@ -131,9 +145,9 @@ const RESOURCE_LIMIT_REASON = 'Available resources are below the launch budget.'
 const DESKTOP_FPS_DEBUG_STORAGE_KEY = 'gsm.desktop.fpsDebugWindow';
 const LIBRARY_STATE_STORAGE_KEY = 'gsm.deck.libraryState.v1';
 const MAP_OPTIONS: MapOption[] = [
-  { id: 9, label: 'Map 9', detail: 'Standard AI arena' },
-  { id: 3001, label: 'Sandbox 3001', detail: 'Compact telemetry map' },
-  { id: 3002, label: 'Sandbox 3002', detail: 'Wide telemetry map' },
+  { id: RULESETS[RuleSet.RMUC2026].mapId, label: RULESETS[RuleSet.RMUC2026].label, detail: 'Full 6-slot roster', ruleSet: RuleSet.RMUC2026 },
+  { id: RULESETS[RuleSet.RMUL2026].mapId, label: RULESETS[RuleSet.RMUL2026].label, detail: '3-slot league roster', ruleSet: RuleSet.RMUL2026 },
+  { id: RULESETS[RuleSet.RMUL2026_1V1].mapId, label: RULESETS[RuleSet.RMUL2026_1V1].label, detail: 'Single infantry duel', ruleSet: RuleSet.RMUL2026_1V1 },
 ];
 const ROUND_OPTIONS: RoundOption[] = [
   { id: 1, label: 'Round 1', detail: 'Single run' },
@@ -176,6 +190,7 @@ const targetMatchCount = ref(50);
 const parallelWorkerCount = ref(1);
 const launchStopBusy = ref(false);
 const pairingMode = ref<PairingMode>('balanced');
+const selectedRuleSet = ref<RuleSet>(RuleSet.RMUC2026);
 const selectedMapId = ref(MAP_OPTIONS[0].id);
 const selectedRoundCount = ref(ROUND_OPTIONS[0].id);
 const teamDrafts = ref<TeamDraft[]>([
@@ -204,6 +219,9 @@ const selectedDesktopMonitorId = ref('');
 const desktopMonitorBusy = ref(false);
 const desktopMonitorError = ref<string | null>(null);
 const desktopBridgeAvailable = ref(false);
+const launchSource = ref('standalone');
+const launchSourceDetail = ref('');
+const launchSourceBusy = ref(false);
 const libraryNotice = ref('Autosave on');
 const performanceStats = ref<ThreePerformanceStats>({
   fps: 0,
@@ -362,6 +380,23 @@ const blueTeamDraft = computed(() => teamDraftById(blueTeamDraftId.value) ?? tea
 const selectedTeamCost = computed(() => (selectedTeamDraft.value ? teamDraftCost(selectedTeamDraft.value) : 0));
 const redTeamCost = computed(() => (redTeamDraft.value ? teamDraftCost(redTeamDraft.value) : 0));
 const blueTeamCost = computed(() => (blueTeamDraft.value ? teamDraftCost(blueTeamDraft.value) : 0));
+const selectedHeadlessMatch = computed<HeadlessMatchConfig | null>(() => {
+  if (!redTeamDraft.value || !blueTeamDraft.value) return null;
+  return {
+    mapId: selectedMapId.value,
+    nettype: 0,
+    aiFill: true,
+    hudHidden: false,
+    attrrecord: autoSaveReplays.value,
+    teams: [
+      teamToConfig(redTeamDraft.value, 0),
+      teamToConfig(blueTeamDraft.value, 1),
+    ],
+  };
+});
+const selectedRosterSpec = computed(() =>
+  selectedHeadlessMatch.value ? buildRosterSpec(selectedHeadlessMatch.value) : ''
+);
 const editingTeamDraft = computed(() => (editingSlotTeamId.value ? teamDraftById(editingSlotTeamId.value) : null));
 const editingSlot = computed(() =>
   editingTeamDraft.value?.slots.find((slot) => slot.teamNumber === editingSlotNumber.value) ?? null
@@ -373,13 +408,12 @@ const autoSaveAvailable = computed(() => launcherStatus.value?.autoSave?.availab
 const autoSaveUnavailableReason = computed(
   () => launcherStatus.value?.autoSave?.reason ?? 'Local service is updating'
 );
-const launchNeedsCounting = computed(() => targetMatchCount.value > parallelWorkerCount.value);
 const resourceLimited = computed(() => launcherStatus.value?.reason === RESOURCE_LIMIT_REASON);
 const launcherReady = computed(() => {
   if (!connected.value || !launcherStatus.value || launcherBusy.value) return false;
+  if (!selectedHeadlessMatch.value) return false;
   if (launcherStatus.value.ready !== true && !resourceLimited.value) return false;
   if (autoSaveReplays.value && !autoSaveAvailable.value) return false;
-  if (launchNeedsCounting.value && !autoSaveReplays.value) return false;
   return true;
 });
 const parallelLimit = computed(() => {
@@ -398,11 +432,10 @@ const launchHint = computed(() => {
   if (autoSaveReplays.value && !autoSaveAvailable.value) {
     return autoSaveUnavailableReason.value;
   }
-  if (launchNeedsCounting.value && !autoSaveReplays.value) return 'Save required for batch progress';
   const batch = runningBatch.value ?? latestBatch.value;
   if (batch?.status === 'running') return `${batch.completedMatches}/${batch.targetMatches} done`;
   if (resourceLimited.value) return 'Low resources; click to launch anyway';
-  return `${launcherStatus.value.resources.recommendedAdditionalMatches} worker slots`;
+  return 'Custom roster launches one match';
 });
 const fpsClass = computed(() => {
   const f = performanceStats.value.fps;
@@ -421,6 +454,15 @@ const desktopMonitorHint = computed(() => {
   const selected = desktopMonitors.value.find((monitor) => monitor.id === selectedDesktopMonitorId.value);
   return selected ? '已本地保存' : '正在读取屏幕';
 });
+const launchSourceHint = computed(() => {
+  if (!desktopBridgeAvailable.value) return '仅桌面端可切换';
+  if (launchSourceBusy.value) return '正在应用';
+  if (launchSourceDetail.value) return launchSourceDetail.value;
+  return launchSource.value === 'steam' ? 'Steam 安装' : '本仓编译 standalone';
+});
+const launchSourceDisabled = computed(
+  () => !desktopBridgeAvailable.value || launchSourceBusy.value
+);
 const desktopMonitorDisabled = computed(
   () => !desktopBridgeAvailable.value || desktopMonitorBusy.value || desktopMonitors.value.length === 0
 );
@@ -457,13 +499,35 @@ watch(teamDrafts, () => {
   if (!teamDraftById(blueTeamDraftId.value) && fallback) blueTeamDraftId.value = fallback;
 }, { deep: true });
 
-function createDefaultTeam(id: string, label: string, tone: TeamTone, teamId: number): TeamDraft {
+function slotBlueprintsForRuleSet(ruleSet: RuleSet): SlotBlueprint[] {
+  return RULESETS[ruleSet].slots.map((slot) => ({
+    teamNumber: slot.teamNumber,
+    careerId: slot.careerId,
+    label: careerName(slot.careerId),
+    shortLabel: careerShortName(slot.careerId, slot.teamNumber),
+  }));
+}
+
+function cloneSlot(slot: RosterSlotConfig): RosterSlotConfig {
+  return JSON.parse(JSON.stringify(slot)) as RosterSlotConfig;
+}
+
+function createDefaultTeam(
+  id: string,
+  label: string,
+  tone: TeamTone,
+  teamId: number,
+  ruleSet: RuleSet = selectedRuleSet.value,
+): TeamDraft {
+  const defaultTeam = createDefaultMatch(ruleSet).teams.find((team) => team.teamId === teamId);
   return {
     id,
     label,
     tone,
     teamId,
-    slots: SLOT_BLUEPRINTS.map(createDefaultSlot),
+    slots: defaultTeam
+      ? defaultTeam.slots.map(cloneSlot)
+      : slotBlueprintsForRuleSet(ruleSet).map(createDefaultSlot),
   };
 }
 
@@ -478,15 +542,7 @@ function createDefaultSlot(blueprint: SlotBlueprint): RosterSlotConfig {
 }
 
 function defaultCapabilitiesForCareer(careerId: number): Partial<RosterSlotConfig> {
-  if (careerId === CareerId.Engineer) {
-    return { engineer: { maxAssemblyLevel: 4, corePool: 6 } };
-  }
-  if (careerId === CareerId.Radar) {
-    return { radar: { maxLockRangeM: 18, detectionMode: 1 } };
-  }
-  if (careerId === CareerId.Dart) {
-    return { dart: { canOutpost: true, canBase: true, maxBaseMode: 3 } };
-  }
+  void careerId;
   return {};
 }
 
@@ -494,10 +550,10 @@ function teamDraftById(id: string): TeamDraft | null {
   return teamDrafts.value.find((team) => team.id === id) ?? null;
 }
 
-function teamToConfig(team: TeamDraft): TeamConfig {
+function teamToConfig(team: TeamDraft, teamId = team.teamId): TeamConfig {
   return {
-    teamId: team.teamId,
-    slots: team.slots,
+    teamId,
+    slots: team.slots.map(cloneSlot),
   };
 }
 
@@ -514,7 +570,8 @@ function formatCost(value: number): string {
 }
 
 function slotBlueprint(teamNumber: number): SlotBlueprint {
-  return SLOT_BLUEPRINTS.find((slot) => slot.teamNumber === teamNumber) ?? SLOT_BLUEPRINTS[0];
+  const blueprints = slotBlueprintsForRuleSet(selectedRuleSet.value);
+  return blueprints.find((slot) => slot.teamNumber === teamNumber) ?? blueprints[0];
 }
 
 function careerName(careerId: number): string {
@@ -535,6 +592,27 @@ function careerName(careerId: number): string {
       return 'Dart';
     default:
       return `Career ${careerId}`;
+  }
+}
+
+function careerShortName(careerId: number, teamNumber: number): string {
+  switch (careerId) {
+    case CareerId.Hero:
+      return 'HERO';
+    case CareerId.Engineer:
+      return 'ENG';
+    case CareerId.Infantry:
+      return `INF-${teamNumber}`;
+    case CareerId.Sentry:
+      return 'SEN';
+    case CareerId.Aerial:
+      return 'AIR';
+    case CareerId.Radar:
+      return 'RAD';
+    case CareerId.Dart:
+      return 'DART';
+    default:
+      return String(teamNumber);
   }
 }
 
@@ -585,6 +663,94 @@ function setSlotConstruct(slot: RosterSlotConfig, value: number): void {
   delete slot.engineer;
   delete slot.radar;
   Object.assign(slot, defaultCapabilitiesForCareer(slot.careerId));
+}
+
+function defaultNumber(slot: RosterSlotConfig, key: keyof (typeof CONSTRUCT_DEFAULTS)[number]): number {
+  const value = CONSTRUCT_DEFAULTS[slot.entityType]?.[key];
+  return typeof value === 'number' ? value : 0;
+}
+
+function paramValue(slot: RosterSlotConfig, attrId: RosterAttrId, fallback: number): number {
+  return slot.paramOverrides?.[attrId] ?? fallback;
+}
+
+function setParam(slot: RosterSlotConfig, attrId: RosterAttrId, value: number): void {
+  if (!Number.isFinite(value)) return;
+  slot.paramOverrides = { ...(slot.paramOverrides ?? {}), [attrId]: Math.round(value) };
+}
+
+function slotHasPower(slot: RosterSlotConfig): boolean {
+  return CONSTRUCT_DEFAULTS[slot.entityType]?.dischargeW != null ||
+    slot.paramOverrides?.[RosterAttrId.CapacityEnergyPowerMax] != null;
+}
+
+function slotAmmoMeta(slot: RosterSlotConfig):
+  | { label: string; attrId: RosterAttrId; fallback: number; max: number; step: number }
+  | null {
+  const defaults = CONSTRUCT_DEFAULTS[slot.entityType];
+  if (defaults?.ammo42 != null || slot.paramOverrides?.[RosterAttrId.Real42mmAmmoCount] != null) {
+    return { label: '42mm', attrId: RosterAttrId.Real42mmAmmoCount, fallback: defaults?.ammo42 ?? 50, max: 240, step: 5 };
+  }
+  if (defaults?.ammo17 != null || slot.paramOverrides?.[RosterAttrId.Real17mmAmmoCount] != null) {
+    return { label: '17mm', attrId: RosterAttrId.Real17mmAmmoCount, fallback: defaults?.ammo17 ?? 500, max: 2400, step: 50 };
+  }
+  return null;
+}
+
+function slotHasAmmo(slot: RosterSlotConfig): boolean {
+  return slotAmmoMeta(slot) != null;
+}
+
+function ammoLabel(slot: RosterSlotConfig): string {
+  return slotAmmoMeta(slot)?.label ?? 'Ammo';
+}
+
+function ammoAttrId(slot: RosterSlotConfig): RosterAttrId {
+  return slotAmmoMeta(slot)?.attrId ?? RosterAttrId.Real17mmAmmoCount;
+}
+
+function ammoFallback(slot: RosterSlotConfig): number {
+  return slotAmmoMeta(slot)?.fallback ?? 0;
+}
+
+function ammoMax(slot: RosterSlotConfig): number {
+  return slotAmmoMeta(slot)?.max ?? 0;
+}
+
+function ammoStep(slot: RosterSlotConfig): number {
+  return slotAmmoMeta(slot)?.step ?? 1;
+}
+
+function fireInterval(slot: RosterSlotConfig): number {
+  if (slot.firingIntervalMs != null) return slot.firingIntervalMs;
+  const fireRateHz = CONSTRUCT_DEFAULTS[slot.entityType]?.fireRateHz;
+  return fireRateHz ? Math.round(1000 / fireRateHz) : 0;
+}
+
+function setFireInterval(slot: RosterSlotConfig, value: number): void {
+  if (!Number.isFinite(value) || value <= 0) return;
+  slot.firingIntervalMs = Math.max(20, Math.min(240, Math.round(value)));
+}
+
+function ensureSpread(slot: RosterSlotConfig): NonNullable<RosterSlotConfig['spread']> {
+  slot.spread ??= { maxEnclosing: 0, minEnclosing: 0 };
+  return slot.spread;
+}
+
+function setSpreadValue(slot: RosterSlotConfig, key: 'maxEnclosing' | 'minEnclosing', value: number): void {
+  if (!Number.isFinite(value)) return;
+  ensureSpread(slot)[key] = Math.max(0, Math.min(120, Math.round(value)));
+}
+
+function resetTeamsForRuleSet(ruleSet: RuleSet): void {
+  selectedRuleSet.value = ruleSet;
+  teamDrafts.value = [
+    createDefaultTeam('team-red-a', 'Red A', 'red', 0, ruleSet),
+    createDefaultTeam('team-blue-a', 'Blue A', 'blue', 1, ruleSet),
+  ];
+  redTeamDraftId.value = teamDrafts.value[0].id;
+  blueTeamDraftId.value = teamDrafts.value[1].id;
+  selectTeamDraft(teamDrafts.value[0].id);
 }
 
 function slotSupportsEngineer(slot: RosterSlotConfig): boolean {
@@ -657,6 +823,8 @@ function setRadarMode(slot: RosterSlotConfig, mode: number): void {
 
 function selectMap(id: number): void {
   selectedMapId.value = id;
+  const option = MAP_OPTIONS.find((candidate) => candidate.id === id);
+  if (option && option.ruleSet !== selectedRuleSet.value) resetTeamsForRuleSet(option.ruleSet);
 }
 
 function selectRound(count: number): void {
@@ -798,6 +966,52 @@ function handleDesktopMonitorChange(event: Event): void {
   const target = event.target;
   if (!(target instanceof HTMLSelectElement)) return;
   void setDesktopMonitor(target.value);
+}
+
+function applyDesktopLaunchSettings(settings: DesktopLaunchSettings): void {
+  launchSource.value = settings.source;
+  launchSourceDetail.value = settings.detail;
+  desktopBridgeAvailable.value = true;
+}
+
+async function loadDesktopLaunchSettings(): Promise<void> {
+  const request = tauriInvoke<DesktopLaunchSettings>('desktop_launch_settings');
+  if (!request) return;
+  launchSourceBusy.value = true;
+  try {
+    applyDesktopLaunchSettings(await request);
+  } catch (err) {
+    launchSourceDetail.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    launchSourceBusy.value = false;
+  }
+}
+
+async function setDesktopLaunchSource(source: string): Promise<void> {
+  if (!source || source === launchSource.value) return;
+  const previous = launchSource.value;
+  launchSource.value = source;
+  const request = tauriInvoke<DesktopLaunchSettings>('desktop_set_launch_source', { source });
+  if (!request) {
+    launchSource.value = previous;
+    desktopBridgeAvailable.value = false;
+    return;
+  }
+  launchSourceBusy.value = true;
+  try {
+    applyDesktopLaunchSettings(await request);
+  } catch (err) {
+    launchSource.value = previous;
+    launchSourceDetail.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    launchSourceBusy.value = false;
+  }
+}
+
+function handleLaunchSourceChange(event: Event): void {
+  const target = event.target;
+  if (!(target instanceof HTMLSelectElement)) return;
+  void setDesktopLaunchSource(target.value);
 }
 
 function formatCount(value: number): string {
@@ -1238,21 +1452,22 @@ function setRoundSeed(value: number): void {
 
 async function launchMatches(): Promise<void> {
   if (!launcherReady.value) return;
-  setTargetMatchCount(targetMatchCount.value);
-  setParallelWorkerCount(parallelWorkerCount.value);
+  const match = selectedHeadlessMatch.value;
+  if (!match) return;
   setRoundSeed(roundSeed.value);
   try {
     const response = await launchHeadlessMatches({
-      targetMatches: targetMatchCount.value,
-      parallelism: parallelWorkerCount.value,
+      targetMatches: 1,
+      parallelism: 1,
       autoSave: autoSaveReplays.value,
       force: resourceLimited.value,
+      match,
     });
     if (!response.ok) {
       libraryNotice.value = response.error ?? 'Launch failed';
       return;
     }
-    libraryNotice.value = `${targetMatchCount.value} target · ${response.launched.length} worker(s)`;
+    libraryNotice.value = `Custom match · ${response.launched.length} worker`;
   } catch (err) {
     libraryNotice.value = err instanceof Error ? err.message : String(err);
   }
@@ -1283,7 +1498,10 @@ async function stopRunningBatch(): Promise<void> {
 function toggleDesktopSettings(): void {
   const nextOpen = !desktopSettingsOpen.value;
   desktopSettingsOpen.value = nextOpen;
-  if (nextOpen) void loadDesktopMonitorSettings();
+  if (nextOpen) {
+    void loadDesktopMonitorSettings();
+    void loadDesktopLaunchSettings();
+  }
 }
 
 function closeTransientUi(): void {
@@ -1406,6 +1624,7 @@ onMounted(() => {
   });
   start();
   void loadDesktopMonitorSettings();
+  void loadDesktopLaunchSettings();
 });
 
 onBeforeUnmount(() => {
@@ -1667,7 +1886,7 @@ onBeforeUnmount(() => {
                   :disabled="runningBatch ? launchStopBusy : !launcherReady"
                   @click.stop="runningBatch ? stopRunningBatch() : launchMatches()"
                 >
-                  {{ runningBatch ? (launchStopBusy ? 'Stopping' : 'Stop batch') : (launcherBusy ? 'Launching' : 'Launch batch') }}
+                  {{ runningBatch ? (launchStopBusy ? 'Stopping' : 'Stop match') : (launcherBusy ? 'Launching' : 'Launch custom') }}
                 </button>
 
                 <dl class="match-summary">
@@ -1730,6 +1949,11 @@ onBeforeUnmount(() => {
                     <span>{{ autoSaveReplays ? 'Autosave on' : 'Autosave off' }}</span>
                   </label>
                   <small>{{ launchHint }}</small>
+                </div>
+
+                <div class="roster-preview">
+                  <span>Roster</span>
+                  <code :title="selectedRosterSpec">{{ selectedRosterSpec }}</code>
                 </div>
               </section>
 
@@ -1820,8 +2044,8 @@ onBeforeUnmount(() => {
 
           <TabsContent value="teams" class="dock-teams" aria-label="Team builder">
             <div class="dock-section-head">
-              <strong>配队成本</strong>
-              <small>{{ selectedTeamDraft?.label ?? 'No team' }} · {{ formatCost(selectedTeamCost) }}</small>
+              <strong>配队</strong>
+              <small>{{ selectedMap.label }} · {{ selectedTeamDraft?.label ?? 'No team' }} · {{ formatCost(selectedTeamCost) }}</small>
             </div>
 
             <div class="team-builder">
@@ -1853,10 +2077,11 @@ onBeforeUnmount(() => {
                     :key="slot.teamNumber"
                     class="slot-row"
                     :class="{ active: selectedTeamDraft.id === editingSlotTeamId && slot.teamNumber === editingSlotNumber }"
+                    @click.stop="editSlotDetails(selectedTeamDraft, slot)"
                   >
                     <div class="slot-copy">
                       <strong>{{ slotBlueprint(slot.teamNumber).shortLabel }}</strong>
-                      <small>{{ careerName(slot.careerId) }} · {{ formatCost(slotCost(slot)) }}</small>
+                      <small>{{ careerName(slot.careerId) }}</small>
                     </div>
                     <select
                       :value="slot.entityType"
@@ -1871,29 +2096,96 @@ onBeforeUnmount(() => {
                         {{ construct.name }}
                       </option>
                     </select>
-                    <button type="button" @click.stop="editSlotDetails(selectedTeamDraft, slot)">编辑</button>
+                    <strong class="slot-cost">{{ formatCost(slotCost(slot)) }}</strong>
+                    <button class="slot-inspect-button" type="button" @click.stop="editSlotDetails(selectedTeamDraft, slot)">
+                      参数
+                    </button>
                   </article>
                 </div>
               </section>
 
               <section v-if="editingSlot" class="slot-detail-menu" aria-label="Slot detail">
-                <div class="level-head">
-                  <strong>{{ constructLabel(editingSlot.entityType) }}</strong>
-                  <small>{{ slotBlueprint(editingSlot.teamNumber).label }} · {{ formatCost(editingSlotCost) }}</small>
+                <div class="slot-inspector-head">
+                  <div>
+                    <strong>{{ constructLabel(editingSlot.entityType) }}</strong>
+                    <span>{{ slotBlueprint(editingSlot.teamNumber).label }} · {{ constructTierLabel(editingSlot.entityType) }}</span>
+                  </div>
+                  <b>{{ formatCost(editingSlotCost) }}</b>
                 </div>
-                <dl class="cost-breakdown">
-                  <div>
-                    <dt>构型</dt>
-                    <dd>{{ constructTierLabel(editingSlot.entityType) }}</dd>
-                  </div>
-                  <div>
-                    <dt>费用</dt>
-                    <dd>{{ formatCost(editingSlotCost) }}</dd>
-                  </div>
-                </dl>
 
-                <div v-if="slotSupportsEngineer(editingSlot)" class="detail-group">
-                  <strong>工程效果</strong>
+                <div class="field-board">
+                  <div class="detail-grid two">
+                    <label v-if="slotHasPower(editingSlot)" class="param-field">
+                      <span>Power</span>
+                      <input
+                        :value="paramValue(editingSlot, RosterAttrId.CapacityEnergyPowerMax, defaultNumber(editingSlot, 'dischargeW'))"
+                        type="number"
+                        min="0"
+                        max="300"
+                        step="10"
+                        @change="setParam(editingSlot, RosterAttrId.CapacityEnergyPowerMax, Number(($event.target as HTMLInputElement).value))"
+                      />
+                    </label>
+                    <label v-if="slotHasAmmo(editingSlot)" class="param-field">
+                      <span>{{ ammoLabel(editingSlot) }}</span>
+                      <input
+                        :value="paramValue(editingSlot, ammoAttrId(editingSlot), ammoFallback(editingSlot))"
+                        type="number"
+                        min="0"
+                        :max="ammoMax(editingSlot)"
+                        :step="ammoStep(editingSlot)"
+                        @change="setParam(editingSlot, ammoAttrId(editingSlot), Number(($event.target as HTMLInputElement).value))"
+                      />
+                    </label>
+                    <label v-if="fireInterval(editingSlot) > 0" class="param-field">
+                      <span>Interval</span>
+                      <input
+                        :value="fireInterval(editingSlot)"
+                        type="number"
+                        min="20"
+                        max="240"
+                        step="1"
+                        @change="setFireInterval(editingSlot, Number(($event.target as HTMLInputElement).value))"
+                      />
+                    </label>
+                    <label class="param-field">
+                      <span>Spread max</span>
+                      <input
+                        :value="editingSlot.spread?.maxEnclosing ?? 0"
+                        type="number"
+                        min="0"
+                        max="120"
+                        step="1"
+                        @change="setSpreadValue(editingSlot, 'maxEnclosing', Number(($event.target as HTMLInputElement).value))"
+                      />
+                    </label>
+                    <label class="param-field">
+                      <span>Spread min</span>
+                      <input
+                        :value="editingSlot.spread?.minEnclosing ?? 0"
+                        type="number"
+                        min="0"
+                        max="120"
+                        step="1"
+                        @change="setSpreadValue(editingSlot, 'minEnclosing', Number(($event.target as HTMLInputElement).value))"
+                      />
+                    </label>
+                    <label class="param-field">
+                      <span>Move spread</span>
+                      <input
+                        :value="paramValue(editingSlot, RosterAttrId.ShooterSpeedSpreadPara, 0)"
+                        type="number"
+                        min="0"
+                        max="120"
+                        step="1"
+                        @change="setParam(editingSlot, RosterAttrId.ShooterSpeedSpreadPara, Number(($event.target as HTMLInputElement).value))"
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                <div v-if="slotSupportsEngineer(editingSlot)" class="field-board">
+                  <span class="field-label">Assembly level</span>
                   <div class="segmented">
                     <button
                       v-for="level in [1, 2, 3, 4]"
@@ -1905,6 +2197,7 @@ onBeforeUnmount(() => {
                       L{{ level }}
                     </button>
                   </div>
+                  <span class="field-label">Core pool</span>
                   <div class="segmented">
                     <button
                       v-for="pool in [2, 4, 6]"
@@ -1918,10 +2211,9 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
-                <div v-if="slotSupportsRadar(editingSlot)" class="detail-group">
-                  <strong>雷达效果</strong>
+                <div v-if="slotSupportsRadar(editingSlot)" class="field-board">
                   <label class="range-field">
-                    <span>{{ editingSlot.radar?.maxLockRangeM ?? 18 }}m</span>
+                    <span>Radar range · {{ editingSlot.radar?.maxLockRangeM ?? 18 }}m</span>
                     <input
                       :value="editingSlot.radar?.maxLockRangeM ?? 18"
                       type="range"
@@ -1943,7 +2235,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
-                <div v-if="slotSupportsDart(editingSlot)" class="detail-group">
+                <div v-if="slotSupportsDart(editingSlot)" class="field-board">
                   <label class="save-toggle">
                     <input
                       type="checkbox"
@@ -1987,7 +2279,7 @@ onBeforeUnmount(() => {
                   v-if="!slotSupportsEngineer(editingSlot) && !slotSupportsRadar(editingSlot) && !slotSupportsDart(editingSlot)"
                   class="level-empty"
                 >
-                  {{ constructTierLabel(editingSlot.entityType) }}
+                  通用参数会随 roster 一起下发
                 </div>
               </section>
             </div>
@@ -2105,6 +2397,20 @@ onBeforeUnmount(() => {
             <option v-for="monitor in desktopMonitors" :key="monitor.id" :value="monitor.id">
               {{ monitor.label }}
             </option>
+          </select>
+        </label>
+        <label class="settings-field">
+          <span class="settings-copy">
+            <strong>启动源</strong>
+            <small>{{ launchSourceHint }}</small>
+          </span>
+          <select
+            :value="launchSource"
+            :disabled="launchSourceDisabled"
+            @change="handleLaunchSourceChange"
+          >
+            <option value="standalone">本地 standalone（本仓编译）</option>
+            <option value="steam">Steam 安装</option>
           </select>
         </label>
       </section>
@@ -2338,14 +2644,16 @@ onBeforeUnmount(() => {
 
 .dock-section-head strong {
   color: var(--text);
-  font-size: var(--gsm-fs-title);
+  font-size: 15px;
   font-weight: 900;
+  line-height: 1.15;
 }
 
 .dock-section-head small {
   color: var(--text-dim);
-  font-size: var(--gsm-fs-meta);
+  font-size: 12px;
   font-weight: 800;
+  line-height: 1.2;
 }
 
 .file-browser {
@@ -2473,14 +2781,16 @@ onBeforeUnmount(() => {
 
 .level-head strong {
   color: var(--text);
-  font-size: var(--gsm-fs-body);
+  font-size: 14px;
   font-weight: 900;
+  line-height: 1.15;
 }
 
 .level-head small {
   color: var(--text-dim);
-  font-size: var(--gsm-fs-meta);
+  font-size: 12px;
   font-weight: 800;
+  line-height: 1.2;
 }
 
 .replay-list,
@@ -2533,7 +2843,7 @@ onBeforeUnmount(() => {
 .replay-row span,
 .choice-row span,
 .team-row span {
-  font-size: var(--gsm-fs-body);
+  font-size: 13px;
   font-weight: 900;
 }
 
@@ -2541,7 +2851,7 @@ onBeforeUnmount(() => {
 .choice-row small,
 .team-row small {
   color: var(--text-dim);
-  font-size: var(--gsm-fs-caption);
+  font-size: 11px;
   font-weight: 800;
 }
 
@@ -2567,7 +2877,7 @@ onBeforeUnmount(() => {
 }
 
 .match-primary {
-  grid-template-rows: 30px minmax(150px, 0.8fr) 60px 38px;
+  grid-template-rows: 30px minmax(120px, 0.8fr) 60px 38px minmax(34px, auto);
   gap: 8px;
   height: 100%;
   padding: 6px;
@@ -2625,6 +2935,38 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+
+.roster-preview {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  border: 1px solid rgba(36, 50, 64, 0.72);
+  border-radius: var(--gsm-radius-md);
+  padding: 5px 6px;
+  background: rgba(8, 13, 18, 0.58);
+}
+
+.roster-preview span {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: var(--gsm-fs-caption);
+  font-weight: 900;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.roster-preview code {
+  min-width: 0;
+  overflow: hidden;
+  color: #9fb3c6;
+  font-family: var(--gsm-font-mono);
+  font-size: var(--gsm-fs-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .match-detail-panel {
@@ -2795,18 +3137,23 @@ onBeforeUnmount(() => {
 .save-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  min-height: 34px;
   min-width: 0;
+  border: 1px solid rgba(36, 50, 64, 0.72);
+  border-radius: var(--gsm-radius-md);
+  padding: 0 9px;
+  background: rgba(8, 13, 18, 0.48);
   color: var(--text-dim);
   cursor: pointer;
-  font-size: var(--gsm-fs-meta);
-  font-weight: 800;
+  font-size: 12px;
+  font-weight: 900;
 }
 
 .save-toggle input,
 .toggle-grid input {
-  width: 13px;
-  height: 13px;
+  width: 15px;
+  height: 15px;
   accent-color: #3ec07a;
 }
 
@@ -2863,16 +3210,16 @@ onBeforeUnmount(() => {
 
 .launch-count {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) var(--gsm-control-xs) 44px var(--gsm-control-xs);
+  grid-template-columns: minmax(0, 1fr) 32px 56px 32px;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   min-width: 0;
 }
 
 .launch-count span {
   overflow: hidden;
   color: var(--text-dim);
-  font-size: var(--gsm-fs-meta);
+  font-size: 12px;
   font-weight: 800;
   text-overflow: ellipsis;
   text-transform: uppercase;
@@ -2880,22 +3227,24 @@ onBeforeUnmount(() => {
 }
 
 .launch-count button {
-  width: var(--gsm-control-xs);
-  height: var(--gsm-control-xs);
+  width: 32px;
+  height: 32px;
   padding: 0;
+  font-size: 16px;
+  line-height: 1;
 }
 
 .launch-count input {
-  width: 44px;
-  height: var(--gsm-control-xs);
+  width: 56px;
+  height: 32px;
   min-width: 0;
   border: 1px solid rgba(36, 50, 64, 0.92);
   border-radius: var(--gsm-radius-sm);
   background: rgba(6, 10, 14, 0.82);
   color: var(--text);
   font: inherit;
-  font-size: var(--gsm-fs-body);
-  font-weight: 800;
+  font-size: 14px;
+  font-weight: 900;
   text-align: center;
 }
 
@@ -3262,7 +3611,7 @@ onBeforeUnmount(() => {
 }
 
 .team-new,
-.slot-row button {
+.slot-inspect-button {
   min-width: 0;
   height: var(--gsm-control-sm);
   border: 1px solid rgba(54, 77, 98, 0.86);
@@ -3276,7 +3625,7 @@ onBeforeUnmount(() => {
 }
 
 .team-new:hover,
-.slot-row button:hover {
+.slot-inspect-button:hover {
   border-color: var(--accent);
   background: rgba(24, 42, 58, 0.96);
 }
@@ -3296,29 +3645,33 @@ onBeforeUnmount(() => {
   bottom: 0;
   z-index: var(--gsm-z-overlay);
   grid-template-rows: 38px minmax(0, 1fr);
-  gap: 6px;
+  gap: 8px;
   width: var(--gsm-overlay-slot);
-  padding: 6px;
+  padding: 8px;
   background: var(--gsm-surface-glass);
   box-shadow: var(--gsm-shadow-overlay);
 }
 
 .slot-list {
+  gap: 8px;
+  overflow-x: hidden;
   padding-right: 2px;
 }
 
 .slot-row {
   display: grid;
-  grid-template-columns: 64px minmax(0, 1fr) 48px;
+  grid-template-columns: 68px minmax(104px, 1fr) 50px 48px;
   align-items: center;
-  gap: 5px;
+  gap: 8px;
   min-width: 0;
   border: 1px solid rgba(36, 50, 64, 0.82);
   border-radius: var(--gsm-radius-md);
-  padding: 5px;
+  padding: 8px;
   background: rgba(20, 29, 38, 0.68);
+  cursor: pointer;
 }
 
+.slot-row:hover,
 .slot-row.active {
   border-color: rgba(79, 159, 224, 0.86);
   background: rgba(22, 34, 46, 0.94);
@@ -3338,25 +3691,41 @@ onBeforeUnmount(() => {
 
 .slot-copy strong {
   color: var(--text);
-  font-size: var(--gsm-fs-meta);
+  font-size: 13px;
   font-weight: 900;
+  line-height: 1.1;
 }
 
 .slot-copy small {
   color: var(--text-dim);
-  font-size: var(--gsm-fs-caption);
+  font-size: 11px;
   font-weight: 800;
+  line-height: 1.2;
 }
 
 .slot-row select {
   width: 100%;
+  height: 32px;
+  font-size: 13px;
 }
 
-.slot-row button {
+.slot-cost {
+  justify-self: end;
+  min-width: 0;
+  overflow: hidden;
+  color: #d9e8f5;
+  font-size: 13px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slot-inspect-button {
   width: 48px;
-  height: 26px;
+  height: 32px;
   padding: 0;
-  font-size: var(--gsm-fs-meta);
+  font-size: 13px;
+  font-weight: 900;
 }
 
 .slot-detail-menu {
@@ -3365,71 +3734,139 @@ onBeforeUnmount(() => {
   top: 0;
   bottom: 0;
   z-index: var(--gsm-z-overlay-raised);
-  grid-template-rows: 38px 52px min-content min-content min-content minmax(0, 1fr);
-  gap: 6px;
-  width: var(--gsm-overlay-detail);
-  padding: 6px;
+  grid-template-rows: min-content;
+  grid-auto-rows: min-content;
+  align-content: start;
+  gap: 10px;
+  width: 348px;
+  padding: 10px;
+  overflow-y: auto;
   background: rgba(13, 19, 26, 0.97);
   box-shadow: 14px 0 30px rgba(0, 0, 0, 0.34);
 }
 
-.cost-breakdown {
+.slot-inspector-head {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 5px;
-  margin: 0;
-}
-
-.cost-breakdown div {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
-  border: 1px solid rgba(36, 50, 64, 0.72);
+  border: 1px solid rgba(54, 77, 98, 0.76);
   border-radius: var(--gsm-radius-md);
-  padding: 5px 6px;
-  background: rgba(10, 16, 22, 0.64);
+  padding: 9px 10px;
+  background: rgba(10, 16, 22, 0.72);
 }
 
-.cost-breakdown dt,
-.cost-breakdown dd {
+.slot-inspector-head div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.slot-inspector-head strong,
+.slot-inspector-head span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.cost-breakdown dt {
-  color: var(--text-dim);
-  font-size: var(--gsm-fs-caption);
-  font-weight: 800;
-  text-transform: uppercase;
-}
-
-.cost-breakdown dd {
-  margin: 0;
+.slot-inspector-head strong {
   color: var(--text);
-  font-size: var(--gsm-fs-body);
+  font-size: 16px;
   font-weight: 900;
+  line-height: 1.15;
 }
 
-.detail-group {
+.slot-inspector-head span {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.slot-inspector-head b {
+  color: #d9e8f5;
+  font-size: 15px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.field-board {
   display: grid;
-  gap: 6px;
+  gap: 8px;
   min-width: 0;
   border: 1px solid rgba(36, 50, 64, 0.62);
   border-radius: var(--gsm-radius-md);
-  padding: 6px;
+  padding: 9px;
   background: rgba(11, 18, 25, 0.5);
 }
 
-.detail-group > strong {
+.field-label {
   overflow: hidden;
-  color: var(--text);
-  font-size: var(--gsm-fs-meta);
+  color: #a8bacb;
+  font-size: 12px;
   font-weight: 900;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+}
+
+.detail-grid {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.detail-grid.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.detail-grid.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.param-field {
+  display: grid;
+  grid-template-rows: 16px 34px;
+  gap: 4px;
+  min-width: 0;
+}
+
+.param-field span {
+  overflow: hidden;
+  color: #a8bacb;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.param-field input {
+  min-width: 0;
+  height: 34px;
+  border: 1px solid rgba(54, 77, 98, 0.92);
+  border-radius: var(--gsm-radius-md);
+  padding: 0 8px;
+  background: rgba(6, 10, 14, 0.88);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 900;
+  text-align: center;
 }
 
 .segmented {
   grid-template-columns: repeat(auto-fit, minmax(34px, 1fr));
+}
+
+.slot-detail-menu .segmented {
+  gap: 7px;
+}
+
+.slot-detail-menu .segmented button {
+  height: 34px;
+  font-size: 13px;
+  font-weight: 900;
 }
 
 .range-field input {
@@ -3437,19 +3874,41 @@ onBeforeUnmount(() => {
   accent-color: #53aae2;
 }
 
+.slot-detail-menu .range-field {
+  gap: 8px;
+}
+
+.slot-detail-menu .range-field span {
+  color: #a8bacb;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.2;
+  text-transform: none;
+}
+
+.slot-detail-menu .range-field input {
+  height: 28px;
+}
+
 .toggle-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .toggle-grid label {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 7px;
   min-width: 0;
+  min-height: 34px;
+  border: 1px solid rgba(36, 50, 64, 0.72);
+  border-radius: var(--gsm-radius-md);
+  padding: 0 9px;
+  background: rgba(8, 13, 18, 0.48);
   color: var(--text-dim);
   cursor: pointer;
-  font-size: var(--gsm-fs-meta);
-  font-weight: 800;
+  font-size: 12px;
+  font-weight: 900;
 }
 
 :deep(.dock-context) {

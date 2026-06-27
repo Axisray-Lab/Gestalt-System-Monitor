@@ -35,18 +35,40 @@ browser then connects **directly** to each game process's WebSocket
 ```bash
 npm install
 
-# Terminal A — discovery/launcher agent with a built-in fake LAN (no game build needed):
-npm run agent:mock
+# The SPA — `npm run dev` ALSO auto-spawns the real discovery/launcher agent
+# (no second terminal needed):
+npm run dev                       # http://localhost:5180  (+ agent on :7788)
 
-# Terminal B — the monitor SPA:
-npm run dev        # http://localhost:5180
+# Built-in fake LAN instead of real discovery:
+GSM_AGENT="--mock" npm run dev    # PowerShell: $env:GSM_AGENT='--mock'; npm run dev
+
+# Run the agent yourself (don't let the dev server spawn one):
+GSM_AGENT=off npm run dev
+```
+
+For the **full product** — the desktop dock that docks to the screen edge and
+launches matches — see [`docs/DESKTOP.md`](docs/DESKTOP.md):
+
+```bash
+npm run desktop:dev               # web@5180 + auto agent@7788 + the Tauri dock
+# or, detached + clean (Windows):  pwsh scripts/monitor-start.ps1 -Restart
 ```
 
 - The SPA opens on the **Built-in mock match** immediately (no agent required).
-- With `agent:mock` running, two fake "LAN matches" appear in the sidebar; click
-  one to watch its live `ws://` feed end-to-end.
-- For real matches, run `npm run agent` (no `--mock`) once the game-side
-  support is in place.
+- With `GSM_AGENT="--mock"`, two fake "LAN matches" appear in the sidebar; click one
+  to watch its live `ws://` feed end-to-end.
+- The dev server auto-discovers replay datasets under `./traces` — see
+  [Local launcher](#local-launcher) and [`docs/DESKTOP.md`](docs/DESKTOP.md).
+
+> **Local config** lives in a gitignored `.env.local` (copy [`.env.example`](.env.example)) —
+> launch profile, the standalone exe path, agent mode, etc. See
+> [`docs/DESKTOP.md`](docs/DESKTOP.md#dev-launch-source-local-standalone-vs-steam).
+
+> **Clean shutdown matters:** the desktop dock reserves a screen edge (a Windows
+> AppBar) and parents the agent + any launched game. Close the dock window normally,
+> or run `pwsh scripts/monitor-stop.ps1`, so those resources are released — a hard
+> `taskkill /F` leaks the reserved strip and orphans game windows. See
+> [`docs/DESKTOP.md`](docs/DESKTOP.md#startup--shutdown-resource-lifecycle-read-this-for-killed-but-not-released).
 
 ## Local launcher
 
@@ -126,7 +148,8 @@ the SPA with `?agent=ws://localhost:7790`.
 |---|---|
 | `packages/protocol` | Shared TS types + wire constants for the game's LAN beacon, JSON-RPC envelope, and the `monitor.*` feed. |
 | `packages/agent` | Node discovery agent (UDP sniff → browser WS). `--mock` synthesizes a fake LAN. |
-| `packages/web` | Vite + Vue 3 + Three.js SPA. |
+| `packages/web` | Vite + Vue 3 + Three.js SPA (the `index.html` monitor + the `deck.html` dock UI). |
+| `packages/desktop` | Tauri bottom-edge **AppBar dock** that loads the deck UI and auto-spawns the agent as a background local service. See [`docs/DESKTOP.md`](docs/DESKTOP.md). |
 
 ## Conventions matched to the game
 

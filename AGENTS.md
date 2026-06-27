@@ -19,6 +19,7 @@ before committing.
 - `packages/protocol` — shared wire types/constants (single source of truth).
 - `packages/agent` — Node LAN discovery agent (`--mock` synthesizes a fake LAN).
 - `packages/web` — Vite + Vue 3 + Three.js SPA.
+- `packages/desktop` — Tauri bottom-edge AppBar dock; loads the deck UI and auto-spawns the agent. See `docs/DESKTOP.md`.
 
 ## Working agreements
 

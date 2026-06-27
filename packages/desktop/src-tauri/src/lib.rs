@@ -19,7 +19,10 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     time::Duration,
 };
 use tauri::{AppHandle, Manager, Monitor};
@@ -27,13 +30,33 @@ use tauri::{AppHandle, Manager, Monitor};
 const DESKTOP_SETTINGS_FILE: &str = "desktop-settings.json";
 const LOCAL_SERVICE_PORT: u16 = 7788;
 const LOCAL_SERVICE_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const DEFAULT_LAUNCH_SOURCE: &str = "standalone";
 
 static LOCAL_SERVICE_CHILD: Mutex<Option<Child>> = Mutex::new(None);
+// Set true once the persisted launch source has been pushed to a live agent this
+// session; reset on (re)spawn so a fresh agent re-receives a non-default choice.
+static LAUNCH_SOURCE_APPLIED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopSettings {
     monitor_id: Option<String>,
+    // Dev launch source: "standalone" (repo editor build, default) | "steam".
+    // Stored in the OS app-config dir (outside the repo); the real exe path lives in
+    // the gitignored Monitor/.env.local, never here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopLaunchSettings {
+    /// The persisted choice shown in the dock toggle.
+    source: String,
+    /// Whether the running agent acknowledged the choice this call.
+    applied: bool,
+    /// Human-readable detail: resolved exe, or why it could not apply.
+    detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -377,6 +400,30 @@ mod appbar {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod single_instance {
+    use windows::core::w;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    /// Acquire a session-wide named mutex. Returns `false` if another dock instance
+    /// already holds it (caller should exit to avoid stacking a 2nd AppBar). The
+    /// handle is intentionally leaked so it stays held until the OS reclaims it on
+    /// process exit (which also lets the next instance acquire cleanly).
+    pub fn acquire() -> bool {
+        unsafe {
+            // The handle is deliberately never closed: HANDLE is a plain Copy value
+            // with no RAII drop, so the mutex stays held for the whole process
+            // lifetime and is released by the OS on exit.
+            match CreateMutexW(None, true, w!("GestaltSystemMonitorDock_SingleInstance")) {
+                Ok(_handle) => GetLastError() != ERROR_ALREADY_EXISTS,
+                // If the mutex can't be created, don't block startup.
+                Err(_) => true,
+            }
+        }
+    }
+}
+
 fn monitor_id(monitor: &Monitor) -> String {
     let position = monitor.position();
     let size = monitor.size();
@@ -493,12 +540,10 @@ fn desktop_monitor_settings_for(
     }
 
     if persist {
-        save_desktop_settings(
-            app,
-            &DesktopSettings {
-                monitor_id: Some(selected_monitor_id.clone()),
-            },
-        )?;
+        // Preserve other fields (e.g. launch_source) — only update the monitor id.
+        let mut settings = load_desktop_settings(app);
+        settings.monitor_id = Some(selected_monitor_id.clone());
+        save_desktop_settings(app, &settings)?;
     }
 
     let monitors = monitors
@@ -543,8 +588,144 @@ fn desktop_set_monitor(
     desktop_monitor_settings_for(&app, Some(monitor_id), true, true)
 }
 
+// --- dev launch source (local standalone vs Steam) ----------------------------
+
+fn normalize_launch_source(source: &str) -> String {
+    match source.trim().to_lowercase().as_str() {
+        "steam" => "steam".to_string(),
+        _ => DEFAULT_LAUNCH_SOURCE.to_string(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSourceResponse {
+    ok: Option<bool>,
+    #[serde(rename = "executablePath")]
+    executable_path: Option<String>,
+    error: Option<String>,
+}
+
+/// One-shot HTTP/1.1 request to the local agent over a TCP stream (the same loopback
+/// transport `local_service_status` already uses). Returns the response BODY only.
+fn agent_request(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+    let mut stream = connect_localhost(LOCAL_SERVICE_PORT)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(2000)));
+    let body = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+        method = method,
+        path = path,
+        port = LOCAL_SERVICE_PORT,
+        len = body.len(),
+        body = body,
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("写入本地服务失败: {err}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|err| format!("读取本地服务失败: {err}"))?;
+    Ok(response
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default())
+}
+
+/// POST the chosen source to the running agent. Returns (applied, human detail).
+fn push_launch_source(source: &str) -> (bool, String) {
+    let payload = format!("{{\"source\":\"{source}\"}}");
+    match agent_request("POST", "/launch/source", Some(&payload)) {
+        Ok(body) => match serde_json::from_str::<AgentSourceResponse>(&body) {
+            Ok(parsed) => {
+                if parsed.ok.unwrap_or(false) {
+                    let exe = parsed.executable_path.unwrap_or_default();
+                    (true, if exe.is_empty() { "已应用".to_string() } else { exe })
+                } else {
+                    (
+                        false,
+                        parsed.error.unwrap_or_else(|| "本地服务拒绝了该启动源".to_string()),
+                    )
+                }
+            }
+            Err(_) => (false, "本地服务返回无法解析".to_string()),
+        },
+        Err(err) => (false, format!("本地服务未运行（已保存，下次启动生效）: {err}")),
+    }
+}
+
+/// On startup / after a respawn, push a persisted non-default source to the agent.
+/// Standalone is the agent's own default (via .env.local), so it needs no push.
+fn apply_persisted_launch_source(app: &AppHandle) {
+    if LAUNCH_SOURCE_APPLIED.load(Ordering::SeqCst) {
+        return;
+    }
+    let source = load_desktop_settings(app)
+        .launch_source
+        .map(|s| normalize_launch_source(&s))
+        .unwrap_or_else(|| DEFAULT_LAUNCH_SOURCE.to_string());
+    if source == DEFAULT_LAUNCH_SOURCE {
+        LAUNCH_SOURCE_APPLIED.store(true, Ordering::SeqCst);
+        return;
+    }
+    if local_service_status(LOCAL_SERVICE_PORT) != LocalServiceStatus::Current {
+        return; // agent not ready yet; retry next supervisor tick
+    }
+    let (ok, detail) = push_launch_source(&source);
+    if ok {
+        LAUNCH_SOURCE_APPLIED.store(true, Ordering::SeqCst);
+        log::info!("applied persisted launch source '{source}': {detail}");
+    } else {
+        log::warn!("could not apply persisted launch source '{source}': {detail}");
+    }
+}
+
+#[tauri::command]
+fn desktop_launch_settings(app: AppHandle) -> Result<DesktopLaunchSettings, String> {
+    let source = load_desktop_settings(&app)
+        .launch_source
+        .map(|s| normalize_launch_source(&s))
+        .unwrap_or_else(|| DEFAULT_LAUNCH_SOURCE.to_string());
+    let detail = match agent_request("GET", "/launch/source", None) {
+        Ok(body) => serde_json::from_str::<AgentSourceResponse>(&body)
+            .ok()
+            .and_then(|r| r.executable_path.or(r.error))
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+    Ok(DesktopLaunchSettings {
+        source,
+        applied: LAUNCH_SOURCE_APPLIED.load(Ordering::SeqCst),
+        detail,
+    })
+}
+
+#[tauri::command]
+fn desktop_set_launch_source(app: AppHandle, source: String) -> Result<DesktopLaunchSettings, String> {
+    let normalized = normalize_launch_source(&source);
+    let mut settings = load_desktop_settings(&app);
+    settings.launch_source = Some(normalized.clone());
+    save_desktop_settings(&app, &settings)?;
+    let (applied, detail) = push_launch_source(&normalized);
+    if applied {
+        LAUNCH_SOURCE_APPLIED.store(true, Ordering::SeqCst);
+    }
+    Ok(DesktopLaunchSettings {
+        source: normalized,
+        applied,
+        detail,
+    })
+}
+
 fn ensure_local_service() -> Result<(), String> {
     reap_managed_local_service();
+    // If we already have a live managed child (it may still be cold-starting and not
+    // yet bound to the port), do NOT spawn a second tree — that was the duplicate-agent
+    // bug where the slot was overwritten and the first tree orphaned.
+    if LOCAL_SERVICE_CHILD.lock().unwrap().is_some() {
+        return Ok(());
+    }
     match local_service_status(LOCAL_SERVICE_PORT) {
         LocalServiceStatus::Current => return Ok(()),
         LocalServiceStatus::Stale => {
@@ -619,6 +800,9 @@ fn spawn_local_service() -> Result<(), String> {
         .spawn()
         .map_err(|err| format!("无法启动本地服务: {err}"))?;
     *LOCAL_SERVICE_CHILD.lock().unwrap() = Some(child);
+    // A freshly spawned agent starts on its default (standalone) source; re-push any
+    // persisted non-default choice on the next supervisor tick.
+    LAUNCH_SOURCE_APPLIED.store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -660,9 +844,14 @@ fn dev_workspace_root() -> Result<PathBuf, String> {
 
 fn stop_managed_local_service() {
     if let Some(mut child) = LOCAL_SERVICE_CHILD.lock().unwrap().take() {
+        // In dev the child is `npm.cmd run agent` (npm -> tsx -> node agent -> games);
+        // child.kill() reaps only npm, orphaning the real agent (port 7788) and every
+        // game it launched. Tree-kill first, then reap the wrapper zombie.
+        stop_process_tree(child.id());
         let _ = child.kill();
         let _ = child.wait();
     }
+    LAUNCH_SOURCE_APPLIED.store(false, Ordering::SeqCst);
 }
 
 fn reap_managed_local_service() {
@@ -754,10 +943,22 @@ fn wait_for_local_service_to_close(port: u16) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Single-instance: refuse to start a 2nd dock, which would stack a 2nd Windows
+    // AppBar reservation on top of the first (a recurring "the bottom strip is
+    // double-reserved" leak). The first instance holds a named mutex for its lifetime.
+    #[cfg(target_os = "windows")]
+    {
+        if !single_instance::acquire() {
+            return;
+        }
+    }
+
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             desktop_monitor_settings,
-            desktop_set_monitor
+            desktop_set_monitor,
+            desktop_launch_settings,
+            desktop_set_launch_source
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -768,10 +969,13 @@ pub fn run() {
                 )?;
             }
 
-            std::thread::spawn(|| loop {
+            let service_handle = app.handle().clone();
+            std::thread::spawn(move || loop {
                 if let Err(err) = ensure_local_service() {
                     log::error!("could not start local service: {err}");
                 }
+                // Re-apply a persisted non-default launch source once the agent is up.
+                apply_persisted_launch_source(&service_handle);
                 std::thread::sleep(LOCAL_SERVICE_CHECK_INTERVAL);
             });
 
@@ -824,7 +1028,11 @@ pub fn run() {
                 // Release the reserved desktop edge when the app exits.
                 #[cfg(target_os = "windows")]
                 appbar::remove();
+                // Tree-kill the managed agent (npm -> node -> games), then sweep any
+                // agent still holding the port (e.g. one spawned by the web dev server)
+                // so nothing is left running after the dock exits.
                 stop_managed_local_service();
+                let _ = stop_local_service_on_port(LOCAL_SERVICE_PORT);
             }
         });
 }

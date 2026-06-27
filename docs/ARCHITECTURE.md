@@ -24,6 +24,18 @@ it for them, and is otherwise out of the data path:
 The agent is the only process that performs privileged local actions. Its browser
 API binds to `localhost` and accepts local origins only.
 
+### Desktop dock
+
+`packages/desktop` (Tauri) packages the deck UI as a bottom-edge Windows **AppBar**
+that reserves a strip of the desktop work area, and **supervises the agent** as a
+local service (in dev the web dev server's vite plugin spawns it; in prod the dock
+spawns the bundled `gsm-agent` sidecar). It is single-instance, and releases the
+AppBar reservation + tree-kills the agent and any launched game on a graceful
+shutdown. The dock also persists per-machine UI state (`desktop-settings.json` in the
+OS app-config dir, outside the repo): the docked monitor and the dev **launch source**
+(local standalone vs Steam). Full architecture, the dev runbook, the launch-source
+toggle, and the startup/shutdown resource-release contract: [`DESKTOP.md`](DESKTOP.md).
+
 ### Local launcher API
 
 The agent pushes two message kinds over the browser WebSocket:
@@ -36,11 +48,12 @@ It also serves:
 
 - `GET /processes` — current match list.
 - `GET /launcher` — current launcher status.
-- `POST /launch` — `{ targetMatches, parallelism, autoSave, installId?, force? }`;
+- `POST /launch` — `{ targetMatches, parallelism, autoSave, installId?, force?, match? }`;
   starts a local headless batch when the install is ready and current CPU/RAM
   budget allows the requested parallel workers. The legacy `{ count }` shape is
   accepted as a compatibility alias, but the desktop UI sends the explicit batch
-  fields.
+  fields. When `match` is present, the agent launches exactly one custom-roster
+  match and passes it as the compact `-roster=` autostart argument.
 - `POST /launch/stop` — `{ id }` or `{ pid }`; terminates a local launch process.
 
 The launcher discovers Steam installs by reading `libraryfolders.vdf` and matching
@@ -61,6 +74,11 @@ matches from `[ATTR-RECORD]` game-time resets, stops the batch at
 `targetMatches`, writes `combined.log`, and starts the local trace analyzer in
 the batch save directory. With raw `GSM_HEADLESS_ARGS`, autosave is reported as
 unavailable because the agent cannot safely assign the log contract.
+
+For custom rosters, the UE and standalone profiles let the request override
+`mapId`, `nettype`, `hudHidden`, `attrrecord`, `attrrecordHz`, `aiFill`, and the
+roster payload. Raw `GSM_HEADLESS_ARGS` remains supported; the agent strips the
+same managed flags and appends the custom-match values for the one launched match.
 
 For local standalone development, `GSM_STANDALONE_LOG` can be used as a fallback
 to read the launched process's WebSocket port from the local game log when the

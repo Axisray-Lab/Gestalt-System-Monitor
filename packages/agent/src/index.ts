@@ -30,6 +30,7 @@ import {
 } from '@gsm/protocol';
 import { LaunchManager, type HeadlessLaunchContext } from './launcher';
 import {
+  applyHeadlessMatchArgs,
   buildStandaloneHeadlessLaunch,
   buildUeHeadlessLaunch,
   splitArgs,
@@ -43,6 +44,15 @@ import { TraceReplayer } from './trace-replayer';
 const argv = process.argv.slice(2);
 const workspaceRoot = findWorkspaceRoot();
 loadLocalEnv(workspaceRoot);
+
+// Dev launch-source override (local standalone vs Steam), set live via
+// `POST /launch/source` by the desktop dock's "启动源" toggle. buildHeadlessLaunchConfig
+// consults it BEFORE the env fallback, so flipping the source takes effect on the
+// NEXT launch with no agent respawn (no orphaned games, no aborted batch). Only the
+// 'standalone' profile honours it — both sources reuse the standalone arg builder and
+// differ solely in exe/cwd, so the launch stays "ready" either way.
+let launchSourceOverride: { source: string; executablePath?: string; cwd?: string } | undefined;
+
 const MOCK = argv.includes('--mock');
 const MOCK_SCENARIO = argv.includes('--scenario');
 const browserPort = numFlag('--port', AGENT_BROWSER_PORT);
@@ -77,10 +87,10 @@ function buildHeadlessLaunchConfig(context: HeadlessLaunchContext = {}): Headles
   if (explicitArgs?.trim()) {
     const verbatim = boolFlag('--headless-verbatim', boolEnv('GSM_HEADLESS_VERBATIM', false));
     return {
-      args: splitArgs(explicitArgs, verbatim),
+      args: applyHeadlessMatchArgs(splitArgs(explicitArgs, verbatim), context.match, { quoteExec: verbatim }),
       windowsVerbatimArguments: verbatim,
       autoSaveAvailable: false,
-      autoSaveEnabled: explicitArgs.includes('-attrrecord'),
+      autoSaveEnabled: context.match?.attrrecord ?? explicitArgs.includes('-attrrecord'),
       autoSaveMode: 'configured-args',
     };
   }
@@ -96,7 +106,7 @@ function buildHeadlessLaunchConfig(context: HeadlessLaunchContext = {}): Headles
         stringFlag('--uproject', process.env.GSM_UPROJECT),
       mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 9))),
       render: renderFlag(),
-      attrRecord: context.autoSave ?? boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
+      attrRecord: boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
       attrHz: numFlag('--attr-hz', numEnv('GSM_HEADLESS_ATTR_HZ', 10)),
       logPath: context.autoSave ? context.logPath : undefined,
       userDir: context.autoSave ? context.userDir : undefined,
@@ -108,19 +118,19 @@ function buildHeadlessLaunchConfig(context: HeadlessLaunchContext = {}): Headles
       exec: optionalStringFlag('--headless-exec', process.env.GSM_HEADLESS_EXEC),
       execCmds: optionalStringFlag('--headless-exec-cmds', process.env.GSM_HEADLESS_EXEC_CMDS),
       matchIntervalSec: numFlag('--match-interval', numEnv('GSM_HEADLESS_MATCH_INTERVAL_SEC', 0)),
+      match: context.match,
     });
   }
 
   if (profile === 'standalone') {
     return buildStandaloneHeadlessLaunch({
-      executablePath: stringFlag(
-        '--standalone-exe',
-        process.env.GSM_STANDALONE_EXE ?? process.env.GSM_GAME_EXE,
-      ),
-      cwd: optionalStringFlag('--standalone-cwd', process.env.GSM_STANDALONE_CWD),
+      executablePath:
+        launchSourceOverride?.executablePath ??
+        stringFlag('--standalone-exe', process.env.GSM_STANDALONE_EXE ?? process.env.GSM_GAME_EXE),
+      cwd: launchSourceOverride?.cwd ?? optionalStringFlag('--standalone-cwd', process.env.GSM_STANDALONE_CWD),
       mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 9))),
       render: renderFlag(),
-      attrRecord: context.autoSave ?? boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
+      attrRecord: boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
       attrHz: numFlag('--attr-hz', numEnv('GSM_HEADLESS_ATTR_HZ', 10)),
       logPath: context.autoSave ? context.logPath : undefined,
       userDir: context.autoSave ? context.userDir : undefined,
@@ -132,6 +142,7 @@ function buildHeadlessLaunchConfig(context: HeadlessLaunchContext = {}): Headles
       exec: optionalStringFlag('--headless-exec', process.env.GSM_HEADLESS_EXEC),
       execCmds: optionalStringFlag('--headless-exec-cmds', process.env.GSM_HEADLESS_EXEC_CMDS),
       matchIntervalSec: numFlag('--match-interval', numEnv('GSM_HEADLESS_MATCH_INTERVAL_SEC', 0)),
+      match: context.match,
     });
   }
 
@@ -151,12 +162,12 @@ function autoSaveStatus(config: HeadlessLaunchConfig, defaultSaveDir: string): L
   return {
     available,
     enabledByDefault: available && config.autoSaveEnabled === true,
-    mode: config.autoSaveMode ?? (available ? 'attrrecord-log' : 'off'),
+    mode: config.autoSaveMode ?? (available ? 'watch-ws' : 'off'),
     defaultSaveDir,
     reason: available
       ? undefined
       : config.autoSaveMode === 'configured-args'
-        ? 'Autosave needs the standalone or ue headless profile so the agent can assign per-run logs.'
+        ? 'Autosave needs the standalone or ue headless profile so the agent can discover each worker WebSocket.'
         : 'Autosave is unavailable until a headless launch profile is configured.',
   };
 }
@@ -294,6 +305,7 @@ udp.on('message', (buf, rinfo) => {
       : {}),
   };
   processes.set(k, nextProcess);
+  if (localLaunch) launcher.setLaunchWsUrl(localLaunch.id, `ws://127.0.0.1:${payload.wsPort}`);
   if (!previous) {
     log(`+ ${payload.name ?? payload.matchId}  ws://${ip}:${payload.wsPort}`);
     broadcastList();
@@ -326,6 +338,71 @@ setInterval(() => {
   }
   if (changed) broadcastList();
 }, 1000);
+
+// --- dev launch-source toggle (local standalone vs Steam) ---------------------
+function defaultStandaloneExe(): string | undefined {
+  return stringFlag('--standalone-exe', process.env.GSM_STANDALONE_EXE ?? process.env.GSM_GAME_EXE);
+}
+
+/**
+ * Resolve the REAL Steam-installed executable. `steam.ts` findExecutable checks the
+ * global `GSM_GAME_EXE`/`GSM_STANDALONE_EXE` override first, so a discovered Steam
+ * candidate's executablePath can be "polluted" to point at the local standalone exe.
+ * Only trust the candidate's exe if it actually lives inside the Steam install dir;
+ * otherwise scan that dir for the packaged game exe.
+ */
+function resolveSteamExe(candidate: { executablePath?: string; installDir: string }): {
+  executablePath?: string;
+  cwd?: string;
+} {
+  const installDir = candidate.installDir;
+  const isInside = (p?: string): boolean =>
+    !!p && path.resolve(p).toLowerCase().startsWith(path.resolve(installDir).toLowerCase());
+  if (isInside(candidate.executablePath)) {
+    return { executablePath: candidate.executablePath, cwd: path.dirname(candidate.executablePath!) };
+  }
+  try {
+    const exes = readdirSync(installDir).filter((name) => /\.exe$/i.test(name));
+    const pick =
+      exes.find((name) => /gestalt/i.test(name)) ??
+      exes.find((name) => /robotbridgedemo/i.test(name)) ??
+      exes[0];
+    if (pick) return { executablePath: path.join(installDir, pick), cwd: installDir };
+  } catch {
+    /* fall through to the candidate's own path */
+  }
+  return { executablePath: candidate.executablePath, cwd: candidate.installDir };
+}
+
+function launchSourceState(): { source: string; executablePath?: string } {
+  if (launchSourceOverride) {
+    return { source: launchSourceOverride.source, executablePath: launchSourceOverride.executablePath };
+  }
+  return { source: 'standalone', executablePath: defaultStandaloneExe() };
+}
+
+function applyLaunchSource(source: string): { source: string; executablePath?: string; error?: string } {
+  const normalized = (source ?? '').trim().toLowerCase();
+  if (normalized === '' || normalized === 'standalone' || normalized === 'local') {
+    launchSourceOverride = undefined; // fall back to env/.env.local standalone exe
+    log('launch source -> local standalone');
+    return { source: 'standalone', executablePath: defaultStandaloneExe() };
+  }
+  if (normalized === 'steam') {
+    const steam = launcher.status().candidates.find((candidate) => candidate.source === 'steam');
+    if (!steam) {
+      return { source: 'steam', error: 'No Steam install of the game was discovered.' };
+    }
+    const resolved = resolveSteamExe(steam);
+    if (!resolved.executablePath) {
+      return { source: 'steam', error: 'No launchable Steam executable was found in the install dir.' };
+    }
+    launchSourceOverride = { source: 'steam', executablePath: resolved.executablePath, cwd: resolved.cwd };
+    log(`launch source -> steam (${resolved.executablePath})`);
+    return { source: 'steam', executablePath: resolved.executablePath };
+  }
+  return { source: normalized, error: `Unknown launch source "${source}".` };
+}
 
 // --- browser-facing HTTP + WS -------------------------------------------------
 const server = http.createServer(async (req, res) => {
@@ -389,6 +466,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/launch/source' && (req.method === 'POST' || req.method === 'GET')) {
+    try {
+      let source: string | null | undefined;
+      if (req.method === 'POST') {
+        const body = await readJsonBody<{ source?: string }>(req);
+        source = body.source;
+      } else {
+        source = url.searchParams.get('source');
+      }
+      const result = source ? applyLaunchSource(source) : launchSourceState();
+      if (source) broadcastLauncherStatus();
+      writeJson(res, 'error' in result && result.error ? 409 : 200, { ok: !('error' in result && result.error), ...result });
+    } catch (err) {
+      writeJson(res, 400, { ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+    return;
+  }
+
   res.writeHead(200, { 'content-type': 'text/plain' });
   res.end('gsm-agent ok');
 });
@@ -402,11 +497,48 @@ wss.on('connection', (ws, req) => {
   sendJson(ws, listMessage());
   sendJson(ws, launcherMessage());
 });
+server.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EADDRINUSE') {
+    // Another agent already owns the browser port. The desktop supervisor treats a
+    // healthy agent on this port as "current" and keeps using it, so the right move
+    // is to surrender quietly rather than crash with an uncaught exception.
+    log(`browser port ${browserPort} already in use — another agent is running; exiting.`);
+    process.exit(0);
+  }
+  console.error('[agent] http server error:', err.message);
+  process.exit(1);
+});
 server.listen(browserPort, 'localhost', () => log(`serving process list on ws://localhost:${browserPort}`));
 const launcherBroadcastTimer = setInterval(() => broadcastLauncherStatus(), 2000);
 launcherBroadcastTimer.unref?.();
 const localLaunchHeartbeat = setInterval(() => refreshLocalLaunches(), BROADCAST_INTERVAL_MS);
 localLaunchHeartbeat.unref?.();
+
+// Top-level shutdown: a dying agent must tree-kill every game it launched (each runs
+// `-blockexitprogram`, so only a forced kill frees the window) and every recorder.
+// Registered unconditionally — the trace-replay branches below add their own cleanup.
+let shuttingDown = false;
+function shutdownAgent(signal: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`shutting down (${signal}) — terminating launched games + recorders`);
+  try {
+    launcher.shutdownAll();
+  } catch (err) {
+    console.error('[agent] shutdownAll failed:', err instanceof Error ? err.message : err);
+  }
+  clearInterval(launcherBroadcastTimer);
+  clearInterval(localLaunchHeartbeat);
+  try {
+    server.close();
+  } catch {
+    /* best effort */
+  }
+  process.exit(0);
+}
+process.on('SIGINT', () => shutdownAgent('SIGINT'));
+process.on('SIGTERM', () => shutdownAgent('SIGTERM'));
+process.on('SIGHUP', () => shutdownAgent('SIGHUP'));
 
 function listMessage(): AgentProcessListMessage {
   const list = [...processes.values()].sort((a, b) => a.matchId.localeCompare(b.matchId));
@@ -476,6 +608,7 @@ function refreshLocalLaunchEntry(
       localLaunchPid: entry.launch.pid,
     };
     processes.set(keyOf(entry.process.matchId, entry.process.sourceIp), entry.process);
+    launcher.setLaunchWsUrl(entry.launch.id, entry.process.wsUrl);
     log(`+ ${entry.process.name}  ${entry.process.wsUrl} (local launch fallback)`);
     return true;
   }
@@ -487,6 +620,7 @@ function refreshLocalLaunchEntry(
   entry.process.localLaunchId = entry.launch.id;
   entry.process.localLaunchPid = entry.launch.pid;
   processes.set(keyOf(entry.process.matchId, entry.process.sourceIp), entry.process);
+  launcher.setLaunchWsUrl(entry.launch.id, entry.process.wsUrl);
   if (entry.process.wsUrl !== previousUrl) {
     log(`~ ${entry.process.name}  ${previousUrl} -> ${entry.process.wsUrl} (local launch fallback)`);
   }
@@ -503,12 +637,15 @@ function isLocalLaunchProcessKey(key: string): boolean {
 
 function localLaunchForBeacon(payload: BeaconPayload): HeadlessLaunch | null {
   const pid = pidFromMatchId(payload.matchId);
+  const runningEntries = [...localLaunchProcesses.values()].filter((entry) => entry.launch.status === 'running');
   for (const entry of localLaunchProcesses.values()) {
     if (entry.launch.status !== 'running') continue;
     if (pid != null && entry.launch.pid === pid) return entry.launch;
     const wsPort = localStandaloneWsPort(entry.launch.startedAt, entry.launch.logPath);
     if (wsPort != null && wsPort === payload.wsPort) return entry.launch;
   }
+  const unboundEntries = runningEntries.filter((entry) => !entry.process);
+  if (unboundEntries.length === 1) return unboundEntries[0].launch;
   return null;
 }
 
@@ -550,7 +687,10 @@ function localStandaloneWsPortFromLog(startedAt?: number, launchLogPath?: string
     if (startedAt != null && stat.mtimeMs + 1000 < startedAt) return undefined;
     const bytes = readFileSync(logPath);
     const tail = bytes.subarray(Math.max(0, bytes.length - 256 * 1024)).toString('utf8');
-    const matches = [...tail.matchAll(/WebSocket server started on port\s+(\d+)/gi)];
+    // The game logs the host:port form, e.g. "WebSocket server started on 0.0.0.0:17463";
+    // older builds logged "...on port 9240". The host group must END in ":" so it never
+    // swallows the port digits (a greedy "[\d.]*:?" would capture "0" from "port 9240").
+    const matches = [...tail.matchAll(/WebSocket server started on (?:port\s+)?(?:[\d.]*:)?(\d+)/gi)];
     const port = Number(matches.at(-1)?.[1]);
     return Number.isFinite(port) && port > 0 ? port : undefined;
   } catch {

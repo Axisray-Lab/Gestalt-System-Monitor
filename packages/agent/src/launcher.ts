@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,7 @@ import type {
   ResourceBudget,
   StopHeadlessRequest,
   StopHeadlessResponse,
+  HeadlessMatchConfig,
 } from '@gsm/protocol';
 import type { HeadlessLaunchConfig } from './headless-launch';
 import { ResourceMonitor } from './resources';
@@ -26,6 +27,7 @@ export interface HeadlessLaunchContext {
   autoSave?: boolean;
   logPath?: string;
   userDir?: string;
+  match?: HeadlessMatchConfig;
 }
 
 export interface LaunchManagerOptions extends SteamDiscoveryOptions {
@@ -37,17 +39,22 @@ export interface LaunchManagerOptions extends SteamDiscoveryOptions {
 
 interface RecordingState {
   launchId: string;
-  logPath: string;
-  offset: number;
-  buffer: string;
-  lastGt?: number;
+  targetMatches: number;
+  progressPath: string;
+  summaryPath: string;
+  eventsPath: string;
+  consolePath: string;
+  stderrPath: string;
+  traceDir: string;
+  wsUrl?: string;
+  process?: ChildProcess;
   completedMatches: number;
+  lastError?: string;
 }
 
 const MAX_PARALLEL_LAUNCHES = 16;
 const MAX_TARGET_MATCHES = 500;
 const RECORD_POLL_MS = 3000;
-const ATTR_RECORD_MARKER = '[ATTR-RECORD]';
 
 export class LaunchManager {
   private candidates: GameInstallCandidate[] = [];
@@ -79,6 +86,30 @@ export class LaunchManager {
     this.resources.dispose();
   }
 
+  /**
+   * Synchronously tear down everything this manager spawned: every still-running
+   * launched game (`-blockexitprogram` means only a forced kill frees them) and
+   * every recorder child. Call this from the agent's SIGINT/SIGTERM handler so a
+   * dying agent does not orphan game windows + recorders. Uses spawnSync because an
+   * async `spawn().unref()` kill can be lost when the process exits right after.
+   */
+  shutdownAll(): void {
+    for (const launch of this.launches.values()) {
+      if (launch.status !== 'running') continue;
+      if (launch.pid > 0) terminateProcessTreeSync(launch.pid);
+      launch.status = 'exited';
+      launch.exitCode = null;
+      launch.signal = 'SIGTERM';
+    }
+    for (const state of this.recordings.values()) {
+      if (state.process?.pid) {
+        terminateProcessTreeSync(state.process.pid);
+        state.process = undefined;
+      }
+    }
+    this.dispose();
+  }
+
   refreshInstalls() {
     this.candidates = discoverGameInstalls(this.options);
   }
@@ -104,27 +135,29 @@ export class LaunchManager {
   }
 
   launch(request: LaunchHeadlessRequest): LaunchHeadlessResponse {
-    const targetMatches = normalizeTargetMatches(request.targetMatches ?? request.count);
+    const customMatch = request.match;
+    const targetMatches = customMatch ? 1 : normalizeTargetMatches(request.targetMatches ?? request.count);
     if (targetMatches == null) {
       return this.errorResponse(`Target matches must be between 1 and ${MAX_TARGET_MATCHES}.`);
     }
 
-    const parallelism = normalizeParallelism(request.parallelism ?? request.count, targetMatches);
+    const parallelism = customMatch ? 1 : normalizeParallelism(request.parallelism ?? request.count, targetMatches);
     if (parallelism == null) {
       return this.errorResponse(
         `Parallel workers must be between 1 and ${Math.min(MAX_PARALLEL_LAUNCHES, targetMatches)}.`,
       );
     }
 
-    const autoSave = request.autoSave ?? this.options.autoSave.enabledByDefault;
+    const autoSave = request.autoSave ?? (customMatch ? false : this.options.autoSave.enabledByDefault);
     if (targetMatches > parallelism && !autoSave) {
-      return this.errorResponse('Batch match counting needs autosave/ATTR-RECORD enabled.');
+      return this.errorResponse('Batch match counting needs WS telemetry autosave enabled.');
     }
     if (autoSave && !this.options.autoSave.available) {
       return this.errorResponse(this.options.autoSave.reason ?? 'Autosave is not available for this launch profile.');
     }
 
-    const preview = this.options.createLaunchConfig({ targetMatches, parallelism, autoSave });
+    const launchMatch = customMatch;
+    const preview = this.options.createLaunchConfig({ targetMatches, parallelism, autoSave, match: launchMatch });
     if (preview.error) return this.errorResponse(preview.error);
 
     const install = request.installId
@@ -149,6 +182,7 @@ export class LaunchManager {
       config: HeadlessLaunchConfig;
       logPath?: string;
       userDir?: string;
+      recording?: Omit<RecordingState, 'launchId'>;
       workerIndex: number;
     }> = [];
     for (let i = 0; i < parallelism; i += 1) {
@@ -163,9 +197,22 @@ export class LaunchManager {
         autoSave,
         logPath,
         userDir,
+        match: launchMatch,
       });
       if (config.error) return this.errorResponse(config.error);
-      launchConfigs.push({ config, logPath, userDir, workerIndex: i });
+      const recording = saveDir
+        ? {
+            targetMatches,
+            progressPath: path.join(saveDir, `${workerName}.progress.json`),
+            summaryPath: path.join(saveDir, `${workerName}_attribute_summary.json`),
+            eventsPath: path.join(saveDir, `${workerName}.events.jsonl`),
+            consolePath: path.join(saveDir, `${workerName}.recorder.log`),
+            stderrPath: path.join(saveDir, `${workerName}.recorder.err.log`),
+            traceDir: path.join(saveDir, workerName),
+            completedMatches: 0,
+          }
+        : undefined;
+      launchConfigs.push({ config, logPath, userDir, recording, workerIndex: i });
     }
 
     const batch: HeadlessLaunchBatch = {
@@ -186,13 +233,10 @@ export class LaunchManager {
       const launch = this.spawnMatch(install, batch, item);
       launched.push(launch);
       batch.launchIds.push(launch.id);
-      if (item.logPath) {
+      if (item.recording) {
         this.recordings.set(launch.id, {
           launchId: launch.id,
-          logPath: item.logPath,
-          offset: 0,
-          buffer: '',
-          completedMatches: 0,
+          ...item.recording,
         });
       }
     }
@@ -220,6 +264,7 @@ export class LaunchManager {
     }
 
     terminateProcessTree(launch.pid);
+    this.stopRecording(launch.id);
     launch.status = 'exited';
     launch.exitCode = null;
     launch.signal = 'SIGTERM';
@@ -231,6 +276,14 @@ export class LaunchManager {
       status: this.status(),
       stopped: launch,
     };
+  }
+
+  setLaunchWsUrl(launchId: string, wsUrl: string): void {
+    const recording = this.recordings.get(launchId);
+    if (!recording || !wsUrl) return;
+    if (recording.wsUrl === wsUrl && recording.process) return;
+    recording.wsUrl = wsUrl;
+    if (!recording.process) this.startRecording(recording);
   }
 
   private preferredInstall(): GameInstallCandidate | null {
@@ -315,41 +368,101 @@ export class LaunchManager {
     const launch = this.launches.get(state.launchId);
     if (!launch || launch.status === 'error') return false;
 
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(state.logPath);
-    } catch {
-      return false;
+    const progress = readJsonFile<{ completed_matches?: number; closed?: boolean }>(state.progressPath);
+    const summary = readJsonFile<{ completed_matches?: number }>(state.summaryPath);
+    const traceMatches = countTraceMatches(state.traceDir);
+    let completedMatches = state.completedMatches;
+    if (typeof progress?.completed_matches === 'number' && Number.isFinite(progress.completed_matches)) {
+      completedMatches = Math.max(0, Math.floor(progress.completed_matches));
     }
-
-    if (stat.size < state.offset) {
-      state.offset = 0;
-      state.buffer = '';
-      state.lastGt = undefined;
-      state.completedMatches = 0;
+    if (typeof summary?.completed_matches === 'number' && Number.isFinite(summary.completed_matches)) {
+      completedMatches = Math.max(completedMatches, Math.floor(summary.completed_matches));
     }
-    if (stat.size === state.offset) return false;
+    completedMatches = Math.max(completedMatches, traceMatches);
 
     let changed = false;
-    const fd = fs.openSync(state.logPath, 'r');
-    try {
-      while (state.offset < stat.size) {
-        const len = Math.min(256 * 1024, stat.size - state.offset);
-        const chunk = Buffer.allocUnsafe(len);
-        const read = fs.readSync(fd, chunk, 0, len, state.offset);
-        if (read <= 0) break;
-        state.offset += read;
-        changed = processRecordingText(state, chunk.toString('utf8', 0, read)) || changed;
-      }
-    } finally {
-      fs.closeSync(fd);
+    if (state.completedMatches !== completedMatches) {
+      state.completedMatches = completedMatches;
+      changed = true;
     }
-
     if (launch.completedMatches !== state.completedMatches) {
       launch.completedMatches = state.completedMatches;
       changed = true;
     }
+    if (
+      state.wsUrl &&
+      !state.process &&
+      launch.status === 'running' &&
+      state.completedMatches < state.targetMatches
+    ) {
+      this.startRecording(state);
+      changed = true;
+    }
     return changed;
+  }
+
+  private startRecording(state: RecordingState): void {
+    if (!state.wsUrl || state.process) return;
+    try {
+      fs.mkdirSync(path.dirname(state.progressPath), { recursive: true });
+      fs.mkdirSync(state.traceDir, { recursive: true });
+      for (const file of [state.progressPath, state.summaryPath, state.eventsPath, state.consolePath, state.stderrPath]) {
+        try {
+          fs.rmSync(file, { force: true });
+        } catch {
+          /* best effort cleanup */
+        }
+      }
+      const recorder = fileURLToPath(new URL('./record-ws.mjs', import.meta.url));
+      const args = [
+        recorder,
+        '--url',
+        state.wsUrl,
+        '--target',
+        String(state.targetMatches),
+        '--progress',
+        state.progressPath,
+        '--summary',
+        state.summaryPath,
+        '--events',
+        state.eventsPath,
+        '--trace-dir',
+        state.traceDir,
+        '--quiet',
+      ];
+      const stdout = fs.openSync(state.consolePath, 'a');
+      const stderr = fs.openSync(state.stderrPath, 'a');
+      state.process = spawn(process.execPath, args, {
+        stdio: ['ignore', stdout, stderr],
+        windowsHide: true,
+      });
+      state.process.once('exit', (code, signal) => {
+        fs.closeSync(stdout);
+        fs.closeSync(stderr);
+        state.process = undefined;
+        if (code && code !== 0) state.lastError = `recorder exited code=${code} signal=${signal ?? ''}`.trim();
+      });
+      state.process.once('error', (err) => {
+        state.lastError = err.message;
+        state.process = undefined;
+        try {
+          fs.closeSync(stdout);
+          fs.closeSync(stderr);
+        } catch {
+          /* stream may already be closed */
+        }
+      });
+      state.process.unref();
+    } catch (err) {
+      state.lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  private stopRecording(launchId: string): void {
+    const state = this.recordings.get(launchId);
+    if (!state?.process?.pid) return;
+    terminateProcessTree(state.process.pid);
+    state.process = undefined;
   }
 
   private refreshBatch(batchId: string | undefined): boolean {
@@ -392,6 +505,7 @@ export class LaunchManager {
         batch.status === 'error'
           ? launches.find((launch) => launch.error)?.error ?? 'One or more headless workers failed.'
           : undefined;
+      this.finalizeAutoSave(batch, launches);
       return true;
     }
 
@@ -400,29 +514,43 @@ export class LaunchManager {
 
   private finalizeAutoSave(batch: HeadlessLaunchBatch, launches: HeadlessLaunch[]): void {
     if (!batch.autoSave || !batch.saveDir) return;
-    const lines: string[] = [];
-    for (const launch of launches) {
-      if (!launch.logPath) continue;
-      try {
-        const text = fs.readFileSync(launch.logPath, 'utf8');
-        for (const line of text.split(/\r?\n/)) {
-          if (line.includes(ATTR_RECORD_MARKER)) lines.push(line);
-        }
-      } catch {
-        /* keep the other worker logs */
-      }
-    }
-
-    if (lines.length === 0) return;
-    const combinedLog = path.join(batch.saveDir, 'combined.log');
-    fs.writeFileSync(combinedLog, `${lines.join('\n')}\n`, 'utf8');
-
-    const analyzer = fileURLToPath(new URL('./analyze-trace.mjs', import.meta.url));
-    const child = spawn(process.execPath, [analyzer, combinedLog, '--out', batch.saveDir], {
-      stdio: 'ignore',
-      windowsHide: true,
+    const workers = launches.map((launch) => {
+      const recording = this.recordings.get(launch.id);
+      const progress = recording ? readJsonFile(recording.progressPath) : null;
+      const summary = recording ? readJsonFile(recording.summaryPath) : null;
+      return {
+        launchId: launch.id,
+        pid: launch.pid,
+        wsUrl: recording?.wsUrl,
+        completedMatches: launch.completedMatches ?? 0,
+        progressPath: recording?.progressPath,
+        summaryPath: recording?.summaryPath,
+        traceDir: recording?.traceDir,
+        recorderError: recording?.lastError,
+        progress,
+        summary,
+      };
     });
-    child.unref();
+    const summaryPath = path.join(batch.saveDir, 'recording-summary.json');
+    const payload = {
+      schema: 'monitor-autosave-watch-ws/1',
+      generatedAt: new Date().toISOString(),
+      batch: {
+        id: batch.id,
+        targetMatches: batch.targetMatches,
+        completedMatches: batch.completedMatches,
+        parallelism: batch.parallelism,
+        status: batch.status,
+        startedAt: batch.startedAt,
+        completedAt: batch.completedAt,
+      },
+      workers,
+    };
+    try {
+      fs.writeFileSync(summaryPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    } catch {
+      /* keep launch status reporting even if autosave summary cannot be written */
+    }
   }
 
   private errorResponse(error: string): LaunchHeadlessResponse {
@@ -468,37 +596,19 @@ function normalizeParallelism(count: number | undefined, targetMatches: number):
   return value;
 }
 
-function processRecordingText(state: RecordingState, text: string): boolean {
-  state.buffer += text;
-  const lines = state.buffer.split(/\r?\n/);
-  state.buffer = lines.pop() ?? '';
-
-  let changed = false;
-  for (const line of lines) {
-    const record = parseAttrRecord(line);
-    if (!record || typeof record.gt !== 'number') continue;
-    if (
-      state.lastGt != null &&
-      record.gt < state.lastGt - 1000 &&
-      (record.st == null || record.st === 1)
-    ) {
-      state.completedMatches += 1;
-      changed = true;
-    }
-    state.lastGt = record.gt;
-  }
-  return changed;
-}
-
-function parseAttrRecord(line: string): { gt?: number; st?: number } | null {
-  const marker = line.indexOf(ATTR_RECORD_MARKER);
-  if (marker < 0) return null;
-  const jsonStart = line.indexOf('{', marker);
-  if (jsonStart < 0) return null;
+function readJsonFile<T = unknown>(file: string): T | null {
   try {
-    return JSON.parse(line.slice(jsonStart)) as { gt?: number; st?: number };
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as T;
   } catch {
     return null;
+  }
+}
+
+function countTraceMatches(dir: string): number {
+  try {
+    return fs.readdirSync(dir).filter((name) => /\.trace\.json$/i.test(name)).length;
+  } catch {
+    return 0;
   }
 }
 
@@ -524,5 +634,30 @@ function terminateProcessTree(pid: number): void {
     } catch {
       /* best effort */
     }
+  }
+}
+
+/**
+ * Blocking variant for shutdown paths: the kill must complete before the agent
+ * process exits, so the whole game/recorder subtree is actually reaped instead of
+ * being orphaned by a fire-and-forget `spawn().unref()`.
+ */
+function terminateProcessTreeSync(pid: number): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+    } else {
+      try {
+        process.kill(-pid, 'SIGTERM');
+      } catch {
+        process.kill(pid, 'SIGTERM');
+      }
+    }
+  } catch {
+    /* best effort */
   }
 }
