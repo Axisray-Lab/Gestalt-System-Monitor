@@ -53,7 +53,6 @@ function selectRuleSet(next: RuleSet): void {
   const fresh = createDefaultMatch(next);
   match.mapId = fresh.mapId;
   match.nettype = fresh.nettype;
-  match.aiFill = fresh.aiFill;
   match.attrrecord = fresh.attrrecord;
   match.attrrecordHz = fresh.attrrecordHz;
   match.hudHidden = fresh.hudHidden;
@@ -235,10 +234,6 @@ function emitLaunch(): void {
         </label>
       </div>
       <div class="tb-toggles">
-        <label>
-          <input v-model="match.aiFill" type="checkbox" />
-          <span>AI fill</span>
-        </label>
         <label>
           <input v-model="match.hudHidden" type="checkbox" />
           <span>HUD hidden</span>

@@ -354,7 +354,7 @@ function readTraceHeader(tracePath: string): TraceHeader {
         v: Number(info.v ?? 0),
         src: info.src,
         fmt: info.fmt,
-        mapId: Number(info.mapId ?? 9),
+        mapId: Number(info.mapId ?? 4),
         frameCount: Number(info.frameCount ?? info.frames?.length ?? 0),
         durMs: Number(info.durMs ?? 0),
         gtMs: Number(info.gtMs ?? 0),

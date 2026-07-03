@@ -117,7 +117,6 @@ export interface HeadlessMatchConfig {
   mapId: number;
   nettype: number;
   teams: TeamConfig[];
-  aiFill: boolean;
   attrrecord?: boolean;
   attrrecordHz?: number;
   hudHidden?: boolean;
@@ -133,7 +132,6 @@ export function createDefaultMatch(ruleSet: RuleSet = RuleSet.RMUC2026): Headles
   return {
     mapId: descriptor.mapId,
     nettype: 0,
-    aiFill: true,
     hudHidden: false,
     attrrecord: false,
     teams: [

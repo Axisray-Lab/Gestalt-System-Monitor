@@ -46,7 +46,7 @@ const q = (s) => `"${String(s)}"`;
  */
 export function buildUeLaunch({
   uproject,
-  mapId = 9,
+  mapId = 4,
   userDir,
   logPath,
   render = 'nullrhi',

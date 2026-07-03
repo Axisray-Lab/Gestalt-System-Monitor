@@ -84,7 +84,7 @@ async function main() {
 
   const trace = {
     v: 2, src: 'attr-record', fmt: 'watchAttributeMapsResult',
-    mapId: mid ?? 9, frames: frames.length, durMs: lr ?? 0, gtMs: lg ?? 0, frames,
+    mapId: mid ?? 4, frames: frames.length, durMs: lr ?? 0, gtMs: lg ?? 0, frames,
   };
 
   await writeFile(op, JSON.stringify(trace));

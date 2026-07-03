@@ -222,7 +222,7 @@ async function main(){
   for(const m of fullMatches){
     if(!m._frames) continue;
     const tp=path.join(od,`${stem}.iter-${String(m.index).padStart(3,'0')}.trace.json`);
-    const trace={v:3,src:'attr-record',fmt:'compact-delta',mapId:9,frameCount:m._frames.length,durMs:m.duration_record_ms,gtMs:m.duration_game_ms,summary:{winner:m.inferred_winner,teamDamage:m.team_damage_applied,bots:m.bots},frames:m._frames};
+    const trace={v:3,src:'attr-record',fmt:'compact-delta',mapId:4,frameCount:m._frames.length,durMs:m.duration_record_ms,gtMs:m.duration_game_ms,summary:{winner:m.inferred_winner,teamDamage:m.team_damage_applied,bots:m.bots},frames:m._frames};
     await writeFile(tp,JSON.stringify(trace));
     console.error(`[analyze]   iter ${m.index}: ${(Buffer.byteLength(JSON.stringify(trace))/1e6).toFixed(1)} MB`);
   }

@@ -76,7 +76,7 @@ the batch save directory. With raw `GSM_HEADLESS_ARGS`, autosave is reported as
 unavailable because the agent cannot safely assign the log contract.
 
 For custom rosters, the UE and standalone profiles let the request override
-`mapId`, `nettype`, `hudHidden`, `attrrecord`, `attrrecordHz`, `aiFill`, and the
+`mapId`, `nettype`, `hudHidden`, `attrrecord`, `attrrecordHz`, and the
 roster payload. Raw `GSM_HEADLESS_ARGS` remains supported; the agent strips the
 same managed flags and appends the custom-match values for the one launched match.
 

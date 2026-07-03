@@ -85,7 +85,6 @@ export function buildUeHeadlessLaunch(options: UeHeadlessLaunchOptions): Headles
     ...(match.exec ? [`-exec=${q(match.exec)}`] : []),
     ...(options.execCmds ? [`-ExecCmds=${q(options.execCmds)}`] : []),
     ...(match.attrRecord ? ['-attrrecord', `-attrrecordhz=${match.attrHz}`] : []),
-    ...(options.match?.aiFill ? ['-aifill'] : []),
     ...headlessMatchArgs(options.match),
     ...(options.matchIntervalSec > 0 ? [`-matchinterval=${options.matchIntervalSec}`] : []),
   ];
@@ -123,7 +122,6 @@ export function buildStandaloneHeadlessLaunch(options: StandaloneHeadlessLaunchO
     ...(match.exec ? [`-exec=${q(match.exec)}`] : []),
     ...(options.execCmds ? [`-ExecCmds=${q(options.execCmds)}`] : []),
     ...(match.attrRecord ? ['-attrrecord', `-attrrecordhz=${match.attrHz}`] : []),
-    ...(options.match?.aiFill ? ['-aifill'] : []),
     ...headlessMatchArgs(options.match),
     ...(options.matchIntervalSec > 0 ? [`-matchinterval=${options.matchIntervalSec}`] : []),
   ];
@@ -188,7 +186,6 @@ export function applyHeadlessMatchArgs(
     '-autostart',
     `-mapid=${match.mapId}`,
     `-nettype=${match.nettype}`,
-    ...(match.aiFill ? ['-aifill'] : []),
     ...(match.hudHidden == null ? [] : [`-hudhidden=${match.hudHidden ? 1 : 0}`]),
     `-exec=${options.quoteExec ? q('SetMatchStatus 1') : 'SetMatchStatus 1'}`,
     ...headlessMatchArgs(match),
@@ -221,7 +218,7 @@ function matchLaunchValues(
 
 function isMatchManagedArg(arg: string): boolean {
   const lower = arg.toLowerCase();
-  if (lower === '-autostart' || lower === '-aifill' || lower === '-attrrecord') return true;
+  if (lower === '-autostart' || lower === '-attrrecord') return true;
   return [
     '-mapid=',
     '-map-id=',

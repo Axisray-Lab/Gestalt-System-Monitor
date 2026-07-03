@@ -104,7 +104,7 @@ function buildHeadlessLaunchConfig(context: HeadlessLaunchContext = {}): Headles
       projectPath:
         stringFlag('--ue-project', process.env.GSM_UE_PROJECT) ??
         stringFlag('--uproject', process.env.GSM_UPROJECT),
-      mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 9))),
+      mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 4))),
       render: renderFlag(),
       attrRecord: boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
       attrHz: numFlag('--attr-hz', numEnv('GSM_HEADLESS_ATTR_HZ', 10)),
@@ -128,7 +128,7 @@ function buildHeadlessLaunchConfig(context: HeadlessLaunchContext = {}): Headles
         launchSourceOverride?.executablePath ??
         stringFlag('--standalone-exe', process.env.GSM_STANDALONE_EXE ?? process.env.GSM_GAME_EXE),
       cwd: launchSourceOverride?.cwd ?? optionalStringFlag('--standalone-cwd', process.env.GSM_STANDALONE_CWD),
-      mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 9))),
+      mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 4))),
       render: renderFlag(),
       attrRecord: boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
       attrHz: numFlag('--attr-hz', numEnv('GSM_HEADLESS_ATTR_HZ', 10)),
@@ -599,7 +599,7 @@ function refreshLocalLaunchEntry(
     entry.process = {
       matchId: `local-standalone-${entry.launch.id}`,
       name: `Local standalone ${entry.launch.pid}`,
-      mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 9))),
+      mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 4))),
       wsPort,
       sourceIp: '127.0.0.1',
       lastSeen: now,
@@ -787,8 +787,8 @@ if (TRACE_PATH) {
   // (UDP loopback beacon is unreliable on Windows)
   const replayerProcess: DiscoveredProcess = {
     matchId: 'trace-replay',
-    name: `Trace Replay — Map 9`,
-    mapId: 9,
+    name: `Trace Replay — Map 4`,
+    mapId: 4,
     wsPort: 9240,
     sourceIp: '127.0.0.1',
     lastSeen: Date.now(),
@@ -843,7 +843,7 @@ function loadTraceDir(dirPath: string, packetLabel: string, portBase: number) {
     const iterNum = iterMatch ? parseInt(iterMatch[1], 10) : i + 1;
 
     let winnerMark = '';
-    let mapId = 9;
+    let mapId = 4;
     try {
       const trace = TraceReplayer.inspect(tracePath);
       mapId = trace.mapId;

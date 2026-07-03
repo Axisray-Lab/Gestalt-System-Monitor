@@ -31,7 +31,7 @@ function parseArgs() {
   return {
     count: parseInt(get('--count') ?? '5', 10),
     out: get('--out') ?? 'traces/recorded',
-    mapId: get('--mapid') ?? '9',
+    mapId: get('--mapid') ?? '4',
     ueExe: get('--ue-exe') ?? 'C:/UE57_v3/Engine/Binaries/Win64/UnrealEditor.exe',
     uproject: get('--uproject') ?? 'C:/Users/Chclk/Documents/Unreal Projects/gestalt_system/RobotBridgeDemo.uproject',
     matchTimeoutMin: parseInt(get('--match-timeout-min') ?? '10', 10),

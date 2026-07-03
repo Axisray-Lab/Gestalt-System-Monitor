@@ -125,7 +125,7 @@ Useful overrides:
 | `--autosave-dir` | `GSM_AUTOSAVE_DIR` | `traces/autosave` |
 | `--ue-exe` | `GSM_UE_EXE` | required for `GSM_HEADLESS_PROFILE=ue` |
 | `--ue-project` | `GSM_UE_PROJECT` | required for `GSM_HEADLESS_PROFILE=ue` |
-| `--mapid` / `--map-id` | `GSM_HEADLESS_MAP_ID` | `9` for the UE profile |
+| `--mapid` / `--map-id` | `GSM_HEADLESS_MAP_ID` | `4` for the UE profile |
 | `--match-memory-mb` | `GSM_HEADLESS_MEMORY_MB` | `2048` |
 | `--match-cpu-cores` | `GSM_HEADLESS_CPU_CORES` | `2` |
 | `--reserve-memory-mb` | `GSM_RESERVE_MEMORY_MB` | `2048` |

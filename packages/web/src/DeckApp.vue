@@ -385,7 +385,6 @@ const selectedHeadlessMatch = computed<HeadlessMatchConfig | null>(() => {
   return {
     mapId: selectedMapId.value,
     nettype: 0,
-    aiFill: true,
     hudHidden: false,
     attrrecord: autoSaveReplays.value,
     teams: [

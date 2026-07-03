@@ -48,7 +48,7 @@ const REGISTRY: Record<string, MapModelDef> = {
 
 /**
  * The live LAN beacon advertises a NUMERIC `mapId` (the game's map-select index),
- * not a string — e.g. the full RMUC2026 standard field is index 9 (and 4), and its
+ * not a string — e.g. the full RMUC2026 standard field is index 4, and its
  * 1v1 / IF cuts (7, 8) reuse the same arena. Map those onto the RMUC2026 sandbox
  * model so a live match renders the field instead of falling back to the wireframe.
  * (Map indices are part of the player-observable beacon contract.)
@@ -57,7 +57,6 @@ const NUMERIC_ALIASES: Record<number, MapModelDef> = {
   4: RMUC2026,
   7: RMUC2026,
   8: RMUC2026,
-  9: RMUC2026,
 };
 
 const normalize = (mapId: string | number): string =>
