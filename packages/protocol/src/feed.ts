@@ -84,6 +84,10 @@ export interface VehicleState {
   ammo17?: number;
   /** 42mm launch allowance, kept separately so visual effects can infer lob shots. */
   ammo42?: number;
+  /** Engineer-carried tech cores, used as the engineer's top-right resource readout. */
+  engineerCarriedCores?: number;
+  /** Engineer team energy-unit stock, used when the engineer is not carrying a core. */
+  engineerTeamEnergyCores?: number;
   /** Shooter locked out (FiringLocked) → ⊘ icon + dimmed ammo. */
   firingLocked?: boolean;
   /** Firing heat, 0..1 (current / max). */

@@ -158,6 +158,7 @@ const DART_ARC_MAX = 2.8;
 const EXPLOSION_SMALL_TTL_MS = 620;
 const EXPLOSION_LARGE_TTL_MS = 900;
 const CLASS_HERO = 1001;
+const CLASS_ENGINEER = 1002;
 const CLASS_DART = 1007;
 /**
  * Exponential-smoothing rate (1/sec) used to interpolate vehicle transforms
@@ -2345,11 +2346,14 @@ export class MatchUnit {
     }
 
     const showingRepairCount = v.kind === 'outpost' && v.repairCount != null;
+    const showingEngineerCore =
+      v.classId === CLASS_ENGINEER &&
+      (v.engineerCarriedCores != null || v.engineerTeamEnergyCores != null);
     p.ammoWrap.classList.toggle('repair-count', showingRepairCount);
 
-    // ⊘ + ammo: lock shows + ammo dims when firing-locked. Outposts use this
-    // corner for remaining repair count instead.
-    const locked = showingRepairCount ? null : (v.firingLocked ?? null);
+    // ⊘ + ammo: lock shows + ammo dims when firing-locked. Outposts and engineers
+    // use this corner for their own resource counters instead.
+    const locked = showingRepairCount || showingEngineerCore ? null : (v.firingLocked ?? null);
     if (locked !== p.last.locked) {
       p.lock.hidden = locked !== true;
       p.ammo.classList.toggle('dim', locked === true);
@@ -2357,6 +2361,15 @@ export class MatchUnit {
     }
     const topRight = showingRepairCount
       ? String(Math.max(0, Math.round(v.repairCount!)))
+      : showingEngineerCore
+        ? String(
+            Math.max(
+              0,
+              Math.round(v.engineerCarriedCores != null && v.engineerCarriedCores > 0
+                ? v.engineerCarriedCores
+                : (v.engineerTeamEnergyCores ?? 0)),
+            ),
+          )
       : v.ammo != null
         ? String(v.ammo)
         : '—';

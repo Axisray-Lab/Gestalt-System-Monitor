@@ -357,6 +357,10 @@ function robotAttributes(r: ReplayRobot, replayT: number): Record<string, number
     r.classId === CLASS_ID.Hero
       ? Math.max(0, 8 - Math.floor(((u * 0.34 + r.phase * 0.23) % 1) * 6))
       : 0;
+  const engineerCarriedCores =
+    r.classId === CLASS_ID.Engineer && activeWindow(u + r.phase * 0.4, 0.2, 0.32) ? 1 : 0;
+  const engineerTeamEnergyCores =
+    r.classId === CLASS_ID.Engineer ? Math.max(0, 6 - Math.floor(((u + r.phase) % 1) * 4)) : undefined;
   const deploymentMode =
     r.classId === CLASS_ID.Hero && activeWindow(u + r.phase * 0.3, 0.58, 0.22);
   // Sentry modes: 1=Defense, 2=Cooling, 3=Movement. There is NO attack mode — the
@@ -379,6 +383,12 @@ function robotAttributes(r: ReplayRobot, replayT: number): Record<string, number
     [AttrId.FiringHeatMax1]: r.heatMax,
     [AttrId.Ammo17mmCount]: ammo,
     ...(r.classId === CLASS_ID.Hero ? { [AttrId.Ammo42mmCount]: ammo42 } : {}),
+    ...(r.classId === CLASS_ID.Engineer
+      ? {
+          [AttrId.EngineerCarriedTechCoreCount]: engineerCarriedCores,
+          [AttrId.EngineerTeamEnergyUnitStock]: engineerTeamEnergyCores,
+        }
+      : {}),
     [AttrId.FiringLocked]: ammo + ammo42 === 0 || heat > r.heatMax * 0.92 ? 1 : 0,
     [AttrId.WorldPosX]: Math.round(pos.x),
     [AttrId.WorldPosY]: Math.round(pos.y),

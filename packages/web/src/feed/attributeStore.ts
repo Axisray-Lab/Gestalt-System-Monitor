@@ -472,6 +472,10 @@ export class AttributeStore {
       const a17 = this.num(m, AttrId.Ammo17mmCount);
       const a42 = this.num(m, AttrId.Ammo42mmCount);
       const dartAmmo = this.num(m, AttrId.RealDartAmmoCount) ?? this.num(m, AttrId.AmmoDartCount);
+      const engineerCarriedCores =
+        classId === CLASS_ID.Engineer ? this.num(m, AttrId.EngineerCarriedTechCoreCount) : undefined;
+      const engineerTeamEnergyCores =
+        classId === CLASS_ID.Engineer ? this.num(m, AttrId.EngineerTeamEnergyUnitStock) : undefined;
       const coins = this.num(m, AttrId.TM_Coins);
       const ammo =
         kind === 'base' && coins != null
@@ -561,6 +565,10 @@ export class AttributeStore {
         ammo17: a17,
         ammo42: a42,
         dartAmmo,
+        engineerCarriedCores:
+          engineerCarriedCores != null ? Math.max(0, Math.round(engineerCarriedCores)) : undefined,
+        engineerTeamEnergyCores:
+          engineerTeamEnergyCores != null ? Math.max(0, Math.round(engineerTeamEnergyCores)) : undefined,
         dartHitCount:
           kind === 'base' ? this.num(m, AttrId.TM_BaseDamageCount) : undefined,
         firingLocked,
