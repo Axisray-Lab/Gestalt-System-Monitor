@@ -38,6 +38,16 @@ const A = {
   DartRemainingShots: 10000074,
   Class: 60000002,
   HealthMax: 60000004,
+  // Scoreboard (per-robot combat + per-team economy/rune) — the observable match state a
+  // spectator dashboard shows, snapshotted at match end alongside building HP.
+  DamageTakenTotal: 63000001,
+  KillCount: 63000004,
+  DeathCount: 63000005,
+  BigRuneBuffArmCount: 50000082,
+  BigRuneBuffLightCount: 50000083,
+  TM_Coins: 74000003,
+  TM_SupportCoins_70: 74000007,
+  TM_SupportCoins_140: 74000008,
   TM_DartOutpostHitCount: 74000023,
   TM_DartBaseHitCount: 74000024,
   TM_DartOutpostDamageTotal: 74000025,
@@ -463,6 +473,49 @@ function snapshotBuildingHp(state, globalAttrs) {
   return out;
 }
 
+// Snapshot the scoreboard a spectator dashboard shows at match end: per-robot combat
+// (team/class/kills/deaths/damage-taken) and per-team economy (coins) + rune activations.
+// Iterates every followed map — robot maps carry TeamID + KillCount/DeathCount; economy/
+// rune attributes are aggregated per team wherever they appear. Observable match state,
+// same category as the dart telemetry and building HP already exposed here.
+function snapshotScoreboard(state) {
+  const vehicles = [];
+  const teams = {};
+  const team = t => {
+    if (!teams[t]) teams[t] = { vehicles: 0, kills: 0, deaths: 0, damage_taken: 0, coins: null, support_coins: 0, rune_arm: 0, rune_light: 0 };
+    return teams[t];
+  };
+  for (const [mapId, m] of state.maps) {
+    const tm = num(m, A.TeamID);
+    if (tm !== 0 && tm !== 1) continue;
+    const kills = num(m, A.KillCount);
+    const deaths = num(m, A.DeathCount);
+    if (kills !== undefined || deaths !== undefined) {
+      const v = {
+        map_id: mapId,
+        team: tm,
+        class: num(m, A.Class) ?? null,
+        kills: Math.round(kills ?? 0),
+        deaths: Math.round(deaths ?? 0),
+        damage_taken: Math.round(num(m, A.DamageTakenTotal) ?? 0),
+        health: num(m, A.Health) ?? null,
+      };
+      vehicles.push(v);
+      const T = team(tm);
+      T.vehicles++; T.kills += v.kills; T.deaths += v.deaths; T.damage_taken += v.damage_taken;
+    }
+    const coins = num(m, A.TM_Coins);
+    if (coins !== undefined) { const T = team(tm); T.coins = Math.max(T.coins ?? 0, Math.round(coins)); }
+    const sc = (num(m, A.TM_SupportCoins_70) ?? 0) + (num(m, A.TM_SupportCoins_140) ?? 0);
+    if (sc) team(tm).support_coins = Math.max(team(tm).support_coins, Math.round(sc));
+    const arm = num(m, A.BigRuneBuffArmCount);
+    const light = num(m, A.BigRuneBuffLightCount);
+    if (arm !== undefined) team(tm).rune_arm += Math.round(arm);
+    if (light !== undefined) team(tm).rune_light += Math.round(light);
+  }
+  return { vehicles, teams };
+}
+
 function applyStatus(state, mapId, prev, cur) {
   const status = num(cur, A.G_CurMatchStatus);
   if (status === undefined) return;
@@ -495,6 +548,7 @@ function applyStatus(state, mapId, prev, cur) {
       completed_at: new Date().toISOString(),
       end_game_time_ms: state.currentGameTimeMs,
       buildings: snapshotBuildingHp(state, cur),
+      scoreboard: snapshotScoreboard(state),
     };
     state.matches.push(matchSummary);
     flushTrace(state, matchSummary);
