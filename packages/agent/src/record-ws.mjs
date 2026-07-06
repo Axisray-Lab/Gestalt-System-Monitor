@@ -16,7 +16,11 @@
 import { createWriteStream, readdirSync } from 'node:fs';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import WebSocket from 'ws';
+// Use node's built-in WebSocket (node >=22 — present on all fleet runners) so no 'ws' npm
+// dependency is needed at runtime (CI shell-runner checkouts don't install node_modules, which
+// made record-ws crash with ERR_MODULE_NOT_FOUND 'ws' and produce zero telemetry). Fall back to
+// the 'ws' package on older node. Both expose the WHATWG addEventListener API used below.
+const WebSocket = globalThis.WebSocket ?? (await import('ws')).default;
 
 const METHOD_WATCH_ATTRIBUTE_MAPS = 'attribute.watchAttributeMaps';
 const METHOD_WATCH_ATTRIBUTE_MAPS_RESULT = 'watchAttributeMaps.result';
@@ -728,7 +732,7 @@ async function main() {
         }, cfg.timeoutSec * 1000)
       : null;
 
-  ws.on('open', () => {
+  ws.addEventListener('open', () => {
     state.connected = true;
     watch(ws, state, DEFAULT_WATCH_MAP_IDS);
     bootstrapRetry = setInterval(() => {
@@ -743,10 +747,11 @@ async function main() {
     log(cfg, `open, watching ${DEFAULT_WATCH_MAP_IDS.length} bootstrap maps`);
   });
 
-  ws.on('message', data => {
+  ws.addEventListener('message', ev => {
+    const data = typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString('utf8');
     let msg;
     try {
-      msg = JSON.parse(data.toString());
+      msg = JSON.parse(data);
     } catch {
       return;
     }
@@ -776,7 +781,7 @@ async function main() {
     }
   });
 
-  ws.on('close', () => {
+  ws.addEventListener('close', () => {
     if (timeout) clearTimeout(timeout);
     if (!finishing) {
       const ok = cfg.targetMatches <= 0 || state.completedMatches >= cfg.targetMatches;
@@ -784,7 +789,8 @@ async function main() {
     }
   });
 
-  ws.on('error', err => {
+  ws.addEventListener('error', ev => {
+    const err = ev?.error ?? ev?.message ?? ev;
     console.error('[record-ws] ERROR:', err?.message ?? err);
     if (timeout) clearTimeout(timeout);
     if (!finishing) void finish('error', 1);
