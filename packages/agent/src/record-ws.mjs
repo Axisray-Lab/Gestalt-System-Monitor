@@ -444,6 +444,25 @@ function flushTrace(state, matchSummary) {
   state.traceWrites.push(write);
 }
 
+// Snapshot both teams' base + outpost Health at match end. Raw LAN-observable match
+// state (the recorder already follows these maps via G_BaseId_0+team / G_OutpostId_0+team).
+// This is the "who is ahead" a spectator sees; the winner tiebreak (a game-ruleset
+// concern) is left to the private consumer — the monitor only exposes observable hp.
+function snapshotBuildingHp(state, globalAttrs) {
+  const out = {};
+  for (const team of [0, 1]) {
+    const baseId = num(globalAttrs, A.G_BaseId_0 + team);
+    const outpostId = num(globalAttrs, A.G_OutpostId_0 + team);
+    const baseMap = baseId ? state.maps.get(Math.round(baseId)) : null;
+    const outpostMap = outpostId ? state.maps.get(Math.round(outpostId)) : null;
+    out[`t${team}_base_hp`] = baseMap ? (num(baseMap, A.Health) ?? null) : null;
+    out[`t${team}_base_hp_max`] = baseMap ? (num(baseMap, A.HealthMax) ?? null) : null;
+    out[`t${team}_outpost_hp`] = outpostMap ? (num(outpostMap, A.Health) ?? null) : null;
+    out[`t${team}_outpost_hp_max`] = outpostMap ? (num(outpostMap, A.HealthMax) ?? null) : null;
+  }
+  return out;
+}
+
 function applyStatus(state, mapId, prev, cur) {
   const status = num(cur, A.G_CurMatchStatus);
   if (status === undefined) return;
@@ -475,6 +494,7 @@ function applyStatus(state, mapId, prev, cur) {
       index: state.currentMatchIndex,
       completed_at: new Date().toISOString(),
       end_game_time_ms: state.currentGameTimeMs,
+      buildings: snapshotBuildingHp(state, cur),
     };
     state.matches.push(matchSummary);
     flushTrace(state, matchSummary);
@@ -484,6 +504,7 @@ function applyStatus(state, mapId, prev, cur) {
       completed_matches: state.completedMatches,
       map_id: mapId,
       gt: state.currentGameTimeMs,
+      buildings: matchSummary.buildings,
     });
     state.activeMatchSeen = false;
   }
