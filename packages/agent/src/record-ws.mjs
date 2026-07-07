@@ -50,9 +50,12 @@ const A = {
   BigRuneBuffArmCount: 50000082,
   BigRuneBuffLightCount: 50000083,
   IsInFortressOccupyPoint: 50000041,
+  HasFortressAmmo: 50000047,
   TM_Coins: 74000003,
   TM_BaseDamageCount: 74000010,
   TM_OutPostRebuildCount: 74000011,
+  TM_FortAmmo: 74000013,
+  TM_FortAmmoCapMax: 74000022,
   TM_SupportCoins_70: 74000007,
   TM_SupportCoins_140: 74000008,
   TM_DartOutpostHitCount: 74000023,
@@ -230,9 +233,12 @@ function makeState(cfg) {
     teamControl: new Map(),
     // root-cause verification accumulators (reset per match in applyStatus):
     occupyMs: new Map(),          // robot mapId -> cumulative ms with IsInFortressOccupyPoint=1
-    lastOccupyGt: 0,              // last game-time we charged occupy against
-    firstOutpostFallGt: null,     // game-time the FIRST outpost fell (base becomes attackable = "堡垒开启")
-    scoreboardAtFall: null,       // scoreboard snapshot at that moment (for pre/post-fall damage split)
+    fortAmmoMs: new Map(),        // robot mapId -> cumulative ms with HasFortressAmmo=1 (leverages 堡垒弹药增益区)
+    lastZoneGt: 0,                // last game-time we charged occupy/fort-ammo against
+    firstOutpostFallGt: null,     // game-time the FIRST outpost fell (增益区开启, ~outpost-kill)
+    scoreboardAtFall: null,       // scoreboard snapshot at that moment (增益区开启 boundary)
+    firstOccupyGt: null,          // game-time 占垒 window opens = first robot actually occupies (~4min gate + outpost)
+    scoreboardAtOccupy: null,     // scoreboard snapshot when 占垒 opens (correct 占垒-易伤 phase boundary)
     teamStats: new Map([
       [0, makeTeamStats()],
       [1, makeTeamStats()],
@@ -494,7 +500,7 @@ function snapshotScoreboard(state) {
   const vehicles = [];
   const teams = {};
   const team = t => {
-    if (!teams[t]) teams[t] = { vehicles: 0, kills: 0, deaths: 0, damage_taken: 0, coins: null, support_coins: 0, rune_arm: 0, rune_light: 0, base_damage: null, outpost_rebuild: null, occupy_ms: 0 };
+    if (!teams[t]) teams[t] = { vehicles: 0, kills: 0, deaths: 0, damage_taken: 0, coins: null, support_coins: 0, rune_arm: 0, rune_light: 0, base_damage: null, outpost_rebuild: null, occupy_ms: 0, fort_ammo_ms: 0, fort_ammo: null, fort_ammo_cap: null };
     return teams[t];
   };
   for (const [mapId, m] of state.maps) {
@@ -504,6 +510,7 @@ function snapshotScoreboard(state) {
     const deaths = num(m, A.DeathCount);
     if (kills !== undefined || deaths !== undefined) {
       const occMs = Math.round(state.occupyMs.get(mapId) ?? 0);
+      const faMs = Math.round(state.fortAmmoMs.get(mapId) ?? 0);
       const v = {
         map_id: mapId,
         team: tm,
@@ -512,11 +519,12 @@ function snapshotScoreboard(state) {
         deaths: Math.round(deaths ?? 0),
         damage_taken: Math.round(num(m, A.DamageTakenTotal) ?? 0),
         occupy_ms: occMs,
+        fort_ammo_ms: faMs,
         health: num(m, A.Health) ?? null,
       };
       vehicles.push(v);
       const T = team(tm);
-      T.vehicles++; T.kills += v.kills; T.deaths += v.deaths; T.damage_taken += v.damage_taken; T.occupy_ms += occMs;
+      T.vehicles++; T.kills += v.kills; T.deaths += v.deaths; T.damage_taken += v.damage_taken; T.occupy_ms += occMs; T.fort_ammo_ms += faMs;
     }
     const coins = num(m, A.TM_Coins);
     if (coins !== undefined) { const T = team(tm); T.coins = Math.max(T.coins ?? 0, Math.round(coins)); }
@@ -524,6 +532,10 @@ function snapshotScoreboard(state) {
     if (baseDmg !== undefined) { const T = team(tm); T.base_damage = Math.max(T.base_damage ?? 0, Math.round(baseDmg)); }
     const rebuild = num(m, A.TM_OutPostRebuildCount);
     if (rebuild !== undefined) { const T = team(tm); T.outpost_rebuild = Math.max(T.outpost_rebuild ?? 0, Math.round(rebuild)); }
+    const fortAmmo = num(m, A.TM_FortAmmo);
+    if (fortAmmo !== undefined) { const T = team(tm); T.fort_ammo = Math.round(fortAmmo); }
+    const fortCap = num(m, A.TM_FortAmmoCapMax);
+    if (fortCap !== undefined) { const T = team(tm); T.fort_ammo_cap = Math.round(fortCap); }
     const sc = (num(m, A.TM_SupportCoins_70) ?? 0) + (num(m, A.TM_SupportCoins_140) ?? 0);
     if (sc) team(tm).support_coins = Math.max(team(tm).support_coins, Math.round(sc));
     const arm = num(m, A.BigRuneBuffArmCount);
@@ -534,10 +546,12 @@ function snapshotScoreboard(state) {
   return { vehicles, teams };
 }
 
-// Charge occupy time to robots currently on the fortress occupy point (占垒), between frames.
+// Charge per-frame zone time to robots: occupy time (占垒 point, IsInFortressOccupyPoint) and
+// fortress-ammo-leverage time (at the 堡垒增益区 with fortress ammo, HasFortressAmmo — remote teams
+// exploit this to counterattack from home; melee abandons it to push).
 function accumulateOccupy(state) {
   const gt = state.currentGameTimeMs;
-  const delta = gt - state.lastOccupyGt;
+  const delta = gt - state.lastZoneGt;
   if (delta > 0 && delta < 5000) { // guard match resets / large gaps
     for (const [mapId, m] of state.maps) {
       const tm = num(m, A.TeamID);
@@ -545,13 +559,15 @@ function accumulateOccupy(state) {
       if (num(m, A.IsInFortressOccupyPoint)) {
         state.occupyMs.set(mapId, (state.occupyMs.get(mapId) ?? 0) + delta);
       }
+      if (num(m, A.HasFortressAmmo)) {
+        state.fortAmmoMs.set(mapId, (state.fortAmmoMs.get(mapId) ?? 0) + delta);
+      }
     }
   }
-  state.lastOccupyGt = gt;
+  state.lastZoneGt = gt;
 }
 
-// Snapshot the scoreboard the instant the FIRST outpost falls (base becomes attackable = "堡垒开启"),
-// so per-vehicle damage/economy can be split pre- vs post-fall (占垒易伤窗口验证).
+// Snapshot the scoreboard the instant the FIRST outpost falls (堡垒增益区开启, ~outpost-kill, early).
 function checkOutpostFall(state) {
   if (state.firstOutpostFallGt !== null) return;
   let g = null;
@@ -569,6 +585,21 @@ function checkOutpostFall(state) {
   }
 }
 
+// Snapshot the scoreboard when the 占垒 (fortress-occupy) window actually OPENS — the correct
+// boundary for the 占垒-易伤 split. Occupy opens on a ~4min time-gate AFTER the outpost fell (NOT at
+// outpost-fall = 增益区), so use the first frame any robot is actually on the occupy point.
+function checkOccupyOpen(state) {
+  if (state.firstOccupyGt !== null) return;
+  for (const m of state.maps.values()) {
+    const tm = num(m, A.TeamID);
+    if ((tm === 0 || tm === 1) && num(m, A.IsInFortressOccupyPoint)) {
+      state.firstOccupyGt = state.currentGameTimeMs;
+      state.scoreboardAtOccupy = snapshotScoreboard(state);
+      return;
+    }
+  }
+}
+
 function applyStatus(state, mapId, prev, cur) {
   const status = num(cur, A.G_CurMatchStatus);
   if (status === undefined) return;
@@ -581,9 +612,12 @@ function applyStatus(state, mapId, prev, cur) {
     state.currentMatchIndex++;
     // reset per-match root-cause accumulators
     state.occupyMs = new Map();
-    state.lastOccupyGt = state.currentGameTimeMs;
+    state.fortAmmoMs = new Map();
+    state.lastZoneGt = state.currentGameTimeMs;
     state.firstOutpostFallGt = null;
     state.scoreboardAtFall = null;
+    state.firstOccupyGt = null;
+    state.scoreboardAtOccupy = null;
     beginTrace(state, mapId);
     writeEvent(state, {
       kind: 'match_start',
@@ -609,6 +643,8 @@ function applyStatus(state, mapId, prev, cur) {
       scoreboard: snapshotScoreboard(state),
       first_outpost_fall_gt: state.firstOutpostFallGt,
       scoreboard_at_fall: state.scoreboardAtFall,
+      first_occupy_gt: state.firstOccupyGt,
+      scoreboard_at_occupy: state.scoreboardAtOccupy,
     };
     state.matches.push(matchSummary);
     flushTrace(state, matchSummary);
@@ -823,6 +859,7 @@ async function main() {
     for (const update of updates) applyUpdate(state, update);
     accumulateOccupy(state);
     checkOutpostFall(state);
+    checkOccupyOpen(state);
 
     const now = Date.now();
     if (now - state.lastWatchAt >= 500) {
