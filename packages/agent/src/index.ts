@@ -826,10 +826,10 @@ if (TRACE_PATH) {
 // --- trace replay (supports --trace, --trace-dir, --trace-dirs) --------------
 function loadTraceDir(dirPath: string, packetLabel: string, portBase: number) {
   const files = readdirSync(dirPath)
-    .filter(f => f.includes('.iter-') && f.endsWith('.trace.json'))
+    .filter(isReplayTraceFile)
     .sort();
   if (files.length === 0) {
-    log(`--trace-dir: no iter-*.trace.json files found in ${dirPath}`);
+    log(`--trace-dir: no iter-*.trace.json / *.rbrecord.json.gz files found in ${dirPath}`);
     return { replayers: [] as TraceReplayer[], procs: [] as DiscoveredProcess[] };
   }
   log(`--trace-dir: loading ${files.length} iterations from ${dirPath} (packet=${packetLabel})`);
@@ -839,7 +839,8 @@ function loadTraceDir(dirPath: string, packetLabel: string, portBase: number) {
 
   for (let i = 0; i < files.length; i++) {
     const tracePath = path.join(dirPath, files[i]);
-    const iterMatch = files[i].match(/iter-(\d+)/);
+    // Legacy traces number via iter-NNN; rbrecord files via _m<NNN> (match index).
+    const iterMatch = files[i].match(/iter-(\d+)/) ?? files[i].match(/_m(\d+)/);
     const iterNum = iterMatch ? parseInt(iterMatch[1], 10) : i + 1;
 
     let winnerMark = '';
@@ -945,9 +946,16 @@ if (traceLoads.length > 0) {
   process.on('beforeExit', shutdown);
 }
 
+// A replayable file is either a legacy compact-delta trace (iter-NNN.trace.json) or
+// a unified rbrecord/1 capture (<label>_m<NNN>.rbrecord.json.gz). Both register as
+// synthetic ws://127.0.0.1:<port> replay iterations.
+function isReplayTraceFile(name: string): boolean {
+  return (name.includes('.iter-') && name.endsWith('.trace.json')) || name.endsWith('.rbrecord.json.gz');
+}
+
 function traceFileCount(dirPath: string): number {
   try {
-    return readdirSync(dirPath).filter(f => f.includes('.iter-') && f.endsWith('.trace.json')).length;
+    return readdirSync(dirPath).filter(isReplayTraceFile).length;
   } catch {
     return 0;
   }

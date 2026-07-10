@@ -13,9 +13,13 @@
  *   node record-ws.mjs --url ws://127.0.0.1:9240 --target 5 --progress progress.json --out summary.json
  */
 
-import { createWriteStream, readdirSync } from 'node:fs';
-import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { createWriteStream, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { copyFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { gzipSync } from 'node:zlib';
+
+// rbrecord/1 writer version stamp (meta.recorder = record-ws.mjs/<RECORDER_VERSION>).
+const RECORDER_VERSION = '1.0';
 // Use node's built-in WebSocket (node >=22 — present on all fleet runners) so no 'ws' npm
 // dependency is needed at runtime (CI shell-runner checkouts don't install node_modules, which
 // made record-ws crash with ERR_MODULE_NOT_FOUND 'ws' and produce zero telemetry). Fall back to
@@ -100,6 +104,16 @@ function parseArgs() {
   const summary =
     get('--summary', '') ||
     (rawOut && /\.json$/i.test(rawOut) ? rawOut : traceDir ? path.join(traceDir, 'summary.json') : '');
+  let metaJson = {};
+  const rawMeta = get('--meta-json', '');
+  if (rawMeta) {
+    try {
+      const parsed = JSON.parse(rawMeta);
+      if (parsed && typeof parsed === 'object') metaJson = parsed;
+    } catch {
+      console.error('[record-ws] WARN: --meta-json is not valid JSON, ignoring');
+    }
+  }
   return {
     url: get('--url', ''),
     agent: get('--agent', ''),
@@ -112,6 +126,12 @@ function parseArgs() {
     mapId: Number(get('--map-id', get('--mapid', '0'))),
     progressIntervalMs: Number(get('--progress-ms', '5000')),
     quiet: has('--quiet'),
+    // rbrecord/1 unified per-match recording (opt-in; absent => zero behaviour change).
+    rbrecordDir: get('--rbrecord-dir', ''),
+    rbrecordSampleDir: get('--rbrecord-sample-dir', ''),
+    rbrecordSampleEvery: Number(get('--rbrecord-sample-every', '10')),
+    rbrecordCapGb: Number(get('--rbrecord-cap-gb', '20')),
+    metaJson,
   };
 }
 
@@ -243,6 +263,15 @@ function makeState(cfg) {
       [0, makeTeamStats()],
       [1, makeTeamStats()],
     ]),
+    // rbrecord/1 per-match state (only populated when cfg.rbrecordDir is set):
+    matchTeamStats: null,          // per-match dart accumulator (lifetime teamStats stays intact)
+    mapIdsSeenThisMatch: new Set(), // scoreboard-bleed guard: only maps updated this match count
+    droppedTimeDeltas: 0,           // occupy/fort-ammo time deltas rejected by the guard (per match)
+    forceRewatch: false,            // set at match start to bypass the 500ms follow throttle once
+    currentRb: null,                // { index, mapId, startWallMs, startGt, connectMidMatch, events, frames }
+    rbWrites: [],                   // pending gzip write promises (awaited in finish())
+    rbFiles: [],                    // committed rbrecord descriptors (diagnostics)
+    rbCommitted: 0,                 // committed count (drives the sampling copy cadence)
     eventsWritten: 0,
     eventStream: null,
   };
@@ -251,6 +280,23 @@ function makeState(cfg) {
 function teamStats(state, team) {
   if (!state.teamStats.has(team)) state.teamStats.set(team, makeTeamStats());
   return state.teamStats.get(team);
+}
+
+// Per-match dart accumulator (rbrecord/1 fix #4): reset each match; null when rbrecord is off.
+function matchTeamStatsFor(state, team) {
+  if (!state.matchTeamStats) return null;
+  if (!state.matchTeamStats.has(team)) state.matchTeamStats.set(team, makeTeamStats());
+  return state.matchTeamStats.get(team);
+}
+
+function applyLaunchToStats(stats, source, kind, delta) {
+  if (source === 'dart_ammo') {
+    stats.launches_from_dart_ammo += delta;
+    stats.launches_by_target_from_dart_ammo[kind] += delta;
+  } else {
+    stats.launches_from_aerial_remaining += delta;
+    stats.launches_by_target_from_aerial_remaining[kind] += delta;
+  }
 }
 
 function targetKind(target) {
@@ -286,11 +332,12 @@ function finalizeDartStats(stats, overrides = {}) {
   };
 }
 
-function summarizeDart(state) {
+function summarizeDartMap(teamStatsMap) {
   const byTeam = {};
   const total = makeTeamStats();
   let totalTrueLaunches = 0;
-  for (const [team, stats] of [...state.teamStats.entries()].sort((a, b) => a[0] - b[0])) {
+  const entries = teamStatsMap ? [...teamStatsMap.entries()].sort((a, b) => a[0] - b[0]) : [];
+  for (const [team, stats] of entries) {
     const teamFinal = finalizeDartStats(stats);
     byTeam[String(team)] = teamFinal;
     totalTrueLaunches += teamFinal.true_launches;
@@ -322,6 +369,12 @@ function summarizeDart(state) {
     }),
     by_team: byTeam,
   };
+}
+
+// Legacy process-lifetime dart summary (unchanged shape; the *_attribute_summary.json + progress
+// consumers depend on this). rbrecord per-match summaries use summarizeDartMap(state.matchTeamStats).
+function summarizeDart(state) {
+  return summarizeDartMap(state.teamStats);
 }
 
 function progressPayload(state) {
@@ -383,6 +436,87 @@ async function writeJsonAtomic(file, payload) {
   throw lastError;
 }
 
+// Binary sibling of writeJsonAtomic (same tmp→rename EPERM/EBUSY retry) for the gzipped rbrecord.
+async function writeBufferAtomic(file, buf) {
+  if (!file) return;
+  await mkdir(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  await writeFile(tmp, buf);
+  let lastError;
+  for (let attempt = 0; attempt < 25; attempt++) {
+    try {
+      await rename(tmp, file);
+      return;
+    } catch (err) {
+      lastError = err;
+      if (!['EPERM', 'EBUSY', 'EACCES'].includes(err?.code) || attempt === 24) break;
+      await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
+// Startup FIFO sweep: if the rbrecord dir exceeds --rbrecord-cap-gb, delete oldest
+// *.rbrecord.json.gz until under cap. Full-fat rbrecords live on the runner's local disk
+// (GIT_CLEAN kept); this bounds them so a night of matches can't fill the volume.
+function sweepRbrecordDir(cfg) {
+  const dir = cfg.rbrecordDir;
+  if (!dir) return;
+  const capBytes = Math.max(0, cfg.rbrecordCapGb) * 1024 * 1024 * 1024;
+  if (capBytes <= 0) return;
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const files = [];
+  let total = 0;
+  for (const name of names) {
+    if (!/\.rbrecord\.json\.gz$/i.test(name)) continue;
+    const full = path.join(dir, name);
+    try {
+      const st = statSync(full);
+      files.push({ full, name, size: st.size, mtime: st.mtimeMs });
+      total += st.size;
+    } catch {}
+  }
+  if (total <= capBytes) return;
+  files.sort((a, b) => a.mtime - b.mtime);
+  let remaining = total;
+  const deleted = [];
+  for (const f of files) {
+    if (remaining <= capBytes) break;
+    try {
+      unlinkSync(f.full);
+      remaining -= f.size;
+      deleted.push(f.name);
+    } catch {}
+  }
+  if (deleted.length > 0) {
+    const shown = deleted.slice(0, 8).join(', ');
+    log(
+      cfg,
+      `rbrecord FIFO sweep: cap=${cfg.rbrecordCapGb}GB before=${(total / 1e9).toFixed(2)}GB ` +
+        `after=${(remaining / 1e9).toFixed(2)}GB deleted=${deleted.length} [${shown}${deleted.length > 8 ? ', …' : ''}]`
+    );
+  }
+}
+
+// Per-run label for rbrecord filenames: reuse the summary basename (so rbrecords join back to
+// the same cell as *_attribute_summary.json), else the meta run_stamp, else the pid.
+function rbLabel(cfg) {
+  if (cfg.summary) {
+    const base = path
+      .basename(cfg.summary)
+      .replace(/\.json$/i, '')
+      .replace(/_attribute_summary$/i, '');
+    if (base) return base;
+  }
+  const runStamp = cfg.metaJson?.run_stamp;
+  return runStamp ? `run_${runStamp}` : `run_${process.pid}`;
+}
+
 function countTraceMatches(dir) {
   if (!dir) return 0;
   try {
@@ -393,9 +527,12 @@ function countTraceMatches(dir) {
 }
 
 function writeEvent(state, event) {
+  const full = { at: Date.now(), ...event };
+  // rbrecord/1: buffer this match's events slice (only while a match is being recorded).
+  if (state.currentRb) state.currentRb.events.push(full);
   if (!state.eventStream) return;
   state.eventsWritten++;
-  state.eventStream.write(`${JSON.stringify({ at: Date.now(), ...event })}\n`);
+  state.eventStream.write(`${JSON.stringify(full)}\n`);
 }
 
 function watch(ws, state, ids, options = {}) {
@@ -426,9 +563,9 @@ function beginTrace(state, mapId) {
   };
 }
 
-function appendTraceFrame(state, updates) {
-  const trace = state.currentTrace;
-  if (!trace) return;
+// Compact one WS frame's updates into the shared [mapId, flatAttrPairs, marker(0=keyframe|1=delta)]
+// form used by BOTH the legacy trace and rbrecord frames (trace-replayer convertCompact reads it).
+function compactUpdates(updates) {
   const compact = [];
   for (const update of updates) {
     const mapId = update?.attribute_map_id;
@@ -437,7 +574,90 @@ function appendTraceFrame(state, updates) {
     if (flat.length === 0) continue;
     compact.push([mapId, flat, update.sync_type === 0 ? 0 : 1]);
   }
+  return compact;
+}
+
+function appendTraceFrame(state, updates) {
+  const trace = state.currentTrace;
+  if (!trace) return;
+  const compact = compactUpdates(updates);
   if (compact.length > 0) trace.frames.push(compact);
+}
+
+// rbrecord/1 frame buffer. First frame of each match is a synthesized keyframe (full state of all
+// watched maps at match start); every later WS frame is a [relMs, gtMs, updates] tuple where relMs is
+// wall-time since match start and gtMs is the game-time captured at frame arrival (after applyUpdate).
+function beginRb(state, mapId, connectMidMatch) {
+  if (!state.cfg.rbrecordDir) return;
+  const startGt = Number.isFinite(state.currentGameTimeMs) ? Math.round(state.currentGameTimeMs) : 0;
+  const keyframe = [];
+  for (const [mid, attrs] of state.maps) {
+    const flat = attrsToFlat(attrs);
+    if (flat.length === 0) continue;
+    keyframe.push([mid, flat, 0]);
+  }
+  state.currentRb = {
+    index: state.currentMatchIndex,
+    mapId: Number.isFinite(state.cfg.mapId) && state.cfg.mapId > 0 ? state.cfg.mapId : mapId,
+    startWallMs: Date.now(),
+    startGt,
+    connectMidMatch: !!connectMidMatch,
+    events: [],
+    frames: [[0, startGt, keyframe]],
+  };
+}
+
+function appendRbFrame(state, updates) {
+  const rb = state.currentRb;
+  if (!rb) return;
+  const compact = compactUpdates(updates);
+  if (compact.length === 0) return;
+  const relMs = Math.max(0, Date.now() - rb.startWallMs);
+  const gtMs = Number.isFinite(state.currentGameTimeMs) ? Math.round(state.currentGameTimeMs) : null;
+  rb.frames.push([relMs, gtMs, compact]);
+}
+
+// Commit the buffered match as <label>_m<NNN>.rbrecord.json.gz (gzip in RAM, tmp→rename). matchSummary
+// is THIS match's summary (same shape as matches[] PLUS per-match dart). Every Nth commit is also
+// copied to the sample dir for artifact upload.
+function commitRb(state, matchSummary, opts = {}) {
+  const rb = state.currentRb;
+  if (!rb || !state.cfg.rbrecordDir) return;
+  const partial = !!opts.partial;
+  const metaJson = state.cfg.metaJson ?? {};
+  const meta = {
+    recorder: `record-ws.mjs/${RECORDER_VERSION}`,
+    generated_at: new Date().toISOString(),
+    ...metaJson,
+    match_index: rb.index,
+    map_id: rb.mapId,
+    partial,
+    connect_mid_match: rb.connectMidMatch,
+    dropped_time_deltas: state.droppedTimeDeltas ?? 0,
+  };
+  const summary = { ...matchSummary, dart: summarizeDartMap(state.matchTeamStats) };
+  const payload = { schema: 'rbrecord/1', meta, summary, events: rb.events, frames: rb.frames };
+  const label = rbLabel(state.cfg);
+  const name = `${label}_m${String(rb.index).padStart(3, '0')}.rbrecord.json.gz`;
+  const file = path.join(state.cfg.rbrecordDir, name);
+  state.rbCommitted++;
+  const doSample =
+    state.cfg.rbrecordSampleDir &&
+    state.cfg.rbrecordSampleEvery > 0 &&
+    state.rbCommitted % state.cfg.rbrecordSampleEvery === 0;
+  const gz = gzipSync(Buffer.from(JSON.stringify(payload), 'utf8'));
+  const write = writeBufferAtomic(file, gz)
+    .then(async () => {
+      state.rbFiles.push({ match: rb.index, file, partial, bytes: gz.length });
+      if (doSample) {
+        await mkdir(state.cfg.rbrecordSampleDir, { recursive: true });
+        await copyFile(file, path.join(state.cfg.rbrecordSampleDir, name));
+      }
+    })
+    .catch(err => {
+      log(state.cfg, `rbrecord write failed (${name}): ${err?.message ?? err}`);
+    });
+  state.rbWrites.push(write);
 }
 
 function flushTrace(state, matchSummary) {
@@ -503,7 +723,11 @@ function snapshotScoreboard(state) {
     if (!teams[t]) teams[t] = { vehicles: 0, kills: 0, deaths: 0, damage_taken: 0, coins: null, support_coins: 0, rune_arm: 0, rune_light: 0, base_damage: null, outpost_rebuild: null, occupy_ms: 0, fort_ammo_ms: 0, fort_ammo: null, fort_ammo_cap: null };
     return teams[t];
   };
+  // rbrecord/1 fix: state.maps is never cleared, so last match's vehicles bleed in. When rbrecord is
+  // on, only count maps actually updated THIS match (mapIdsSeenThisMatch). Off => unchanged behaviour.
+  const bleedGuard = !!state.cfg.rbrecordDir;
   for (const [mapId, m] of state.maps) {
+    if (bleedGuard && !state.mapIdsSeenThisMatch.has(mapId)) continue;
     const tm = num(m, A.TeamID);
     if (tm !== 0 && tm !== 1) continue;
     const kills = num(m, A.KillCount);
@@ -552,7 +776,11 @@ function snapshotScoreboard(state) {
 function accumulateOccupy(state) {
   const gt = state.currentGameTimeMs;
   const delta = gt - state.lastZoneGt;
-  if (delta > 0 && delta < 5000) { // guard match resets / large gaps
+  // rbrecord/1 fix: widen the guard to 30000ms (was 5000) so normal but sparse WS frames don't
+  // silently drop occupy/fort-ammo time; count deltas the guard still rejects into a meta diagnostic.
+  // Off => keep the original 5000ms cap byte-for-byte (occupy_ms in the legacy summary is unchanged).
+  const cap = state.cfg.rbrecordDir ? 30000 : 5000;
+  if (delta > 0 && delta < cap) { // guard match resets / large gaps
     for (const [mapId, m] of state.maps) {
       const tm = num(m, A.TeamID);
       if (tm !== 0 && tm !== 1) continue;
@@ -563,6 +791,9 @@ function accumulateOccupy(state) {
         state.fortAmmoMs.set(mapId, (state.fortAmmoMs.get(mapId) ?? 0) + delta);
       }
     }
+  } else if (state.cfg.rbrecordDir && delta !== 0) {
+    // delta<0 (match reset) or delta>=cap (time jump) — record how much charged time we skipped.
+    state.droppedTimeDeltas = (state.droppedTimeDeltas ?? 0) + 1;
   }
   state.lastZoneGt = gt;
 }
@@ -619,6 +850,19 @@ function applyStatus(state, mapId, prev, cur) {
     state.firstOccupyGt = null;
     state.scoreboardAtOccupy = null;
     beginTrace(state, mapId);
+    // rbrecord/1: reset per-match accumulators and open a fresh frame buffer. connect_mid_match is
+    // true when we never observed a pre-match status 0 (prevStatus undefined => recorder attached
+    // mid-match). beginRb must precede the match_start writeEvent so it lands in this match's slice.
+    if (state.cfg.rbrecordDir) {
+      state.matchTeamStats = new Map([
+        [0, makeTeamStats()],
+        [1, makeTeamStats()],
+      ]);
+      state.mapIdsSeenThisMatch = new Set();
+      state.droppedTimeDeltas = 0;
+      state.forceRewatch = true;
+      beginRb(state, mapId, prevStatus === undefined);
+    }
     writeEvent(state, {
       kind: 'match_start',
       match: state.currentMatchIndex,
@@ -656,8 +900,46 @@ function applyStatus(state, mapId, prev, cur) {
       gt: state.currentGameTimeMs,
       buildings: matchSummary.buildings,
     });
+    // rbrecord/1: commit AFTER match_complete is buffered so the events slice is whole.
+    if (state.currentRb) {
+      commitRb(state, matchSummary, { partial: false });
+      state.currentRb = null;
+    }
     state.activeMatchSeen = false;
   }
+}
+
+// Locate the global attribute map (carries match status + G_BaseId/G_OutpostId refs) for a
+// partial-commit building-HP snapshot when finish() fires mid-match.
+function findGlobalAttrs(state) {
+  for (const m of state.maps.values()) {
+    if (num(m, A.G_CurMatchStatus) !== undefined || num(m, A.G_BaseId_0) !== undefined) return m;
+  }
+  return null;
+}
+
+// rbrecord/1 fix #2: on process teardown, commit the in-flight (uncompleted) match instead of
+// losing it. meta.partial=true; also appended to the legacy matches[] with a partial flag. Does NOT
+// bump completedMatches (exit-code semantics unchanged).
+function finishPartialRb(state) {
+  if (!state.cfg.rbrecordDir) return;
+  if (!state.currentRb || !state.activeMatchSeen || state.currentMatchIndex <= 0) return;
+  const globalAttrs = findGlobalAttrs(state) ?? {};
+  const matchSummary = {
+    index: state.currentMatchIndex,
+    completed_at: new Date().toISOString(),
+    end_game_time_ms: state.currentGameTimeMs,
+    buildings: snapshotBuildingHp(state, globalAttrs),
+    scoreboard: snapshotScoreboard(state),
+    first_outpost_fall_gt: state.firstOutpostFallGt,
+    scoreboard_at_fall: state.scoreboardAtFall,
+    first_occupy_gt: state.firstOccupyGt,
+    scoreboard_at_occupy: state.scoreboardAtOccupy,
+    partial: true,
+  };
+  state.matches.push(matchSummary);
+  commitRb(state, matchSummary, { partial: true });
+  state.currentRb = null;
 }
 
 function applyLaunchDelta(state, team, source, prevValue, curValue) {
@@ -669,13 +951,11 @@ function applyLaunchDelta(state, team, source, prevValue, curValue) {
 
   const control = state.teamControl.get(team) ?? {};
   const kind = targetKind(control.target);
-  const stats = teamStats(state, team);
-  if (source === 'dart_ammo') {
-    stats.launches_from_dart_ammo += delta;
-    stats.launches_by_target_from_dart_ammo[kind] += delta;
-  } else {
-    stats.launches_from_aerial_remaining += delta;
-    stats.launches_by_target_from_aerial_remaining[kind] += delta;
+  applyLaunchToStats(teamStats(state, team), source, kind, delta);
+  // rbrecord/1: mirror into the per-match dart accumulator (lifetime teamStats stays untouched).
+  if (state.cfg.rbrecordDir) {
+    const ms = matchTeamStatsFor(state, team);
+    if (ms) applyLaunchToStats(ms, source, kind, delta);
   }
   writeEvent(state, {
     kind: 'dart_launch',
@@ -729,10 +1009,7 @@ function addPositiveCounterDelta(prev, cur, attr, apply) {
   apply(delta);
 }
 
-function applyDartTeamStats(state, prev, cur) {
-  const team = num(cur, A.TeamID);
-  if (team !== 0 && team !== 1) return;
-  const stats = teamStats(state, team);
+function bumpDartHitCounters(stats, prev, cur) {
   addPositiveCounterDelta(prev, cur, A.TM_DartOutpostHitCount, delta => {
     stats.outpost_hits += delta;
   });
@@ -750,6 +1027,17 @@ function applyDartTeamStats(state, prev, cur) {
   });
 }
 
+function applyDartTeamStats(state, prev, cur) {
+  const team = num(cur, A.TeamID);
+  if (team !== 0 && team !== 1) return;
+  bumpDartHitCounters(teamStats(state, team), prev, cur);
+  // rbrecord/1: mirror hit/damage counters into the per-match accumulator.
+  if (state.cfg.rbrecordDir) {
+    const ms = matchTeamStatsFor(state, team);
+    if (ms) bumpDartHitCounters(ms, prev, cur);
+  }
+}
+
 function applyUpdate(state, update) {
   const mapId = update?.attribute_map_id;
   if (!Number.isFinite(mapId)) return;
@@ -761,6 +1049,9 @@ function applyUpdate(state, update) {
   state.updates++;
 
   applyStatus(state, mapId, prev, cur);
+  // rbrecord/1 scoreboard-bleed guard: record maps touched THIS match (after applyStatus, so a
+  // match-start reset of the set doesn't drop the status map that triggered it).
+  if (state.cfg.rbrecordDir) state.mapIdsSeenThisMatch.add(mapId);
   applyDartMap(state, prev, cur);
   applyDartTeamStats(state, prev, cur);
 }
@@ -776,6 +1067,11 @@ async function discoverUrlFromAgent(agent) {
 }
 
 async function main() {
+  // Crash diagnostics: a bare "[record-ws] ERROR:" with an empty message is undebuggable from the
+  // CI err.log — surface the real failure (stack/code) for uncaught throws, unhandled rejections,
+  // and WS-level errors so a probe death names its cause.
+  process.on('uncaughtException', e => console.error('[record-ws] UNCAUGHT:', e?.stack ?? e));
+  process.on('unhandledRejection', e => console.error('[record-ws] UNHANDLED_REJECTION:', e?.stack ?? e));
   const cfg = parseArgs();
   if (!cfg.url && cfg.agent) cfg.url = await discoverUrlFromAgent(cfg.agent);
   if (!cfg.url) {
@@ -786,6 +1082,10 @@ async function main() {
     throw new Error('--target/--count must be >= 0');
   }
   if (cfg.traceDir) await mkdir(cfg.traceDir, { recursive: true });
+  if (cfg.rbrecordDir) {
+    await mkdir(cfg.rbrecordDir, { recursive: true });
+    sweepRbrecordDir(cfg); // FIFO to --rbrecord-cap-gb before we start writing new ones
+  }
 
   const state = makeState(cfg);
   if (cfg.events) {
@@ -803,7 +1103,10 @@ async function main() {
     finishing = true;
     state.closed = true;
     try {
-      await Promise.allSettled(state.traceWrites);
+      // rbrecord/1 fix #2: flush the in-flight match (partial=true) BEFORE finalPayload so it also
+      // lands in the legacy matches[]. No-op unless rbrecord is enabled and a match is active.
+      finishPartialRb(state);
+      await Promise.allSettled([...state.traceWrites, ...state.rbWrites]);
       await writeJsonAtomic(cfg.progress, progressPayload(state));
       await writeJsonAtomic(cfg.summary, finalPayload(state, reason));
     } finally {
@@ -857,11 +1160,20 @@ async function main() {
     }
     appendTraceFrame(state, updates);
     for (const update of updates) applyUpdate(state, update);
+    // rbrecord/1: append this frame AFTER applyUpdate so gtMs reflects the frame that just arrived.
+    appendRbFrame(state, updates);
     accumulateOccupy(state);
     checkOutpostFall(state);
     checkOccupyOpen(state);
 
     const now = Date.now();
+    // rbrecord/1 fix #6: on match start, force one immediate re-watch of every referenced map so the
+    // boundary keyframe/first frames aren't missing maps still stuck behind the 500ms follow throttle.
+    if (state.forceRewatch) {
+      state.forceRewatch = false;
+      watch(ws, state, referencedMapIdsFromStore(state.maps), { force: true });
+      state.lastWatchAt = now;
+    }
     if (now - state.lastWatchAt >= 500) {
       state.lastWatchAt = now;
       watch(ws, state, referencedMapIdsFromStore(state.maps));
@@ -886,7 +1198,13 @@ async function main() {
 
   ws.addEventListener('error', ev => {
     const err = ev?.error ?? ev?.message ?? ev;
-    console.error('[record-ws] ERROR:', err?.message ?? err);
+    console.error(
+      '[record-ws] ERROR:',
+      err?.message ?? err,
+      err?.code ?? '',
+      err?.stack ? `\n${err.stack}` : '',
+      `frames=${state.frames} updates=${state.updates} elapsed=${Math.round((Date.now() - state.startedAt) / 1000)}s`
+    );
     if (timeout) clearTimeout(timeout);
     if (!finishing) void finish('error', 1);
   });

@@ -7,7 +7,8 @@
  * browser is actually connected.
  */
 
-import { closeSync, openSync, readSync, statSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   EJSONRPCType,
@@ -46,7 +47,80 @@ const TRACE_HEADER_READ_BYTES = 256 * 1024;
 const TRACE_HEADER_MAX_BYTES = 64 * 1024 * 1024;
 const TRACE_FRAME_READ_BYTES = 128 * 1024;
 
+// rbrecord/1 frames carry a real timeline; pace by the recorded relMs gap between
+// consecutive frames. Clamp a single gap so a pathological recording stall (e.g. a
+// paused recorder) cannot freeze playback indefinitely.
+const RB_MAX_FRAME_DELAY_MS = 5000;
+
+// rbrecord/1 frame: [relMs, gtMs|null, updates] where each update is the same
+// compact-delta triple ([mapId, flatAttrPairs, marker(0=keyframe|1=delta)]) that a
+// legacy .trace.json frame is built from — so convertCompact() reads updates directly.
+type CompactUpdate = [number, number[], number];
+type RbFrame = [number, number | null, CompactUpdate[]];
+
+function isRbrecordPath(tracePath: string): boolean {
+  return tracePath.endsWith('.rbrecord.json.gz');
+}
+
+// Single-entry memo so the back-to-back inspect()+constructor parse of the same file
+// at startup gunzips/parses it once. Keyed by path+mtime; bounded to one file's frames.
+let rbCache: { path: string; mtimeMs: number; result: RbrecordFile } | null = null;
+
+interface RbrecordFile {
+  info: TraceFileInfo;
+  frames: RbFrame[];
+}
+
+function readRbrecord(tracePath: string): RbrecordFile {
+  const stat = statSync(tracePath);
+  if (rbCache && rbCache.path === tracePath && rbCache.mtimeMs === stat.mtimeMs) {
+    return rbCache.result;
+  }
+  const doc = JSON.parse(gunzipSync(readFileSync(tracePath)).toString('utf8')) as {
+    schema?: string;
+    meta?: { map_id?: number };
+    summary?: TraceFileInfo['summary'];
+    frames?: RbFrame[];
+  };
+  if (doc.schema !== 'rbrecord/1') {
+    throw new Error(`Unsupported rbrecord schema "${doc.schema}" in ${tracePath}`);
+  }
+  const frames: RbFrame[] = Array.isArray(doc.frames) ? doc.frames : [];
+
+  // Level id comes from meta.map_id; the per-frame update ids are entity map ids, not
+  // level ids, so fall back to the legacy default rather than to a frame value.
+  let mapId = Number(doc.meta?.map_id ?? 0);
+  if (!Number.isFinite(mapId) || mapId <= 0) mapId = 4;
+
+  const durMs = frames.length > 0 ? Math.max(0, Number(frames[frames.length - 1][0]) || 0) : 0;
+  let gtMs = 0;
+  for (let i = frames.length - 1; i >= 0; i -= 1) {
+    const g = frames[i][1];
+    if (g != null && Number.isFinite(g)) {
+      gtMs = Number(g);
+      break;
+    }
+  }
+
+  const result: RbrecordFile = {
+    frames,
+    info: {
+      v: 1,
+      src: 'rbrecord',
+      fmt: 'compact-delta',
+      mapId,
+      frameCount: frames.length,
+      durMs,
+      gtMs,
+      summary: doc.summary,
+    },
+  };
+  rbCache = { path: tracePath, mtimeMs: stat.mtimeMs, result };
+  return result;
+}
+
 export function readTraceInfo(tracePath: string): TraceFileInfo {
+  if (isRbrecordPath(tracePath)) return readRbrecord(tracePath).info;
   return readTraceHeader(tracePath).info;
 }
 
@@ -67,13 +141,26 @@ export class TraceReplayer {
   // State for compact-delta reconstruction.
   private pmap = new Map<number, Record<string, number>>();
 
+  // rbrecord/1: whole-file in-memory frames, loaded lazily on resume() and freed on
+  // pause() so idle replays keep the legacy streaming design's zero-resident-frames
+  // discipline even with many matches registered at once.
+  private readonly isRb: boolean;
+  private rbFrames: RbFrame[] | null = null;
+
   constructor(private readonly opts: ReplayerOptions) {
     this.wsPort = opts.wsPort ?? 9240;
     this.speed = opts.speed ?? 1;
     this.loop = opts.loop ?? false;
-    const header = readTraceHeader(opts.tracePath);
-    this.info = header.info;
-    this.framesOffset = header.framesOffset;
+    this.isRb = isRbrecordPath(opts.tracePath);
+    if (this.isRb) {
+      // Parse once for the header (frames are dropped here and reloaded on demand).
+      this.info = readRbrecord(opts.tracePath).info;
+      this.framesOffset = 0;
+    } else {
+      const header = readTraceHeader(opts.tracePath);
+      this.info = header.info;
+      this.framesOffset = header.framesOffset;
+    }
     console.error(
       `[replayer] ${this.info.frameCount} frames, ${(this.info.durMs / 1000).toFixed(0)}s, map=${this.info.mapId}`,
     );
@@ -124,6 +211,16 @@ export class TraceReplayer {
 
   private resume() {
     if (!this.alive || this.clients.size === 0 || this.timer) return;
+    if (this.isRb) {
+      if (!this.rbFrames) {
+        this.rbFrames = readRbrecord(this.opts.tracePath).frames;
+        this.idx = 0;
+        this.pmap.clear();
+        this.loggedFirstFrame = false;
+      }
+      this.tick();
+      return;
+    }
     if (!this.reader) {
       this.reader = new TraceFrameReader(this.opts.tracePath, this.framesOffset);
       this.idx = 0;
@@ -140,31 +237,61 @@ export class TraceReplayer {
     }
     this.reader?.close();
     this.reader = null;
+    this.rbFrames = null;
     this.idx = 0;
     this.pmap.clear();
     this.loggedFirstFrame = false;
   }
 
   private tick() {
-    if (!this.alive || this.clients.size === 0 || !this.reader) return;
-    const raw = this.reader.nextFrame();
-    if (!raw) {
-      if (this.loop) {
-        this.reader.reset();
-        this.idx = 0;
-        this.pmap.clear();
-        this.loggedFirstFrame = false;
-        this.tick();
-      } else {
-        this.pause();
-      }
-      return;
-    }
+    if (!this.alive || this.clients.size === 0) return;
 
-    const params =
-      this.info.fmt === 'compact-delta'
-        ? this.convertCompact(raw as Array<[number, number[], number]>)
-        : (raw as TraceFrame).result;
+    let params: WatchAttributeMapsResult;
+    let delay: number;
+
+    if (this.isRb) {
+      if (!this.rbFrames) return;
+      if (this.idx >= this.rbFrames.length) {
+        if (this.loop) {
+          this.idx = 0;
+          this.pmap.clear();
+          this.loggedFirstFrame = false;
+          this.tick();
+        } else {
+          this.pause();
+        }
+        return;
+      }
+      const frame = this.rbFrames[this.idx];
+      params = this.convertCompact(frame[2] ?? []);
+      // Real-timeline pacing: sleep the recorded gap to the next frame's relMs.
+      const next = this.rbFrames[this.idx + 1];
+      let gap = next ? (Number(next[0]) || 0) - (Number(frame[0]) || 0) : 0;
+      if (!Number.isFinite(gap) || gap < 0) gap = 0;
+      delay = this.speed > 0 ? Math.max(1, Math.min(gap / this.speed, RB_MAX_FRAME_DELAY_MS)) : 1;
+    } else {
+      if (!this.reader) return;
+      const raw = this.reader.nextFrame();
+      if (!raw) {
+        if (this.loop) {
+          this.reader.reset();
+          this.idx = 0;
+          this.pmap.clear();
+          this.loggedFirstFrame = false;
+          this.tick();
+        } else {
+          this.pause();
+        }
+        return;
+      }
+      params =
+        this.info.fmt === 'compact-delta'
+          ? this.convertCompact(raw as Array<[number, number[], number]>)
+          : (raw as TraceFrame).result;
+      const frameCount = Math.max(1, this.info.frameCount);
+      const avg = this.info.durMs > 0 ? this.info.durMs / frameCount : 100;
+      delay = this.speed > 0 ? Math.max(16, avg / this.speed) : 1;
+    }
 
     if (!this.loggedFirstFrame) {
       console.error(`[replayer] first frame: ${params.watch_attribute_maps_results.length} updates`);
@@ -175,9 +302,6 @@ export class TraceReplayer {
       if (ws.readyState === WebSocket.OPEN) this.send(ws, params);
     }
     this.idx += 1;
-    const frameCount = Math.max(1, this.info.frameCount);
-    const avg = this.info.durMs > 0 ? this.info.durMs / frameCount : 100;
-    const delay = this.speed > 0 ? Math.max(16, avg / this.speed) : 1;
     this.timer = setTimeout(() => {
       this.timer = null;
       this.tick();
