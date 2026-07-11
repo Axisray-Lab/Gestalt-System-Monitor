@@ -20,11 +20,14 @@ import { gzipSync } from 'node:zlib';
 
 // rbrecord/1 writer version stamp (meta.recorder = record-ws.mjs/<RECORDER_VERSION>).
 const RECORDER_VERSION = '1.0';
-// Use node's built-in WebSocket (node >=22 — present on all fleet runners) so no 'ws' npm
-// dependency is needed at runtime (CI shell-runner checkouts don't install node_modules, which
-// made record-ws crash with ERR_MODULE_NOT_FOUND 'ws' and produce zero telemetry). Fall back to
-// the 'ws' package on older node. Both expose the WHATWG addEventListener API used below.
-const WebSocket = globalThis.WebSocket ?? (await import('ws')).default;
+// Prefer the 'ws' package when resolvable, fall back to node's built-in (undici) WebSocket.
+// Rationale: undici's client dies with an empty-message TypeError from its own #onSocketClose
+// while a healthy recording is in flight (reproduced 3x at ~200s on node 24; the reconnect layer
+// then burns its budget because every fresh undici socket dies the same way). The 'ws' package is
+// unaffected. CI shell-runner checkouts have no node_modules — there the import fails and the
+// built-in keeps things working (as it did for the balance13 overnight fleet). Both expose the
+// WHATWG addEventListener API used below.
+const WebSocket = await import('ws').then(m => m.default).catch(() => globalThis.WebSocket);
 
 const METHOD_WATCH_ATTRIBUTE_MAPS = 'attribute.watchAttributeMaps';
 const METHOD_WATCH_ATTRIBUTE_MAPS_RESULT = 'watchAttributeMaps.result';
@@ -1070,7 +1073,14 @@ async function main() {
   // Crash diagnostics: a bare "[record-ws] ERROR:" with an empty message is undebuggable from the
   // CI err.log — surface the real failure (stack/code) for uncaught throws, unhandled rejections,
   // and WS-level errors so a probe death names its cause.
-  process.on('uncaughtException', e => console.error('[record-ws] UNCAUGHT:', e?.stack ?? e));
+  // onFatal is wired to the reconnect path once the socket machinery below exists: undici's
+  // WebSocket can THROW from its own close handling (observed: empty-message TypeError at
+  // #onSocketClose) instead of emitting 'error' — treat that exactly like a socket loss.
+  let onFatal = null;
+  process.on('uncaughtException', e => {
+    console.error('[record-ws] UNCAUGHT:', e?.stack ?? e);
+    onFatal?.(e);
+  });
   process.on('unhandledRejection', e => console.error('[record-ws] UNHANDLED_REJECTION:', e?.stack ?? e));
   const cfg = parseArgs();
   if (!cfg.url && cfg.agent) cfg.url = await discoverUrlFromAgent(cfg.agent);
@@ -1094,9 +1104,44 @@ async function main() {
   }
 
   log(cfg, `connecting ${cfg.url}`);
-  const ws = new WebSocket(cfg.url);
+  // Reconnect-and-resume: node's built-in (undici) WebSocket occasionally dies minutes into a
+  // recording with an empty-message TypeError from #onSocketClose (observed twice across ~180
+  // probe runs), and fleet runs can also hit real transient socket drops. Losing the socket must
+  // not lose the run: keep in-memory state (maps/matches/rbrecord buffers survive), clear the
+  // watched set, and re-subscribe on a fresh socket. Consecutive-failure budget; any received
+  // frame refills it.
+  const MAX_CONSECUTIVE_RECONNECTS = 5;
+  let ws = null;
   let finishing = false;
   let bootstrapRetry = null;
+  let reconnectsLeft = MAX_CONSECUTIVE_RECONNECTS;
+  let reconnectTimer = null;
+  let reconnects = 0;
+
+  function scheduleReconnect(why) {
+    if (finishing || reconnectTimer) return;
+    if (bootstrapRetry) {
+      clearInterval(bootstrapRetry);
+      bootstrapRetry = null;
+    }
+    state.connected = false;
+    if (reconnectsLeft <= 0) {
+      const ok = cfg.targetMatches <= 0 || state.completedMatches >= cfg.targetMatches;
+      void finish(ok ? 'socket_lost' : 'socket_lost_before_target', ok ? 0 : 1);
+      return;
+    }
+    reconnectsLeft--;
+    reconnects++;
+    console.error(
+      `[record-ws] socket lost (${why}) — reconnecting in 2s (${reconnectsLeft} attempts left, ` +
+        `frames=${state.frames} completed=${state.completedMatches}/${cfg.targetMatches})`
+    );
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, 2000);
+    reconnectTimer.unref?.();
+  }
 
   async function finish(reason, code) {
     if (finishing) return;
@@ -1127,22 +1172,35 @@ async function main() {
         }, cfg.timeoutSec * 1000)
       : null;
 
-  ws.addEventListener('open', () => {
+  function connect() {
+    if (finishing) return;
+    // Fresh socket => the server-side watch registrations are gone; clear our bookkeeping so
+    // watch() re-subscribes everything (the FullSync snapshots then rebuild/refresh state.maps).
+    state.watched.clear();
+    const sock = new WebSocket(cfg.url);
+    ws = sock;
+
+  sock.addEventListener('open', () => {
+    if (sock !== ws || finishing) return;
     state.connected = true;
-    watch(ws, state, DEFAULT_WATCH_MAP_IDS);
+    watch(sock, state, DEFAULT_WATCH_MAP_IDS);
+    if (reconnects > 0) watch(sock, state, referencedMapIdsFromStore(state.maps), { force: true });
     bootstrapRetry = setInterval(() => {
-      if (state.frames > 0) {
+      if (state.frames > 0 && state.connected) {
         if (bootstrapRetry) clearInterval(bootstrapRetry);
         bootstrapRetry = null;
         return;
       }
-      watch(ws, state, DEFAULT_WATCH_MAP_IDS, { force: true });
+      watch(sock, state, DEFAULT_WATCH_MAP_IDS, { force: true });
     }, 1000);
     bootstrapRetry.unref?.();
-    log(cfg, `open, watching ${DEFAULT_WATCH_MAP_IDS.length} bootstrap maps`);
+    log(cfg, `open, watching ${DEFAULT_WATCH_MAP_IDS.length} bootstrap maps${reconnects > 0 ? ` (reconnect #${reconnects})` : ''}`);
   });
 
-  ws.addEventListener('message', ev => {
+  sock.addEventListener('message', ev => {
+    if (sock !== ws || finishing) return;
+    // Healthy traffic refills the consecutive-failure budget.
+    reconnectsLeft = MAX_CONSECUTIVE_RECONNECTS;
     const data = typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString('utf8');
     let msg;
     try {
@@ -1171,12 +1229,12 @@ async function main() {
     // boundary keyframe/first frames aren't missing maps still stuck behind the 500ms follow throttle.
     if (state.forceRewatch) {
       state.forceRewatch = false;
-      watch(ws, state, referencedMapIdsFromStore(state.maps), { force: true });
+      watch(sock, state, referencedMapIdsFromStore(state.maps), { force: true });
       state.lastWatchAt = now;
     }
     if (now - state.lastWatchAt >= 500) {
       state.lastWatchAt = now;
-      watch(ws, state, referencedMapIdsFromStore(state.maps));
+      watch(sock, state, referencedMapIdsFromStore(state.maps));
     }
     if (cfg.progress && now - state.lastProgressAt >= cfg.progressIntervalMs) {
       state.lastProgressAt = now;
@@ -1188,15 +1246,18 @@ async function main() {
     }
   });
 
-  ws.addEventListener('close', () => {
-    if (timeout) clearTimeout(timeout);
-    if (!finishing) {
-      const ok = cfg.targetMatches <= 0 || state.completedMatches >= cfg.targetMatches;
-      void finish(ok ? 'closed' : 'closed_before_target', ok ? 0 : 1);
+  sock.addEventListener('close', () => {
+    if (sock !== ws || finishing) return;
+    if (cfg.targetMatches > 0 && state.completedMatches >= cfg.targetMatches) {
+      if (timeout) clearTimeout(timeout);
+      void finish('closed', 0);
+      return;
     }
+    scheduleReconnect('closed');
   });
 
-  ws.addEventListener('error', ev => {
+  sock.addEventListener('error', ev => {
+    if (sock !== ws) return;
     const err = ev?.error ?? ev?.message ?? ev;
     console.error(
       '[record-ws] ERROR:',
@@ -1205,9 +1266,16 @@ async function main() {
       err?.stack ? `\n${err.stack}` : '',
       `frames=${state.frames} updates=${state.updates} elapsed=${Math.round((Date.now() - state.startedAt) / 1000)}s`
     );
-    if (timeout) clearTimeout(timeout);
-    if (!finishing) void finish('error', 1);
+    scheduleReconnect('error');
   });
+  }
+
+  onFatal = e => {
+    if (finishing) return;
+    if (/undici|websocket/i.test(String(e?.stack ?? e))) scheduleReconnect('uncaught');
+  };
+
+  connect();
 }
 
 main().catch(err => {
