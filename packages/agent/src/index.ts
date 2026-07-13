@@ -11,6 +11,7 @@
  */
 import dgram from 'node:dgram';
 import http from 'node:http';
+import { networkInterfaces } from 'node:os';
 import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
@@ -278,6 +279,14 @@ const localLaunchProcesses = new Map<
 >();
 const keyOf = (matchId: string, ip: string) => `${matchId}@${ip}`;
 
+function websocketHostForBeacon(sourceIp: string): string {
+  if (sourceIp === '127.0.0.1') return sourceIp;
+  const isLocal = Object.values(networkInterfaces()).some((addresses) =>
+    addresses?.some((address) => address.family === 'IPv4' && address.address === sourceIp),
+  );
+  return isLocal ? '127.0.0.1' : sourceIp;
+}
+
 // --- UDP beacon listener (mirrors the game's LAN beacon semantics) ------------
 const udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
@@ -292,6 +301,7 @@ udp.on('message', (buf, rinfo) => {
   if (typeof payload?.matchId !== 'string' || typeof payload?.wsPort !== 'number') return;
 
   const ip = rinfo.address;
+  const wsHost = websocketHostForBeacon(ip);
   const k = keyOf(payload.matchId, ip);
   const previous = processes.get(k);
   const localLaunch = localLaunchForBeacon(payload);
@@ -299,15 +309,15 @@ udp.on('message', (buf, rinfo) => {
     ...payload,
     sourceIp: ip,
     lastSeen: Date.now(),
-    wsUrl: `ws://${ip}:${payload.wsPort}`,
+    wsUrl: `ws://${wsHost}:${payload.wsPort}`,
     ...(localLaunch
       ? { localLaunchId: localLaunch.id, localLaunchPid: localLaunch.pid }
       : {}),
   };
   processes.set(k, nextProcess);
-  if (localLaunch) launcher.setLaunchWsUrl(localLaunch.id, `ws://127.0.0.1:${payload.wsPort}`);
+  if (localLaunch) launcher.setLaunchWsUrl(localLaunch.id, nextProcess.wsUrl);
   if (!previous) {
-    log(`+ ${payload.name ?? payload.matchId}  ws://${ip}:${payload.wsPort}`);
+    log(`+ ${payload.name ?? payload.matchId}  ${nextProcess.wsUrl}`);
     broadcastList();
   } else if (previous.localLaunchId !== nextProcess.localLaunchId || previous.localLaunchPid !== nextProcess.localLaunchPid) {
     broadcastList();
