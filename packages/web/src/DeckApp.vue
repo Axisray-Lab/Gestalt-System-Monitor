@@ -222,6 +222,8 @@ const desktopBridgeAvailable = ref(false);
 const launchSource = ref('standalone');
 const launchSourceDetail = ref('');
 const launchSourceBusy = ref(false);
+const desktopQuitBusy = ref(false);
+const desktopQuitError = ref<string | null>(null);
 const libraryNotice = ref('Autosave on');
 const performanceStats = ref<ThreePerformanceStats>({
   fps: 0,
@@ -464,6 +466,15 @@ const launchSourceDisabled = computed(
 );
 const desktopMonitorDisabled = computed(
   () => !desktopBridgeAvailable.value || desktopMonitorBusy.value || desktopMonitors.value.length === 0
+);
+const desktopQuitHint = computed(() => {
+  if (!desktopBridgeAvailable.value) return '仅桌面端可用';
+  if (desktopQuitError.value) return desktopQuitError.value;
+  if (desktopQuitBusy.value) return '正在释放桌面停靠空间';
+  return '释放停靠空间并关闭 Monitor';
+});
+const desktopQuitDisabled = computed(
+  () => !desktopBridgeAvailable.value || desktopQuitBusy.value
 );
 
 watch(focusedKey, (key) => {
@@ -1011,6 +1022,31 @@ function handleLaunchSourceChange(event: Event): void {
   const target = event.target;
   if (!(target instanceof HTMLSelectElement)) return;
   void setDesktopLaunchSource(target.value);
+}
+
+async function quitDesktopMonitor(): Promise<void> {
+  if (desktopQuitDisabled.value) return;
+  const confirmed = window.confirm(
+    '确定退出 Monitor？\nMonitor 会先释放桌面停靠空间，再关闭由它启动的后台服务。'
+  );
+  if (!confirmed) return;
+
+  desktopQuitError.value = null;
+  const request = tauriInvoke<void>('desktop_quit');
+  if (!request) {
+    desktopBridgeAvailable.value = false;
+    desktopQuitError.value = '仅桌面端可用';
+    return;
+  }
+
+  desktopQuitBusy.value = true;
+  try {
+    await request;
+  } catch (err) {
+    desktopQuitError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    desktopQuitBusy.value = false;
+  }
 }
 
 function formatCount(value: number): string {
@@ -2412,6 +2448,20 @@ onBeforeUnmount(() => {
             <option value="steam">Steam 安装</option>
           </select>
         </label>
+        <div class="settings-danger-zone">
+          <span class="settings-copy">
+            <strong>退出 Monitor</strong>
+            <small :title="desktopQuitHint">{{ desktopQuitHint }}</small>
+          </span>
+          <button
+            class="settings-danger-button"
+            type="button"
+            :disabled="desktopQuitDisabled"
+            @click="quitDesktopMonitor"
+          >
+            {{ desktopQuitBusy ? '正在退出…' : '退出 Monitor' }}
+          </button>
+        </div>
       </section>
     </main>
 
@@ -4350,6 +4400,48 @@ onBeforeUnmount(() => {
 .settings-field select:disabled {
   cursor: default;
   opacity: 0.54;
+}
+
+.settings-danger-zone {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 1px;
+  border-top: 1px solid rgba(116, 55, 60, 0.72);
+  padding-top: 8px;
+}
+
+.settings-danger-zone .settings-copy strong {
+  color: #f6b0b0;
+}
+
+.settings-danger-button {
+  width: 100%;
+  height: 29px;
+  border: 1px solid rgba(196, 70, 78, 0.88);
+  border-radius: var(--gsm-radius-sm);
+  background: rgba(84, 27, 32, 0.82);
+  color: #ffe1e1;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--gsm-fs-body);
+  font-weight: 900;
+}
+
+.settings-danger-button:hover:not(:disabled),
+.settings-danger-button:focus-visible {
+  border-color: rgba(239, 96, 104, 0.98);
+  background: rgba(112, 34, 41, 0.94);
+  outline: none;
+}
+
+.settings-danger-button:focus-visible {
+  box-shadow: 0 0 0 2px rgba(239, 96, 104, 0.2);
+}
+
+.settings-danger-button:disabled {
+  cursor: default;
+  opacity: 0.46;
 }
 
 .toggle-track {

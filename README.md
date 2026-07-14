@@ -50,7 +50,7 @@ For the **full product** — the desktop dock that docks to the screen edge and
 launches matches — see [`docs/DESKTOP.md`](docs/DESKTOP.md):
 
 ```bash
-npm run desktop:dev               # web@5180 + auto agent@7788 + the Tauri dock
+npm run desktop:dev               # web@5180 + Rust-owned agent@7788 + Tauri dock
 # or, detached + clean (Windows):  pwsh scripts/monitor-start.ps1 -Restart
 ```
 
@@ -64,10 +64,10 @@ npm run desktop:dev               # web@5180 + auto agent@7788 + the Tauri dock
 > launch profile, the standalone exe path, agent mode, etc. See
 > [`docs/DESKTOP.md`](docs/DESKTOP.md#dev-launch-source-local-standalone-vs-steam).
 
-> **Clean shutdown matters:** the desktop dock reserves a screen edge (a Windows
-> AppBar) and parents the agent + any launched game. Close the dock window normally,
-> or run `pwsh scripts/monitor-stop.ps1`, so those resources are released — a hard
-> `taskkill /F` leaks the reserved strip and orphans game windows. See
+> **Desktop lifecycle:** use Settings → **退出 Monitor** or
+> `pwsh scripts/monitor-stop.ps1` for an ordered, verified shutdown. A Windows Job,
+> detached AppBar watchdog and persisted lease also cover crashes/forced exits; the
+> stop script verifies that the native work area returned to its pre-launch value. See
 > [`docs/DESKTOP.md`](docs/DESKTOP.md#startup--shutdown-resource-lifecycle-read-this-for-killed-but-not-released).
 
 ## Local launcher

@@ -28,10 +28,12 @@ API binds to `localhost` and accepts local origins only.
 
 `packages/desktop` (Tauri) packages the deck UI as a bottom-edge Windows **AppBar**
 that reserves a strip of the desktop work area, and **supervises the agent** as a
-local service (in dev the web dev server's vite plugin spawns it; in prod the dock
-spawns the bundled `gsm-agent` sidecar). It is single-instance, and releases the
-AppBar reservation + tree-kills the agent and any launched game on a graceful
-shutdown. The dock also persists per-machine UI state (`desktop-settings.json` in the
+local service. Desktop dev and production both give Rust sole ownership of the agent;
+web-only dev uses a separately token-owned Vite child. The dock is single-instance,
+uses an authenticated owner-only agent shutdown, and backs normal cleanup with a
+kill-on-close Job plus detached AppBar watchdog/lease for forced exits. Compatible
+external agents may be adopted for use but are never killed by port number. The dock
+also persists per-machine UI state (`desktop-settings.json` in the
 OS app-config dir, outside the repo): the docked monitor and the dev **launch source**
 (local standalone vs Steam). Full architecture, the dev runbook, the launch-source
 toggle, and the startup/shutdown resource-release contract: [`DESKTOP.md`](DESKTOP.md).

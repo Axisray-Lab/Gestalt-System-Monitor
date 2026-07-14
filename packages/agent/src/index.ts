@@ -11,6 +11,7 @@
  */
 import dgram from 'node:dgram';
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
 import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -57,6 +58,7 @@ let launchSourceOverride: { source: string; executablePath?: string; cwd?: strin
 const MOCK = argv.includes('--mock');
 const MOCK_SCENARIO = argv.includes('--scenario');
 const browserPort = numFlag('--port', AGENT_BROWSER_PORT);
+const ownerToken = process.env.GSM_OWNER_TOKEN?.trim();
 const headlessLaunch = buildHeadlessLaunchConfig();
 const defaultSaveDir = path.resolve(
   workspaceRoot,
@@ -324,7 +326,10 @@ udp.on('message', (buf, rinfo) => {
   }
 });
 
-udp.on('error', (err) => console.error('[agent] udp error:', err.message));
+udp.on('error', (err) => {
+  console.error('[agent] udp error:', err.message);
+  if (!shuttingDown) shutdownAgent('UDP server error', 1);
+});
 udp.bind(DISCOVERY_PORT, () => {
   try {
     udp.setBroadcast(true);
@@ -335,7 +340,7 @@ udp.bind(DISCOVERY_PORT, () => {
 });
 
 // --- expiry sweep -------------------------------------------------------------
-setInterval(() => {
+const expirySweepTimer = setInterval(() => {
   const now = Date.now();
   let changed = false;
   for (const [k, p] of processes) {
@@ -348,6 +353,7 @@ setInterval(() => {
   }
   if (changed) broadcastList();
 }, 1000);
+expirySweepTimer.unref?.();
 
 // --- dev launch-source toggle (local standalone vs Steam) ---------------------
 function defaultStandaloneExe(): string | undefined {
@@ -422,7 +428,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
-  res.setHeader('access-control-allow-headers', 'content-type');
+  res.setHeader('access-control-allow-headers', 'content-type,x-gsm-owner-token');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -431,6 +437,22 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+
+  if (url.pathname === '/shutdown') {
+    if (req.method !== 'POST') {
+      res.setHeader('allow', 'POST');
+      writeJson(res, 405, { ok: false, error: 'method not allowed' });
+      return;
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress) || !ownerTokenMatches(req.headers['x-gsm-owner-token'])) {
+      writeJson(res, 403, { ok: false, error: 'forbidden' });
+      return;
+    }
+    res.setHeader('connection', 'close');
+    writeJson(res, 202, { ok: true });
+    setImmediate(() => shutdownAgent('owner request', 0));
+    return;
+  }
 
   if (req.method === 'GET' && url.pathname === '/processes') {
     writeJson(res, 200, listMessage());
@@ -499,6 +521,14 @@ const server = http.createServer(async (req, res) => {
 });
 
 const wss = new WebSocketServer({ server });
+wss.on('error', (err: NodeJS.ErrnoException) => {
+  // The attached HTTP server emits the same listen failure and owns the
+  // EADDRINUSE policy below; handling it twice would upgrade a clean surrender
+  // into exit code 1.
+  if (err.code === 'EADDRINUSE' || shuttingDown) return;
+  console.error('[agent] websocket server error:', err.message);
+  shutdownAgent('WebSocket server error', 1);
+});
 wss.on('connection', (ws, req) => {
   if (!isAllowedOrigin(req.headers.origin)) {
     ws.close();
@@ -508,15 +538,17 @@ wss.on('connection', (ws, req) => {
   sendJson(ws, launcherMessage());
 });
 server.on('error', (err: NodeJS.ErrnoException) => {
+  if (shuttingDown) return;
   if (err.code === 'EADDRINUSE') {
     // Another agent already owns the browser port. The desktop supervisor treats a
     // healthy agent on this port as "current" and keeps using it, so the right move
     // is to surrender quietly rather than crash with an uncaught exception.
     log(`browser port ${browserPort} already in use — another agent is running; exiting.`);
-    process.exit(0);
+    shutdownAgent('browser port already in use', 0);
+    return;
   }
   console.error('[agent] http server error:', err.message);
-  process.exit(1);
+  shutdownAgent('HTTP server error', 1);
 });
 server.listen(browserPort, 'localhost', () => log(`serving process list on ws://localhost:${browserPort}`));
 const launcherBroadcastTimer = setInterval(() => broadcastLauncherStatus(), 2000);
@@ -524,31 +556,80 @@ launcherBroadcastTimer.unref?.();
 const localLaunchHeartbeat = setInterval(() => refreshLocalLaunches(), BROADCAST_INTERVAL_MS);
 localLaunchHeartbeat.unref?.();
 
-// Top-level shutdown: a dying agent must tree-kill every game it launched (each runs
-// `-blockexitprogram`, so only a forced kill frees the window) and every recorder.
-// Registered unconditionally — the trace-replay branches below add their own cleanup.
+// Top-level shutdown: every explicit exit and fatal server error converges here so
+// launched games, recorders, sockets, timers, and trace replayers have one owner.
+// The synchronous process-exit fallback covers any dependency that still calls
+// process.exit() directly; normal callers use shutdownAgent so the requested exit
+// code is preserved and the event loop gets a turn to flush an HTTP response.
+const shutdownHooks = new Set<() => void>();
+let cleanupStarted = false;
 let shuttingDown = false;
-function shutdownAgent(signal: string): void {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  log(`shutting down (${signal}) — terminating launched games + recorders`);
+let shutdownExitCode = 0;
+
+function registerShutdownHook(hook: () => void): void {
+  shutdownHooks.add(hook);
+}
+
+function cleanupAgentResources(reason: string): void {
+  if (cleanupStarted) return;
+  cleanupStarted = true;
+  log(`shutting down (${reason}) — terminating launched games + recorders`);
+  for (const hook of shutdownHooks) {
+    try {
+      hook();
+    } catch (err) {
+      console.error('[agent] shutdown hook failed:', err instanceof Error ? err.message : err);
+    }
+  }
+  shutdownHooks.clear();
+  clearInterval(expirySweepTimer);
+  clearInterval(launcherBroadcastTimer);
+  clearInterval(localLaunchHeartbeat);
   try {
     launcher.shutdownAll();
   } catch (err) {
     console.error('[agent] shutdownAll failed:', err instanceof Error ? err.message : err);
   }
-  clearInterval(launcherBroadcastTimer);
-  clearInterval(localLaunchHeartbeat);
+  for (const ws of wss.clients) ws.terminate();
+  try {
+    wss.close();
+  } catch {
+    /* best effort */
+  }
+  try {
+    udp.close();
+  } catch {
+    /* best effort */
+  }
   try {
     server.close();
   } catch {
     /* best effort */
   }
-  process.exit(0);
 }
-process.on('SIGINT', () => shutdownAgent('SIGINT'));
-process.on('SIGTERM', () => shutdownAgent('SIGTERM'));
-process.on('SIGHUP', () => shutdownAgent('SIGHUP'));
+
+function shutdownAgent(reason: string, exitCode = 0): void {
+  shutdownExitCode = Math.max(shutdownExitCode, exitCode);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  cleanupAgentResources(reason);
+  setImmediate(() => process.exit(shutdownExitCode));
+}
+process.once('SIGINT', () => shutdownAgent('SIGINT', 0));
+process.once('SIGTERM', () => shutdownAgent('SIGTERM', 0));
+process.once('SIGHUP', () => shutdownAgent('SIGHUP', 0));
+process.once('uncaughtException', (err) => {
+  console.error('[agent] uncaught exception:', err);
+  shutdownAgent('uncaught exception', 1);
+});
+process.once('unhandledRejection', (reason) => {
+  console.error('[agent] unhandled rejection:', reason);
+  shutdownAgent('unhandled rejection', 1);
+});
+process.once('exit', (exitCode) => {
+  shutdownExitCode = Math.max(shutdownExitCode, exitCode);
+  cleanupAgentResources(`process exit ${shutdownExitCode}`);
+});
 
 function listMessage(): AgentProcessListMessage {
   const list = [...processes.values()].sort((a, b) => a.matchId.localeCompare(b.matchId));
@@ -719,6 +800,21 @@ function writeJson(res: http.ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(value));
 }
+function ownerTokenMatches(header: string | string[] | undefined): boolean {
+  if (!ownerToken || typeof header !== 'string') return false;
+  const expected = Buffer.from(ownerToken, 'utf8');
+  const actual = Buffer.from(header, 'utf8');
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  const normalized = address.toLowerCase();
+  return (
+    normalized === '::1' ||
+    normalized.startsWith('127.') ||
+    normalized.startsWith('::ffff:127.')
+  );
+}
 function setCorsHeaders(req: http.IncomingMessage, res: http.ServerResponse): boolean {
   const origin = req.headers.origin;
   if (!isAllowedOrigin(origin)) return false;
@@ -819,18 +915,15 @@ if (TRACE_PATH) {
 
   replayer.start().catch((err) => {
     console.error('[agent] trace replayer failed:', err);
-    process.exit(1);
+    shutdownAgent('trace replayer failure', 1);
   });
-  // Graceful shutdown
-  const shutdown = () => {
+  registerShutdownHook(() => {
     clearInterval(keepAlive);
     const k = keyOf(replayerProcess.matchId, replayerProcess.sourceIp);
     processes.delete(k);
     broadcastList();
-    replayer.stop().then(() => process.exit(0));
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+    void replayer.stop();
+  });
 }
 
 // --- trace replay (supports --trace, --trace-dir, --trace-dirs) --------------
@@ -947,13 +1040,10 @@ if (traceLoads.length > 0) {
     broadcastList();
   }, BROADCAST_INTERVAL_MS);
 
-  const shutdown = () => {
+  registerShutdownHook(() => {
     clearInterval(heartbeat);
-    for (const r of allReplayers) r.stop();
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-  process.on('beforeExit', shutdown);
+    for (const r of allReplayers) void r.stop();
+  });
 }
 
 // A replayable file is either a legacy compact-delta trace (iter-NNN.trace.json) or

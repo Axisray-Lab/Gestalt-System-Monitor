@@ -17,29 +17,33 @@ screen edge and orphaned game windows behind.
 
 ```
  ┌───────────────────────────────── desktop dock (app.exe, Tauri) ──────────────────┐
- │  • single-instance named mutex (no 2nd dock → no stacked AppBar reservation)      │
+ │  • single-instance mutex + AppBar lease/watchdog                                  │
  │  • registers a Windows AppBar (SHAppBarMessage ABM_NEW) reserving the bottom edge │
+ │  • owns a kill-on-close Windows Job and an agent ownership token                  │
  │  • supervisor thread (every 3s): ensure_local_service()                           │
  └───────────────┬──────────────────────────────────────────────────────────────────┘
-                 │ spawns / adopts
+                 │ owns (or safely adopts an already-compatible external service)
                  ▼
         discovery + launcher AGENT  (localhost:7788)
-         dev  : the web dev server's vite `gsm-agent` plugin spawns it
-                (`npm run agent`); Rust only spawns it as a FALLBACK if 7788 is free
+         dev  : Rust spawns `npm run agent` with a private `GSM_OWNER_TOKEN`
          prod : Rust spawns the bundled `gsm-agent` sidecar directly
                  │ spawns (detached)
                  ▼
         game process(es)  (the standalone / Steam build) — beacon udp/7999 + ws://
 ```
 
-- **Dev**: `npm run desktop:dev` → `tauri dev`. Its `beforeDevCommand`
-  (`tauri.conf.json`) starts the web dev server on `:5180`, whose vite `gsm-agent`
-  plugin (`packages/web/vite.config.ts`) auto-spawns the **real** agent on `:7788`.
-  The Rust supervisor sees that agent as "current" and does **not** spawn a second
-  one. So in dev the agent is owned by the web dev server — **do not also run
-  `npm run agent` yourself**.
+- **Desktop dev**: `npm run desktop:dev` → `tauri dev`. Its `beforeDevCommand`
+  starts Vite in `desktop` mode on `:5180`; that mode deliberately disables Vite's
+  agent plugin. Rust is therefore the only agent owner and starts `npm run agent`
+  with a private token. This removes the old split ownership between Vite and Rust.
+- **Web-only dev**: `npm run dev` still lets Vite own one agent child. It uses the
+  same token-authenticated shutdown endpoint and only reaps the child it spawned.
 - **Prod**: there is no vite. The Rust supervisor spawns the bundled `gsm-agent`
   sidecar next to `app.exe`.
+
+If a compatible agent is already listening on `:7788`, desktop/web dev may use it,
+but they never claim or kill it. A stale or foreign listener is reported and left
+untouched instead of being killed by port number.
 
 ---
 
@@ -115,42 +119,66 @@ the agent's `launchSourceOverride` works).
 
 ## Startup / shutdown resource lifecycle (read this for "killed but not released")
 
-The dock holds **OS-level resources that only release on a graceful shutdown**: the
-AppBar work-area reservation, the agent process tree (which owns port 7788 and is the
-parent of every launched game), and the recorder children. A hard `taskkill /F` on
-the dock — or `tauri dev`'s rebuild `TerminateProcess` — skips the cleanup and leaves
-the reserved screen edge + orphaned game windows behind. That is the
-"killed the game but Windows didn't free the window" symptom.
+The dock holds an AppBar work-area reservation and may own an agent → game → recorder
+process tree. The lifecycle is intentionally layered: the normal path performs an
+ordered cleanup, while a Windows Job, detached AppBar watchdog and persisted lease
+cover exits where application callbacks cannot run.
 
 **Startup (ordered):**
-1. Single-instance named mutex — a 2nd dock exits instead of stacking a 2nd AppBar.
-2. Register the AppBar (`ABM_NEW`) on the selected monitor.
-3. Supervisor loop (3s): spawn/adopt the agent; skip if a managed child is already
-   alive (prevents the cold-start duplicate-spawn) or if 7788 is already "current".
-4. Re-apply a persisted non-default launch source to the agent once it is up.
+1. Create a `KILL_ON_JOB_CLOSE` Windows Job before reserving any desktop space.
+2. Acquire the single-instance mutex — a 2nd dock exits instead of stacking an
+   AppBar reservation.
+3. Under a cross-process lease mutex, remove a stale persisted lease, start a
+   breakaway broker which creates the detached watchdog, then register `ABM_NEW`.
+   Registration, WndProc subclassing, `ABM_SETPOS` and lease persistence are checked;
+   any failure rolls the registration back and aborts startup.
+4. Start stoppable periodic workers. AppBar work is enqueued onto the HWND-owning
+   Tauri thread; the worker never calls Shell/window APIs from a background thread.
+5. Supervisor loop (3s): use an already-compatible external agent without owning
+   it, otherwise spawn exactly one token-owned agent child. Re-apply a persisted
+   non-default launch source once it is ready.
 
-**Shutdown (ordered) — runs on window Close / `RunEvent::Exit`:**
-1. `ABM_REMOVE` releases the reserved screen edge (`appbar::remove`).
-2. Tree-kill the managed agent (`taskkill /T /F` on the whole `npm → node → games`
-   tree), then reap it.
-3. Sweep any agent still holding port 7788 (e.g. one spawned by the web dev server).
-4. The agent's own `SIGINT`/`SIGTERM`/`SIGHUP` handler runs `shutdownAll()`:
-   force-kills every still-running game (each launches with `-blockexitprogram`, so
-   only a forced kill frees it) and every recorder child.
+**Normal shutdown (ordered) — runs on window Close, explicit “退出 Monitor”,
+`ExitRequested` and `Exit`:**
+1. Set the one-way shutdown flag, synchronously send `ABM_REMOVE`, restore Wry's
+   original WndProc and delete the AppBar lease. No later reassert can re-register it.
+2. Stop and join the periodic workers.
+3. POST `/shutdown` with the owned agent's private token. The agent rejects non-
+   loopback or wrong-token requests, synchronously stops games/recorders/sockets,
+   then exits. Rust waits up to four seconds and only then tree-kills **its own**
+   child as a fallback. There is no port-owner sweep.
+4. Process exit closes the Job handle, which kills any owned descendant that escaped
+   the cooperative path. An adopted external agent is intentionally unaffected.
 
-**Clean stop from a terminal** (does all of the above the right way — graceful close
-first so the AppBar is released, then tree-kills the rest and frees the ports):
+**Hard-exit coverage:**
+
+- Console C/CLOSE/BREAK removes the AppBar synchronously before posting `WM_CLOSE`.
+- The final watchdog is outside both the dock's Job and its live process tree. It
+  waits on the dock process handle and runs `ABM_REMOVE` if the dock is terminated or
+  crashes. A broker process exits before `ABM_NEW`, so `taskkill /T` cannot sweep the
+  final watchdog as a descendant.
+- `appbar-lease.json` in the OS app-config directory is a second recovery layer. A
+  later instance removes a matching stale registration before creating a new one;
+  owner matching prevents a late old watchdog from touching the new instance.
+- Job close reaps the desktop-owned agent, games and recorders even when Rust/Node
+  cleanup code never runs.
+
+**Verified stop from a terminal** first closes the dock normally, then kills only
+processes proven to belong to this checkout/session. It compares every monitor's
+native-pixel work area with the baseline captured by `monitor-start.ps1`; foreign
+owners of `:7788`, `:5180` or `:5191` are reported and never killed:
 
 ```powershell
-pwsh scripts/monitor-stop.ps1                 # dock + agent + web
-pwsh scripts/monitor-stop.ps1 -IncludeGames   # also sweep orphaned game windows
+pwsh scripts/monitor-stop.ps1                 # dock + owned agent + owned web
+pwsh scripts/monitor-stop.ps1 -IncludeGames   # also owned descendant game processes
 ```
 
 ### Known limitations
-- A true hard-kill of `app.exe` (crash, `taskkill /F`, kill from Task Manager)
-  cannot run the in-process cleanup, so it can still leak the AppBar strip. Recover
-  with `scripts/monitor-stop.ps1` (it gracefully closes any surviving dock) or by
-  re-launching the dock (single-instance + a fresh `ABM_NEW`). Prefer closing the
-  dock window normally, or `monitor-stop.ps1`, over `taskkill /F`.
-- Recorder telemetry on agent-death is best-effort: the process is always reaped
-  (no leak), but its final summary write may be truncated.
+- Reservations leaked by a **pre-lease build** have no saved HWND for the new
+  watchdog to deregister. Repair that one legacy work area once (normally by
+  restarting Explorer); `monitor-start.ps1` refuses to stack a new 320px AppBar on
+  top of a suspicious existing reservation.
+- An adopted external agent and its games have a different owner and intentionally
+  survive desktop shutdown. Stop them through their own launcher/session.
+- On a forced agent/Job termination the process tree is still reaped, but a
+  recorder's final buffered summary may be truncated.

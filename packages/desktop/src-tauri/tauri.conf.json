@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.gestalt-system.monitor",
   "build": {
-    "beforeDevCommand": "npm run dev -w @gsm/web",
+    "beforeDevCommand": "npm run dev:desktop -w @gsm/web",
     "frontendDist": "../../web/dist",
     "devUrl": "http://localhost:5180"
   },

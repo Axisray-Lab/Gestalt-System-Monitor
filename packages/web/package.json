@@ -6,6 +6,7 @@
   "description": "Gestalt-System-Monitor SPA — Three.js map wireframe + vehicle telemetry over the game's WebSocket feed.",
   "scripts": {
     "dev": "vite",
+    "dev:desktop": "vite --mode desktop",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",

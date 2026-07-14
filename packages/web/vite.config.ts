@@ -1,12 +1,10 @@
 import { defineConfig } from 'vitest/config';
 import vue from '@vitejs/plugin-vue';
 import { fileURLToPath, URL } from 'node:url';
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { appendFile, writeFile } from 'node:fs/promises';
-import { promisify } from 'node:util';
 import { loadEnv, type Plugin } from 'vite';
-
-const execFileAsync = promisify(execFile);
 
 /**
  * Dev-only: bring up the discovery agent alongside the SPA so a single
@@ -22,11 +20,18 @@ function gsmAgent(): Plugin {
   const DEFAULT_ARGS = '';
   const DEFAULT_AGENT_PORT = 7788;
   let child: ChildProcess | null = null;
+  let ownerToken: string | null = null;
+  let stopPromise: Promise<void> | null = null;
   return {
     name: 'gsm-agent',
     // Dev server only — NOT during `vitest` (which also runs a serve-like env and
     // would otherwise spawn a second agent that collides on the agent's port).
-    apply: (_config, env) => env.command === 'serve' && env.mode !== 'test' && !process.env.VITEST,
+    // Desktop mode delegates agent ownership to the Rust lifecycle coordinator.
+    apply: (_config, env) =>
+      env.command === 'serve' &&
+      env.mode !== 'test' &&
+      env.mode !== 'desktop' &&
+      !process.env.VITEST,
     async configureServer(server) {
       const cfg = process.env.GSM_AGENT ?? DEFAULT_ARGS;
       if (cfg.trim().toLowerCase() === 'off') return;
@@ -38,37 +43,118 @@ function gsmAgent(): Plugin {
         return;
       }
       if (running === 'stale') {
-        server.config.logger.info(`[gsm-agent] updating stale local service on localhost:${port}`);
-        await stopLocalServiceOnPort(port);
+        server.config.logger.error(
+          `[gsm-agent] localhost:${port} is occupied by an incompatible service; leaving it untouched`,
+        );
+        return;
       }
       const root = fileURLToPath(new URL('../..', import.meta.url));
       const isWin = process.platform === 'win32';
-      child = spawn('npm', ['run', 'agent', '--', ...args], {
+      const token = randomUUID();
+      const spawned = spawn('npm', ['run', 'agent', '--', ...args], {
         cwd: root,
         stdio: 'inherit',
         shell: isWin,
+        env: { ...process.env, GSM_OWNER_TOKEN: token },
       });
-      child.on('error', (e) =>
+      child = spawned;
+      ownerToken = token;
+      spawned.on('error', (e) =>
         server.config.logger.error(`[gsm-agent] failed to start: ${e.message}`)
       );
-      const kill = (): void => {
-        const c = child;
-        child = null;
-        if (!c || c.killed || c.pid == null) return;
-        // npm spawns a process tree (npm → tsx → node); kill the whole tree.
-        if (isWin) {
-          try { spawn('taskkill', ['/pid', String(c.pid), '/T', '/F'], { stdio: 'ignore' }); }
-          catch { /* best effort */ }
-        } else {
-          try { c.kill('SIGTERM'); } catch { /* best effort */ }
+      spawned.once('exit', () => {
+        if (child === spawned) {
+          child = null;
+          ownerToken = null;
         }
+      });
+
+      const killOwnedAgentSync = (): void => {
+        const owned = child;
+        child = null;
+        ownerToken = null;
+        if (!owned) return;
+        terminateOwnedChildSync(owned, isWin);
       };
-      server.httpServer?.once('close', kill);
-      process.once('exit', kill);
-      process.once('SIGINT', () => { kill(); process.exit(0); });
-      process.once('SIGTERM', () => { kill(); process.exit(0); });
+      const stopOwnedAgent = (): Promise<void> => {
+        if (stopPromise) return stopPromise;
+        const owned = child;
+        const tokenForChild = ownerToken;
+        if (!owned || !tokenForChild) return Promise.resolve();
+        stopPromise = (async () => {
+          const accepted = await requestOwnedAgentShutdown(port, tokenForChild);
+          if (accepted) await waitForChildExit(owned, 2000);
+          if (isChildRunning(owned)) terminateOwnedChildSync(owned, isWin);
+          if (child === owned) {
+            child = null;
+            ownerToken = null;
+          }
+        })().finally(() => {
+          stopPromise = null;
+        });
+        return stopPromise;
+      };
+
+      server.httpServer?.once('close', () => void stopOwnedAgent());
+      process.once('exit', killOwnedAgentSync);
+      process.once('SIGINT', () => void stopOwnedAgent().finally(() => process.exit(0)));
+      process.once('SIGTERM', () => void stopOwnedAgent().finally(() => process.exit(0)));
     },
   };
+}
+
+function isChildRunning(child: ChildProcess): boolean {
+  return child.pid != null && child.exitCode == null && child.signalCode == null;
+}
+
+function terminateOwnedChildSync(child: ChildProcess, isWin: boolean): void {
+  if (!isChildRunning(child) || child.pid == null) return;
+  if (isWin) {
+    try {
+      spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+    } catch {
+      /* best effort */
+    }
+    return;
+  }
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    /* best effort */
+  }
+}
+
+async function requestOwnedAgentShutdown(port: number, ownerToken: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 750);
+  try {
+    const response = await fetch(`http://localhost:${port}/shutdown`, {
+      method: 'POST',
+      headers: { 'x-gsm-owner-token': ownerToken },
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (!isChildRunning(child)) return;
+  await new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(timeout);
+      child.off('exit', done);
+      resolve();
+    };
+    const timeout = setTimeout(done, timeoutMs);
+    child.once('exit', done);
+  });
 }
 
 function agentPortFromArgs(args: string[]): number | undefined {
@@ -87,78 +173,28 @@ function agentPortFromArgs(args: string[]): number | undefined {
 }
 
 async function localServiceStatus(port: number): Promise<'current' | 'stale' | 'offline'> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 500);
+  let response: Response;
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 500);
-    const response = await fetch(`http://localhost:${port}/launcher`, {
+    response = await fetch(`http://localhost:${port}/launcher`, {
       signal: controller.signal,
     });
+  } catch {
+    return 'offline';
+  } finally {
     clearTimeout(timeout);
-    if (!response.ok) return 'offline';
+  }
+  if (!response.ok) return 'stale';
+  try {
     const payload = await response.json() as {
       kind?: string;
       status?: { autoSave?: unknown; batches?: unknown };
     };
-    if (payload.kind !== 'launcherStatus') return 'offline';
+    if (payload.kind !== 'launcherStatus') return 'stale';
     return payload.status?.autoSave && Array.isArray(payload.status?.batches) ? 'current' : 'stale';
   } catch {
-    return 'offline';
-  }
-}
-
-async function stopLocalServiceOnPort(port: number): Promise<void> {
-  const pids = process.platform === 'win32'
-    ? await windowsPidsListeningOnPort(port)
-    : await unixPidsListeningOnPort(port);
-  for (const pid of pids) {
-    if (pid === process.pid) continue;
-    try {
-      if (process.platform === 'win32') {
-        await execFileAsync('taskkill', ['/pid', String(pid), '/T', '/F']);
-      } else {
-        process.kill(pid, 'SIGTERM');
-      }
-    } catch {
-      /* best effort; spawn below will surface a real bind error if this failed */
-    }
-  }
-  await waitForLocalServicePortToClose(port);
-}
-
-async function windowsPidsListeningOnPort(port: number): Promise<number[]> {
-  try {
-    const { stdout } = await execFileAsync('netstat', ['-ano', '-p', 'tcp']);
-    const pids = new Set<number>();
-    for (const line of stdout.split(/\r?\n/)) {
-      if (!line.includes('LISTENING')) continue;
-      const parts = line.trim().split(/\s+/);
-      const local = parts[1] ?? '';
-      const pid = Number(parts.at(-1));
-      if (local.endsWith(`:${port}`) && Number.isInteger(pid) && pid > 0) pids.add(pid);
-    }
-    return [...pids];
-  } catch {
-    return [];
-  }
-}
-
-async function unixPidsListeningOnPort(port: number): Promise<number[]> {
-  try {
-    const { stdout } = await execFileAsync('lsof', ['-ti', `tcp:${port}`]);
-    return stdout
-      .split(/\s+/)
-      .map((value) => Number(value))
-      .filter((pid) => Number.isInteger(pid) && pid > 0);
-  } catch {
-    return [];
-  }
-}
-
-async function waitForLocalServicePortToClose(port: number): Promise<void> {
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
-    if ((await localServiceStatus(port)) === 'offline') return;
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    return 'stale';
   }
 }
 
