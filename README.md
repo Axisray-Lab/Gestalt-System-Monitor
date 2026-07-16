@@ -132,12 +132,20 @@ Useful overrides:
 
 The SPA warns when the local service estimates there is not enough remaining
 CPU/RAM for the requested parallel workers; a deliberate click still launches the
-batch. When `autoSave` is enabled on the
-`standalone` or `ue` profile, the agent adds `-attrrecord`, assigns per-worker
-`-abslog` / `-UserDir` paths, counts completed matches from `[ATTR-RECORD]` game
-time resets, writes `combined.log`, and runs the local trace analyzer into the
-batch save directory. The real headless match entrypoint is the GS-2 game-side
-capability described in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+batch. When `autoSave` is enabled on the `standalone` or `ue` profile, the agent
+adds `-replaytracks`, assigns per-worker `-abslog` / `-UserDir` paths, and keeps
+the WebSocket recorder only for lightweight progress, summary, and event files.
+The game atomically finalizes one RBREPLAY v4 file per match; the agent copies it
+into the batch worker directory and does not count that match complete until the
+telemetry boundary and finalized `.rbreplay` are both present. That single file
+drives game 3D playback, Monitor playback, and offline AI analysis; autosave no
+longer writes a second `.trace.json` or `.rbrecord` state recording. Monitor
+decodes AttributeMap lifecycle events directly from the native world
+packet stream, including checkpoint rebuilds and map recycling; no sampled
+Attribute side track is recorded.
+
+The real headless match entrypoint is the GS-2 game-side capability described in
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 If another agent already owns `7788`, run a second one with `--port 7790` and open
 the SPA with `?agent=ws://localhost:7790`.

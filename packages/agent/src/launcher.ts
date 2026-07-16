@@ -40,14 +40,16 @@ export interface LaunchManagerOptions extends SteamDiscoveryOptions {
 interface RecordingState {
   launchId: string;
   targetMatches: number;
+  userDir: string;
   progressPath: string;
   summaryPath: string;
   eventsPath: string;
   consolePath: string;
   stderrPath: string;
-  traceDir: string;
+  replayDir: string;
   wsUrl?: string;
   process?: ChildProcess;
+  telemetryCompleted: number;
   completedMatches: number;
   lastError?: string;
 }
@@ -203,12 +205,14 @@ export class LaunchManager {
       const recording = saveDir
         ? {
             targetMatches,
+            userDir: userDir!,
             progressPath: path.join(saveDir, `${workerName}.progress.json`),
             summaryPath: path.join(saveDir, `${workerName}_attribute_summary.json`),
             eventsPath: path.join(saveDir, `${workerName}.events.jsonl`),
             consolePath: path.join(saveDir, `${workerName}.recorder.log`),
             stderrPath: path.join(saveDir, `${workerName}.recorder.err.log`),
-            traceDir: path.join(saveDir, workerName),
+            replayDir: path.join(saveDir, workerName),
+            telemetryCompleted: 0,
             completedMatches: 0,
           }
         : undefined;
@@ -370,17 +374,24 @@ export class LaunchManager {
 
     const progress = readJsonFile<{ completed_matches?: number; closed?: boolean }>(state.progressPath);
     const summary = readJsonFile<{ completed_matches?: number }>(state.summaryPath);
-    const traceMatches = countTraceMatches(state.traceDir);
-    let completedMatches = state.completedMatches;
+    const replayMatches = syncUnifiedReplays(state);
+    let telemetryCompleted = state.telemetryCompleted;
     if (typeof progress?.completed_matches === 'number' && Number.isFinite(progress.completed_matches)) {
-      completedMatches = Math.max(0, Math.floor(progress.completed_matches));
+      telemetryCompleted = Math.max(telemetryCompleted, Math.max(0, Math.floor(progress.completed_matches)));
     }
     if (typeof summary?.completed_matches === 'number' && Number.isFinite(summary.completed_matches)) {
-      completedMatches = Math.max(completedMatches, Math.floor(summary.completed_matches));
+      telemetryCompleted = Math.max(telemetryCompleted, Math.max(0, Math.floor(summary.completed_matches)));
     }
-    completedMatches = Math.max(completedMatches, traceMatches);
+    // A match is durable only after both the WS telemetry boundary and the
+    // finalized one-file replay are present. This prevents the launcher from
+    // killing the game while its delayed replay footer is still being written.
+    const completedMatches = Math.min(telemetryCompleted, replayMatches);
 
     let changed = false;
+    if (state.telemetryCompleted !== telemetryCompleted) {
+      state.telemetryCompleted = telemetryCompleted;
+      changed = true;
+    }
     if (state.completedMatches !== completedMatches) {
       state.completedMatches = completedMatches;
       changed = true;
@@ -393,7 +404,7 @@ export class LaunchManager {
       state.wsUrl &&
       !state.process &&
       launch.status === 'running' &&
-      state.completedMatches < state.targetMatches
+      state.telemetryCompleted < state.targetMatches
     ) {
       this.startRecording(state);
       changed = true;
@@ -405,7 +416,7 @@ export class LaunchManager {
     if (!state.wsUrl || state.process) return;
     try {
       fs.mkdirSync(path.dirname(state.progressPath), { recursive: true });
-      fs.mkdirSync(state.traceDir, { recursive: true });
+      fs.mkdirSync(state.replayDir, { recursive: true });
       for (const file of [state.progressPath, state.summaryPath, state.eventsPath, state.consolePath, state.stderrPath]) {
         try {
           fs.rmSync(file, { force: true });
@@ -426,8 +437,6 @@ export class LaunchManager {
         state.summaryPath,
         '--events',
         state.eventsPath,
-        '--trace-dir',
-        state.traceDir,
         '--quiet',
       ];
       const stdout = fs.openSync(state.consolePath, 'a');
@@ -525,7 +534,7 @@ export class LaunchManager {
         completedMatches: launch.completedMatches ?? 0,
         progressPath: recording?.progressPath,
         summaryPath: recording?.summaryPath,
-        traceDir: recording?.traceDir,
+        unifiedReplayDir: recording?.replayDir,
         recorderError: recording?.lastError,
         progress,
         summary,
@@ -533,7 +542,7 @@ export class LaunchManager {
     });
     const summaryPath = path.join(batch.saveDir, 'recording-summary.json');
     const payload = {
-      schema: 'monitor-autosave-watch-ws/1',
+      schema: 'monitor-autosave-rbreplay-v4/1',
       generatedAt: new Date().toISOString(),
       batch: {
         id: batch.id,
@@ -604,12 +613,42 @@ function readJsonFile<T = unknown>(file: string): T | null {
   }
 }
 
-function countTraceMatches(dir: string): number {
+function countReplayMatches(dir: string): number {
   try {
-    return fs.readdirSync(dir).filter((name) => /\.trace\.json$/i.test(name)).length;
+    return fs.readdirSync(dir).filter((name) => /\.rbreplay$/i.test(name)).length;
   } catch {
     return 0;
   }
+}
+
+function syncUnifiedReplays(state: RecordingState): number {
+  const sourceDir = path.join(state.userDir, 'Saved', 'Replays');
+  try {
+    fs.mkdirSync(state.replayDir, { recursive: true });
+    for (const name of fs.readdirSync(sourceDir).filter((candidate) => /\.rbreplay$/i.test(candidate))) {
+      const source = path.join(sourceDir, name);
+      const destination = path.join(state.replayDir, name);
+      const sourceSize = fs.statSync(source).size;
+      let destinationSize = -1;
+      try {
+        destinationSize = fs.statSync(destination).size;
+      } catch {
+        /* copy below */
+      }
+      if (sourceSize <= 0 || sourceSize === destinationSize) continue;
+      const temporary = `${destination}.copying`;
+      fs.copyFileSync(source, temporary);
+      if (fs.statSync(temporary).size !== sourceSize) {
+        fs.rmSync(temporary, { force: true });
+        continue;
+      }
+      fs.rmSync(destination, { force: true });
+      fs.renameSync(temporary, destination);
+    }
+  } catch {
+    // The directory appears only after the first finalized match. Poll again.
+  }
+  return countReplayMatches(state.replayDir);
 }
 
 function newId(): string {

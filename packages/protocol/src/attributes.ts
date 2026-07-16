@@ -433,9 +433,14 @@ export function makeWatchParams(
   return { attribute_map_ids: ids, watch_type: watchType };
 }
 
-/** One attribute map's update. `sync_type` 0 = full replace, 1 = incremental patch. */
+/**
+ * One attribute map's update. `sync_type` 0 = full replace, 1 = incremental patch,
+ * 2 = recycle/delete. Recycle carries an empty `attributes` object.
+ */
+export type AttributeMapSyncType = 0 | 1 | 2;
+
 export interface AttributeMapUpdate {
-  sync_type: number;
+  sync_type: AttributeMapSyncType;
   attribute_map_id: number;
   attributes: Record<string, number>;
 }

@@ -11,8 +11,9 @@ import {
  * Per-attribute-map store + projection into the renderer's `WorldSnapshot`.
  *
  * Mirrors the public `watchAttributeMaps.result` handling: plain JSON, with full
- * (`sync_type 0`) vs incremental (`sync_type 1`) updates. Each "vehicle" is one
- * attribute map that carries a `PlayerID`/`Health`.
+ * (`sync_type 0`), incremental (`sync_type 1`), and replay-native recycle
+ * (`sync_type 2`) updates. Each "vehicle" is one attribute map that carries a
+ * `PlayerID`/`Health`.
  *
  * If world position + heading are absent, units are laid out in a deterministic
  * placeholder grid so the parse chain + per-unit panels remain testable.
@@ -148,9 +149,21 @@ export class AttributeStore {
   }
 
   private applyUpdate(u: AttributeMapUpdate, now: number): void {
-    this.mapUpdatedAt.set(u.attribute_map_id, now);
     const old = this.maps.get(u.attribute_map_id);
     const oldBattleMapId = old ? this.num(old, AttrId.PlayerBattleAttributeMapID) : undefined;
+    // Native replay carries RecycleAttributeMapEvent explicitly as sync_type 2.
+    // Remove the map and all derived visibility/reference state atomically.
+    if (u.sync_type === 2) {
+      this.maps.delete(u.attribute_map_id);
+      this.mapUpdatedAt.delete(u.attribute_map_id);
+      this.ownHiddenMapIds.delete(u.attribute_map_id);
+      if (oldBattleMapId != null && oldBattleMapId > 0) {
+        this.linkedHiddenMapIds.delete(Math.round(oldBattleMapId));
+      }
+      return;
+    }
+
+    this.mapUpdatedAt.set(u.attribute_map_id, now);
     let m = old;
     // sync_type 0 (or first sight) = full replace; sync_type 1 = patch.
     if (!m || u.sync_type !== 1) {

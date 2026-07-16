@@ -15,6 +15,12 @@ import {
   METHOD_WATCH_ATTRIBUTE_MAPS_RESULT,
   type WatchAttributeMapsResult,
 } from '@gsm/protocol';
+import {
+  projectCompactAttributeUpdates,
+  readRbReplayWorldAttributes,
+  type RbReplayCompactUpdate,
+  type RbReplayFrame,
+} from './rbreplay-reader';
 
 export interface TraceFrame {
   result: WatchAttributeMapsResult;
@@ -53,13 +59,18 @@ const TRACE_FRAME_READ_BYTES = 128 * 1024;
 const RB_MAX_FRAME_DELAY_MS = 5000;
 
 // rbrecord/1 frame: [relMs, gtMs|null, updates] where each update is the same
-// compact-delta triple ([mapId, flatAttrPairs, marker(0=keyframe|1=delta)]) that a
-// legacy .trace.json frame is built from — so convertCompact() reads updates directly.
-type CompactUpdate = [number, number[], number];
+// compact-delta triple ([mapId, flatAttrPairs, marker(0=keyframe|1=delta|2=recycle)])
+// that a legacy .trace.json frame is built from. Marker 2 is emitted only by the
+// native world decoder; historical rbrecord files remain unchanged.
+type CompactUpdate = RbReplayCompactUpdate;
 type RbFrame = [number, number | null, CompactUpdate[]];
 
 function isRbrecordPath(tracePath: string): boolean {
   return tracePath.endsWith('.rbrecord.json.gz');
+}
+
+function isRbreplayPath(tracePath: string): boolean {
+  return tracePath.endsWith('.rbreplay');
 }
 
 // Single-entry memo so the back-to-back inspect()+constructor parse of the same file
@@ -121,6 +132,18 @@ function readRbrecord(tracePath: string): RbrecordFile {
 
 export function readTraceInfo(tracePath: string): TraceFileInfo {
   if (isRbrecordPath(tracePath)) return readRbrecord(tracePath).info;
+  if (isRbreplayPath(tracePath)) {
+    const { info } = readRbReplayWorldAttributes(tracePath, false);
+    return {
+      v: info.version,
+      src: 'rbreplay',
+      fmt: 'compact-delta',
+      mapId: info.mapId,
+      frameCount: info.frameCount,
+      durMs: info.durMs,
+      gtMs: info.gtMs,
+    };
+  }
   return readTraceHeader(tracePath).info;
 }
 
@@ -145,6 +168,7 @@ export class TraceReplayer {
   // pause() so idle replays keep the legacy streaming design's zero-resident-frames
   // discipline even with many matches registered at once.
   private readonly isRb: boolean;
+  private readonly isUnifiedReplay: boolean;
   private rbFrames: RbFrame[] | null = null;
 
   constructor(private readonly opts: ReplayerOptions) {
@@ -152,9 +176,10 @@ export class TraceReplayer {
     this.speed = opts.speed ?? 1;
     this.loop = opts.loop ?? false;
     this.isRb = isRbrecordPath(opts.tracePath);
-    if (this.isRb) {
+    this.isUnifiedReplay = isRbreplayPath(opts.tracePath);
+    if (this.isRb || this.isUnifiedReplay) {
       // Parse once for the header (frames are dropped here and reloaded on demand).
-      this.info = readRbrecord(opts.tracePath).info;
+      this.info = readTraceInfo(opts.tracePath);
       this.framesOffset = 0;
     } else {
       const header = readTraceHeader(opts.tracePath);
@@ -211,9 +236,11 @@ export class TraceReplayer {
 
   private resume() {
     if (!this.alive || this.clients.size === 0 || this.timer) return;
-    if (this.isRb) {
+    if (this.isRb || this.isUnifiedReplay) {
       if (!this.rbFrames) {
-        this.rbFrames = readRbrecord(this.opts.tracePath).frames;
+        this.rbFrames = this.isUnifiedReplay
+          ? (readRbReplayWorldAttributes(this.opts.tracePath, true).frames as RbReplayFrame[])
+          : readRbrecord(this.opts.tracePath).frames;
         this.idx = 0;
         this.pmap.clear();
         this.loggedFirstFrame = false;
@@ -249,7 +276,7 @@ export class TraceReplayer {
     let params: WatchAttributeMapsResult;
     let delay: number;
 
-    if (this.isRb) {
+    if (this.isRb || this.isUnifiedReplay) {
       if (!this.rbFrames) return;
       if (this.idx >= this.rbFrames.length) {
         if (this.loop) {
@@ -286,7 +313,7 @@ export class TraceReplayer {
       }
       params =
         this.info.fmt === 'compact-delta'
-          ? this.convertCompact(raw as Array<[number, number[], number]>)
+          ? this.convertCompact(raw as RbReplayCompactUpdate[])
           : (raw as TraceFrame).result;
       const frameCount = Math.max(1, this.info.frameCount);
       const avg = this.info.durMs > 0 ? this.info.durMs / frameCount : 100;
@@ -308,26 +335,8 @@ export class TraceReplayer {
     }, delay);
   }
 
-  private convertCompact(frame: Array<[number, number[], number]>): WatchAttributeMapsResult {
-    const updates: WatchAttributeMapsResult['watch_attribute_maps_results'] = [];
-    for (const [mid, flat, marker] of frame) {
-      const isKeyframe = marker === 0;
-      const prev = isKeyframe ? {} : (this.pmap.get(mid) ?? {});
-      const attrs: Record<string, number> = {};
-      for (let i = 0; i < flat.length; i += 2) {
-        const key = String(flat[i]);
-        const value = flat[i + 1];
-        attrs[key] = value;
-        prev[key] = value;
-      }
-      this.pmap.set(mid, prev);
-      updates.push({
-        sync_type: isKeyframe ? 0 : 1,
-        attribute_map_id: mid,
-        attributes: attrs,
-      });
-    }
-    return { watch_attribute_maps_results: updates };
+  private convertCompact(frame: RbReplayCompactUpdate[]): WatchAttributeMapsResult {
+    return projectCompactAttributeUpdates(frame, this.pmap);
   }
 
   private send(ws: WebSocket, params: WatchAttributeMapsResult) {

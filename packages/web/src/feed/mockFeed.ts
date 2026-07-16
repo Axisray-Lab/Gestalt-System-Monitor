@@ -506,12 +506,12 @@ function replayFrame(replayT: number): WatchAttributeMapsResult {
         } as Record<string, number>,
       },
       ...ROBOTS.map((r) => ({
-        sync_type: 0,
+        sync_type: 0 as const,
         attribute_map_id: r.mapId,
         attributes: robotAttributes(r, replayT),
       })),
       ...STRUCTURES.map((s) => ({
-        sync_type: 0,
+        sync_type: 0 as const,
         attribute_map_id: s.mapId,
         attributes: structureAttributes(s, replayT),
       })),
@@ -557,7 +557,7 @@ function recordedDartOverlay(
     cycle_event_type: 0,
     watch_attribute_maps_results: [
       ...targets.bases.map((id, i) => ({
-        sync_type: 1,
+        sync_type: 1 as const,
         attribute_map_id: id,
         attributes: {
           [AttrId.TM_BaseDamageCount]:
@@ -566,7 +566,7 @@ function recordedDartOverlay(
         } as Record<string, number>,
       })),
       ...targets.robots.map((id) => ({
-        sync_type: 1,
+        sync_type: 1 as const,
         attribute_map_id: id,
         attributes: {
           [AttrId.Blocked]: active && id === robotTarget ? 1 : 0,

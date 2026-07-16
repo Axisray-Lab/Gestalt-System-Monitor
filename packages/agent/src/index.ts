@@ -109,6 +109,7 @@ function buildHeadlessLaunchConfig(context: HeadlessLaunchContext = {}): Headles
         stringFlag('--uproject', process.env.GSM_UPROJECT),
       mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 4))),
       render: renderFlag(),
+      unifiedReplay: context.autoSave === true,
       attrRecord: boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
       attrHz: numFlag('--attr-hz', numEnv('GSM_HEADLESS_ATTR_HZ', 10)),
       logPath: context.autoSave ? context.logPath : undefined,
@@ -133,6 +134,7 @@ function buildHeadlessLaunchConfig(context: HeadlessLaunchContext = {}): Headles
       cwd: launchSourceOverride?.cwd ?? optionalStringFlag('--standalone-cwd', process.env.GSM_STANDALONE_CWD),
       mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 4))),
       render: renderFlag(),
+      unifiedReplay: context.autoSave === true,
       attrRecord: boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
       attrHz: numFlag('--attr-hz', numEnv('GSM_HEADLESS_ATTR_HZ', 10)),
       logPath: context.autoSave ? context.logPath : undefined,
@@ -932,7 +934,7 @@ function loadTraceDir(dirPath: string, packetLabel: string, portBase: number) {
     .filter(isReplayTraceFile)
     .sort();
   if (files.length === 0) {
-    log(`--trace-dir: no iter-*.trace.json / *.rbrecord.json.gz files found in ${dirPath}`);
+    log(`--trace-dir: no iter-*.trace.json / *.rbrecord.json.gz / *.rbreplay files found in ${dirPath}`);
     return { replayers: [] as TraceReplayer[], procs: [] as DiscoveredProcess[] };
   }
   log(`--trace-dir: loading ${files.length} iterations from ${dirPath} (packet=${packetLabel})`);
@@ -1046,11 +1048,12 @@ if (traceLoads.length > 0) {
   });
 }
 
-// A replayable file is either a legacy compact-delta trace (iter-NNN.trace.json) or
-// a unified rbrecord/1 capture (<label>_m<NNN>.rbrecord.json.gz). Both register as
-// synthetic ws://127.0.0.1:<port> replay iterations.
+// A replayable file is a legacy compact trace, historical rbrecord/1 capture, or
+// RBREPLAY whose native world Attribute events project onto the same synthetic WS API.
 function isReplayTraceFile(name: string): boolean {
-  return (name.includes('.iter-') && name.endsWith('.trace.json')) || name.endsWith('.rbrecord.json.gz');
+  return (name.includes('.iter-') && name.endsWith('.trace.json')) ||
+    name.endsWith('.rbrecord.json.gz') ||
+    name.endsWith('.rbreplay');
 }
 
 function traceFileCount(dirPath: string): number {

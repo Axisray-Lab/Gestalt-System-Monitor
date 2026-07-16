@@ -71,16 +71,22 @@ The headless command line is configuration (`--headless-args` /
 `GSM_UE_PROJECT`). Launching stays disabled until such a command is configured;
 the monitor does not encode private game implementation details. Autosave is
 agent-managed only for the `standalone` and `ue` profiles: the agent adds
-`-attrrecord`, assigns per-worker `-abslog` and `-UserDir` paths, counts completed
-matches from `[ATTR-RECORD]` game-time resets, stops the batch at
-`targetMatches`, writes `combined.log`, and starts the local trace analyzer in
-the batch save directory. With raw `GSM_HEADLESS_ARGS`, autosave is reported as
-unavailable because the agent cannot safely assign the log contract.
+`-replaytracks`, assigns per-worker `-abslog` and `-UserDir` paths, and runs the
+WebSocket recorder only for progress/summary/event telemetry. A match counts as
+durable only after that telemetry reports completion and the game has finalized
+and copied the corresponding `.rbreplay` into the worker directory. The batch
+stops at `targetMatches`; the same replay file is then used by game 3D playback,
+Monitor, and offline AI analysis. With raw `GSM_HEADLESS_ARGS`, autosave is
+reported as unavailable because the agent cannot safely assign the recording
+contract.
 
 For custom rosters, the UE and standalone profiles let the request override
-`mapId`, `nettype`, `hudHidden`, `attrrecord`, `attrrecordHz`, and the
-roster payload. Raw `GSM_HEADLESS_ARGS` remains supported; the agent strips the
-same managed flags and appends the custom-match values for the one launched match.
+`mapId`, `nettype`, `hudHidden`, legacy `attrrecord`/`attrrecordHz`, and the
+roster payload. Autosave takes precedence over the legacy sampler and records
+the unified replay from the native world event stream; `attrrecordHz` applies only
+to the explicitly selected legacy sampler. Raw `GSM_HEADLESS_ARGS`
+remains supported; the agent strips the same managed flags and appends the
+custom-match values for the one launched match.
 
 For local standalone development, `GSM_STANDALONE_LOG` can be used as a fallback
 to read the launched process's WebSocket port from the local game log when the
@@ -159,8 +165,8 @@ interface Vec3 { x: number; y: number; z: number; }   // UE cm, Z-up, left-hande
 
 > **Position & heading:** world **position** (`WorldPosX/Y/Z`) and **chassis/turret
 > heading** (`ChassisYaw`/`TurretYaw`/`TurretPitch`) are present in the robot
-> attribute maps — confirmed in recorded `[ATTR-RECORD]` traces (real per-frame UE
-> coordinates), so trace **replay** places and orients robots for real. When these
+> attribute maps — confirmed end-to-end in the native world stream of a current
+> RBREPLAY v4 file, so replay places and orients robots for real. When these
 > attrs are absent (an older build, or a live channel not yet verified to stream
 > them), `VehicleState.pos` falls back to a deterministic placeholder layout so the
 > parse chain and per-unit panels stay testable.
@@ -184,9 +190,8 @@ real matches needs the game side to:
 2. **Expose per-robot state on the `attribute.watchAttributeMaps` channel** — the
    same channel the in-game HUD already streams. Health / max-health / team /
    player-id, **world position** and **chassis + turret heading** are all written
-   into the robot attribute maps (verified in `[ATTR-RECORD]` recordings — the game
-   computes and stores them). The one open item is a live integration pass
-   confirming the live watch streams the position band end-to-end.
+   into the robot attribute maps and verified through the same native event stream
+   used by RBREPLAY and Monitor playback.
 
 Map geometry needs **no** game-side push: the monitor places the arena client-side
 from the beacon's `mapId` plus the static placement config, falling back to a

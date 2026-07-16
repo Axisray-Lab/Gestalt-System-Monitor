@@ -17,6 +17,7 @@ export interface UeHeadlessLaunchOptions {
   projectPath?: string;
   mapId: number;
   render: 'nullrhi' | 'offscreen' | 'windowed';
+  unifiedReplay: boolean;
   attrRecord: boolean;
   attrHz: number;
   logPath?: string;
@@ -37,6 +38,7 @@ export interface StandaloneHeadlessLaunchOptions {
   cwd?: string;
   mapId: number;
   render: 'nullrhi' | 'offscreen' | 'windowed';
+  unifiedReplay: boolean;
   attrRecord: boolean;
   attrHz: number;
   logPath?: string;
@@ -84,7 +86,11 @@ export function buildUeHeadlessLaunch(options: UeHeadlessLaunchOptions): Headles
     `-hudhidden=${match.hudHidden}`,
     ...(match.exec ? [`-exec=${q(match.exec)}`] : []),
     ...(options.execCmds ? [`-ExecCmds=${q(options.execCmds)}`] : []),
-    ...(match.attrRecord ? ['-attrrecord', `-attrrecordhz=${match.attrHz}`] : []),
+    ...(match.unifiedReplay
+      ? ['-replaytracks']
+      : match.attrRecord
+        ? ['-attrrecord', `-attrrecordhz=${match.attrHz}`]
+        : []),
     ...headlessMatchArgs(options.match),
     ...(options.matchIntervalSec > 0 ? [`-matchinterval=${options.matchIntervalSec}`] : []),
   ];
@@ -121,7 +127,11 @@ export function buildStandaloneHeadlessLaunch(options: StandaloneHeadlessLaunchO
     `-hudhidden=${match.hudHidden}`,
     ...(match.exec ? [`-exec=${q(match.exec)}`] : []),
     ...(options.execCmds ? [`-ExecCmds=${q(options.execCmds)}`] : []),
-    ...(match.attrRecord ? ['-attrrecord', `-attrrecordhz=${match.attrHz}`] : []),
+    ...(match.unifiedReplay
+      ? ['-replaytracks']
+      : match.attrRecord
+        ? ['-attrrecord', `-attrrecordhz=${match.attrHz}`]
+        : []),
     ...headlessMatchArgs(options.match),
     ...(options.matchIntervalSec > 0 ? [`-matchinterval=${options.matchIntervalSec}`] : []),
   ];
@@ -202,14 +212,23 @@ function headlessMatchArgs(match: HeadlessMatchConfig | undefined): string[] {
 function matchLaunchValues(
   options: Pick<
     UeHeadlessLaunchOptions,
-    'mapId' | 'netType' | 'hudHidden' | 'attrRecord' | 'attrHz' | 'exec' | 'match'
+    'mapId' | 'netType' | 'hudHidden' | 'unifiedReplay' | 'attrRecord' | 'attrHz' | 'exec' | 'match'
   >,
-): { mapId: number; netType: number; hudHidden: number; attrRecord: boolean; attrHz: number; exec?: string } {
+): {
+  mapId: number;
+  netType: number;
+  hudHidden: number;
+  unifiedReplay: boolean;
+  attrRecord: boolean;
+  attrHz: number;
+  exec?: string;
+} {
   const match = options.match;
   return {
     mapId: match?.mapId ?? options.mapId,
     netType: match?.nettype ?? options.netType,
     hudHidden: match?.hudHidden == null ? options.hudHidden : match.hudHidden ? 1 : 0,
+    unifiedReplay: options.unifiedReplay,
     attrRecord: options.attrRecord,
     attrHz: options.attrHz,
     exec: options.exec ?? (match ? 'SetMatchStatus 1' : undefined),
@@ -218,7 +237,7 @@ function matchLaunchValues(
 
 function isMatchManagedArg(arg: string): boolean {
   const lower = arg.toLowerCase();
-  if (lower === '-autostart' || lower === '-attrrecord') return true;
+  if (lower === '-autostart' || lower === '-attrrecord' || lower === '-replaytracks') return true;
   return [
     '-mapid=',
     '-map-id=',
