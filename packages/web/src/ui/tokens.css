@@ -1,0 +1,53 @@
+:root {
+  --gsm-font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --gsm-font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --gsm-fs-tiny: 8px;
+  --gsm-fs-caption: 9px;
+  --gsm-fs-meta: 10px;
+  --gsm-fs-body: 11px;
+  --gsm-fs-label: 12px;
+  --gsm-fs-title: 13px;
+  --gsm-fs-metric: 16px;
+  --gsm-lh-tight: 1.1;
+  --gsm-lh-ui: 1.2;
+  --gsm-lh-body: 1.35;
+
+  --gsm-space-1: 4px;
+  --gsm-space-2: 6px;
+  --gsm-space-3: 8px;
+  --gsm-space-4: 10px;
+  --gsm-space-5: 12px;
+
+  --gsm-radius-xs: 4px;
+  --gsm-radius-sm: 5px;
+  --gsm-radius-md: 6px;
+  --gsm-radius-lg: 8px;
+
+  --gsm-control-xs: 24px;
+  --gsm-control-sm: 28px;
+  --gsm-control-md: 32px;
+  --gsm-row-sm: 40px;
+  --gsm-row-md: 48px;
+  --gsm-row-lg: 58px;
+
+  --gsm-panel-left: 356px;
+  --gsm-panel-right: 256px;
+  --gsm-rail-width: 58px;
+  --gsm-overlay-gap: 9px;
+  --gsm-overlay-file: 284px;
+  --gsm-overlay-match: 620px;
+  --gsm-overlay-slot: 360px;
+  --gsm-overlay-detail: 292px;
+
+  --gsm-z-panel: 5;
+  --gsm-z-overlay: 9;
+  --gsm-z-overlay-raised: 10;
+
+  --gsm-border-panel: rgba(36, 50, 64, 0.76);
+  --gsm-border-strong: rgba(54, 77, 98, 0.8);
+  --gsm-surface-glass: rgba(13, 19, 26, 0.985);
+  --gsm-surface-subtle: rgba(8, 13, 18, 0.52);
+  --gsm-surface-control: rgba(20, 29, 38, 0.76);
+  --gsm-shadow-overlay: 12px 0 28px rgba(0, 0, 0, 0.3);
+}

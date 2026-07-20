@@ -47,12 +47,20 @@ export function createWsFeed(url: string, mapId?: string | number): FeedSource {
   let watched = new Set<number>();
   let active = true;
   let lastProjectAt = 0;
+  let receivedStream = false;
+  let streamWaitTimer: number | null = null;
   const store = new AttributeStore();
   let mapCb: ((m: MapWireframe) => void) | null = null;
   let snapCb: ((s: WorldSnapshot) => void) | null = null;
   let statusCb: ((s: FeedStatus) => void) | null = null;
 
   const setStatus = (s: FeedStatus) => statusCb?.(s);
+
+  function clearStreamWaitTimer(): void {
+    if (streamWaitTimer == null) return;
+    window.clearTimeout(streamWaitTimer);
+    streamWaitTimer = null;
+  }
 
   function watch(ids: Iterable<number>): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -73,9 +81,10 @@ export function createWsFeed(url: string, mapId?: string | number): FeedSource {
 
   function connect() {
     setStatus('connecting');
+    receivedStream = false;
+    clearStreamWaitTimer();
     ws = new WebSocket(url);
     ws.onopen = () => {
-      setStatus('open');
       watched = new Set<number>();
       // Subscribe to attribute-map streaming.
       watch(DEFAULT_WATCH_MAP_IDS);
@@ -93,11 +102,23 @@ export function createWsFeed(url: string, mapId?: string | number): FeedSource {
           },
         });
       }
+      streamWaitTimer = window.setTimeout(() => {
+        if (!receivedStream) setStatus('idle');
+        streamWaitTimer = null;
+      }, 6000);
     };
-    ws.onerror = () => setStatus('error');
+    ws.onerror = () => {
+      clearStreamWaitTimer();
+      setStatus('error');
+    };
     ws.onclose = () => {
-      setStatus('closed');
-      if (!closedByUser) setTimeout(connect, 1500);
+      clearStreamWaitTimer();
+      if (closedByUser) {
+        setStatus('idle');
+      } else {
+        setStatus('closed');
+        setTimeout(connect, 1500);
+      }
     };
     ws.onmessage = (ev) => {
       let msg: JSONRPCMessage;
@@ -111,6 +132,11 @@ export function createWsFeed(url: string, mapId?: string | number): FeedSource {
       feedPerf.messages += 1;
       if (!isNotification(msg)) return;
       if (msg.method === METHOD_WATCH_ATTRIBUTE_MAPS_RESULT) {
+        if (!receivedStream) {
+          receivedStream = true;
+          clearStreamWaitTimer();
+          setStatus('open');
+        }
         // Always fold the update in (cheap) so the store stays warm; only do the
         // expensive id-scan + snapshot projection when this board actually renders.
         const tApply = performance.now();
@@ -142,6 +168,7 @@ export function createWsFeed(url: string, mapId?: string | number): FeedSource {
     },
     close: () => {
       closedByUser = true;
+      clearStreamWaitTimer();
       ws?.close();
       ws = null;
     },

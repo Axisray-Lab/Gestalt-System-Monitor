@@ -171,7 +171,7 @@ export function startScenarioMock(): void {
     return { sim, wss, port, beaconPayload: {
       matchId: sim.matchId,
       name: `Map9 AI ${i + 1}`,
-      mapId: 'RMUC2026_Map9',
+      mapId: 'RMUC2026_Map4',
       wsPort: port,
       playerCount: 22,
       maxPlayers: 22,

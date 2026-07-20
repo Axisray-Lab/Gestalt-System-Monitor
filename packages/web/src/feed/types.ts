@@ -14,6 +14,10 @@ export interface FeedSource {
   onStatus(cb: (s: FeedStatus) => void): void;
   start(): void;
   close(): void;
+  /** Renderer-driven gate: when inactive, the feed stays connected and keeps its
+   *  store warm (applyResult) but skips the expensive id-scan + snapshot projection,
+   *  so hidden boards don't burn the main thread (the dominant cost at many matches). */
+  setActive(active: boolean): void;
 }
 
 /**
@@ -27,4 +31,7 @@ export interface MatchView {
   label: string;
   status: FeedStatus;
   playerCount?: number;
+  /** Present when the local service started this live process. */
+  localLaunchId?: string;
+  localLaunchPid?: number;
 }

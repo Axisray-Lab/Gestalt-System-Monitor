@@ -1,5 +1,10 @@
 # Dashboard Plan — v0.3 Spectator Polish
 
+> Status: **PLAN** — the panels below are a design target for ROADMAP v0.3 and are
+> not all implemented in `packages/web` yet. Commands like `agent:scenario` /
+> `agent:replay` and any "deck" panel referenced here are aspirational unless the
+> code says otherwise.
+
 基于 2026-06-17 无头对局数据的分析需求，扩展 Gestalt-System-Monitor 为可用的 AI 对战监控面板。
 
 ## 目标

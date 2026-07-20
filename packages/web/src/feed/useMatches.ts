@@ -25,6 +25,7 @@ export interface MatchHooks {
 interface Entry {
   feed: FeedSource;
   view: MatchView;
+  started: boolean;
 }
 
 /**
@@ -44,20 +45,29 @@ export function useMatches(
   const mockKeys = Array.from({ length: opts.mockCount ?? 1 }, (_, i) => `mock-${i}`);
   const entries = new Map<string, Entry>();
   const matches = ref<MatchView[]>([]);
+  let activeKeys = new Set<string>();
   let started = false;
 
   function project(): void {
     matches.value = [...entries.values()].map((e) => e.view);
   }
 
-  function add(key: string, label: string, feed: FeedSource, playerCount?: number): void {
-    const view = reactive<MatchView>({ key, label, status: 'idle', playerCount });
-    hooks.onAdd(key, label); // unit exists before any telemetry arrives
+  function add(key: string, label: string, feed: FeedSource, process?: DiscoveredProcess): void {
+    const view = reactive<MatchView>({
+      key,
+      label,
+      status: 'idle',
+      playerCount: process?.playerCount,
+      localLaunchId: process?.localLaunchId,
+      localLaunchPid: process?.localLaunchPid,
+    });
     feed.onStatus((s) => (view.status = s));
     feed.onMap((m) => hooks.onMap(key, m));
     feed.onSnapshot((s) => hooks.onSnapshot(key, s));
-    feed.start();
-    entries.set(key, { feed, view });
+    const entry: Entry = { feed, view, started: false };
+    entries.set(key, entry);
+    hooks.onAdd(key, label); // unit exists before any telemetry arrives
+    if (activeKeys.has(key)) startFeed(entry);
   }
 
   function remove(key: string): void {
@@ -66,6 +76,13 @@ export function useMatches(
     e.feed.close(); // stop telemetry first
     hooks.onRemove(key); // then drop the unit
     entries.delete(key);
+  }
+
+  function startFeed(entry: Entry): void {
+    if (entry.started) return;
+    entry.started = true;
+    entry.feed.start();
+    entry.feed.setActive(true);
   }
 
   function reconcile(procs: DiscoveredProcess[]): void {
@@ -80,11 +97,13 @@ export function useMatches(
           // Same match, fresh beacon: update metadata in place, keep the live feed.
           existing.view.label = p.name ?? p.matchId;
           existing.view.playerCount = p.playerCount;
+          existing.view.localLaunchId = p.localLaunchId;
+          existing.view.localLaunchPid = p.localLaunchPid;
         }
         continue;
       }
       if (mockKeys.includes(key)) add(key, `RMUC2026AI #${mockKeys.indexOf(key) + 1}`, createMockFeed());
-      else if (p) add(key, p.name ?? p.matchId, createWsFeed(p.wsUrl, p.mapId), p.playerCount);
+      else if (p) add(key, p.name ?? p.matchId, createWsFeed(p.wsUrl, p.mapId), p);
     }
     for (const key of [...entries.keys()]) {
       if (!desired.has(key)) remove(key);
@@ -104,10 +123,27 @@ export function useMatches(
     reconcile(processes.value);
   }
 
+  /** Gate each feed by whether its board currently renders (driven by the scene's
+   *  stack-visibility). Hidden boards fully disconnect; the agent-side replay is
+   *  lazy too, so large libraries stay as catalog entries until viewed. */
+  function setActiveKeys(active: Set<string>): void {
+    activeKeys = new Set(active);
+    for (const [key, entry] of entries) {
+      if (activeKeys.has(key)) {
+        startFeed(entry);
+        continue;
+      }
+      if (!entry.started) continue;
+      entry.feed.close();
+      entry.started = false;
+      entry.view.status = 'idle';
+    }
+  }
+
   onUnmounted(() => {
     for (const e of entries.values()) e.feed.close();
     entries.clear();
   });
 
-  return { matches, start };
+  return { matches, start, setActiveKeys };
 }

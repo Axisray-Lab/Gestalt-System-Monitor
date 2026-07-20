@@ -33,8 +33,12 @@ export interface DiscoveredProcess extends BeaconPayload {
   sourceIp: string;
   /** epoch ms of the most recent beacon. */
   lastSeen: number;
-  /** Convenience: ws://<sourceIp>:<wsPort> the browser connects to directly. */
+  /** Browser connection URL. Local beacons use loopback so loopback-only game sockets remain reachable. */
   wsUrl: string;
+  /** Local launcher id when this process was started by the desktop monitor. */
+  localLaunchId?: string;
+  /** Local OS process id when this process was started by the desktop monitor. */
+  localLaunchPid?: number;
 }
 
 /** Message the agent pushes to the browser over its own WS channel. */

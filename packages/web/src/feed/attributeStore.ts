@@ -11,8 +11,9 @@ import {
  * Per-attribute-map store + projection into the renderer's `WorldSnapshot`.
  *
  * Mirrors the public `watchAttributeMaps.result` handling: plain JSON, with full
- * (`sync_type 0`) vs incremental (`sync_type 1`) updates. Each "vehicle" is one
- * attribute map that carries a `PlayerID`/`Health`.
+ * (`sync_type 0`), incremental (`sync_type 1`), and replay-native recycle
+ * (`sync_type 2`) updates. Each "vehicle" is one attribute map that carries a
+ * `PlayerID`/`Health`.
  *
  * If world position + heading are absent, units are laid out in a deterministic
  * placeholder grid so the parse chain + per-unit panels remain testable.
@@ -42,6 +43,7 @@ const ROBOT_CLASSES = new Set<number>([
   CLASS_ID.Infantry,
   CLASS_ID.Sentry,
   CLASS_ID.Aerial,
+  CLASS_ID.Dart,
 ]);
 
 const CAREER_NAME: Record<number, string> = {
@@ -83,6 +85,16 @@ const RMUC2026_FALLBACK_YAW: Record<'red' | 'blue', Record<'base' | 'outpost', n
   blue: { base: -90, outpost: 90 },
 };
 
+const RMUC2026_DART_STATION_POS: Record<'red' | 'blue', Vec3> = {
+  red: { x: 330, y: -1290, z: 2 },
+  blue: { x: -320, y: 1370, z: 2 },
+};
+
+const RMUC2026_DART_STATION_YAW: Record<'red' | 'blue', number> = {
+  red: 90,
+  blue: -90,
+};
+
 const RUNE_FALLBACK_POS: Vec3 = { x: 0, y: 0, z: 90 };
 
 /**
@@ -108,7 +120,7 @@ const BUFF_DEFS: { key: string; id: AttrId; on: (v: number) => boolean }[] = [
   { key: 'cool', id: AttrId.FortressCoolingValue, on: (v) => v > 0 },
   { key: 'cool', id: AttrId.TerrainCrossingColdMultiplierThou, on: (v) => v > 0 },
   { key: 'weak', id: AttrId.Weakened, on: (v) => v === 1 }, // 虚弱
-  { key: 'blind', id: AttrId.DartInterferenceEffectTrigger, on: (v) => v > 0 }, // 致盲
+  { key: 'blind', id: AttrId.Blocked, on: (v) => v === 1 }, // 致盲/受阻
   // 易伤 — DamageMultiplierThou is a DEBUFF (damage TAKEN multiplier), not a gain;
   // fires independently of AttackMultiplierThou on Hero/Infantry/Sentry.
   { key: 'vuln', id: AttrId.DamageMultiplierThou, on: (v) => v > 0 },
@@ -137,9 +149,21 @@ export class AttributeStore {
   }
 
   private applyUpdate(u: AttributeMapUpdate, now: number): void {
-    this.mapUpdatedAt.set(u.attribute_map_id, now);
     const old = this.maps.get(u.attribute_map_id);
     const oldBattleMapId = old ? this.num(old, AttrId.PlayerBattleAttributeMapID) : undefined;
+    // Native replay carries RecycleAttributeMapEvent explicitly as sync_type 2.
+    // Remove the map and all derived visibility/reference state atomically.
+    if (u.sync_type === 2) {
+      this.maps.delete(u.attribute_map_id);
+      this.mapUpdatedAt.delete(u.attribute_map_id);
+      this.ownHiddenMapIds.delete(u.attribute_map_id);
+      if (oldBattleMapId != null && oldBattleMapId > 0) {
+        this.linkedHiddenMapIds.delete(Math.round(oldBattleMapId));
+      }
+      return;
+    }
+
+    this.mapUpdatedAt.set(u.attribute_map_id, now);
     let m = old;
     // sync_type 0 (or first sight) = full replace; sync_type 1 = patch.
     if (!m || u.sync_type !== 1) {
@@ -322,6 +346,12 @@ export class AttributeStore {
     }
 
     if (ids.robots.size > 0) {
+      // Dart maps are public low-id class maps (often PlayerID=-1) and may not be
+      // referenced through PlayerBattleAttributeMapID, but their ammo drives dart
+      // launch visuals.
+      if (classId === CLASS_ID.Dart) {
+        return this.hasRenderableRobotTeam(m) && this.isFreshRobotMap(mapId, now) ? 'robot' : null;
+      }
       if (!ids.robots.has(mapId)) return null;
       if (!this.isFreshRobotMap(mapId, now)) return null;
       if (classId != null && !ROBOT_CLASSES.has(classId)) return null;
@@ -335,15 +365,17 @@ export class AttributeStore {
     return this.hasRobotIdentity(m) && this.isFreshRobotMap(mapId, now) ? 'robot' : null;
   }
 
-  private fallbackPos(kind: UnitKind, teamId: number | undefined): Vec3 | null {
+  private fallbackPos(kind: UnitKind, teamId: number | undefined, classId?: number): Vec3 | null {
     if (kind === 'rune') return RUNE_FALLBACK_POS;
     const side = teamId === 0 ? 'red' : teamId === 1 ? 'blue' : null;
+    if (side && classId === CLASS_ID.Dart) return RMUC2026_DART_STATION_POS[side];
     if (!side || (kind !== 'base' && kind !== 'outpost')) return null;
     return RMUC2026_FALLBACK_POS[side][kind];
   }
 
-  private fallbackYaw(kind: UnitKind, teamId: number | undefined): number | undefined {
+  private fallbackYaw(kind: UnitKind, teamId: number | undefined, classId?: number): number | undefined {
     const side = teamId === 0 ? 'red' : teamId === 1 ? 'blue' : null;
+    if (side && classId === CLASS_ID.Dart) return RMUC2026_DART_STATION_YAW[side];
     if (!side || (kind !== 'base' && kind !== 'outpost')) return undefined;
     return RMUC2026_FALLBACK_YAW[side][kind];
   }
@@ -352,14 +384,17 @@ export class AttributeStore {
     m: Record<string, number>,
     kind: UnitKind,
     teamId: number | undefined,
+    classId: number | undefined,
     i: number,
     n: number
   ): Vec3 {
+    const fallback = this.fallbackPos(kind, teamId, classId);
+    if (classId === CLASS_ID.Dart && fallback) return fallback;
     const px = this.num(m, AttrId.WorldPosX);
     const py = this.num(m, AttrId.WorldPosY);
     const pz = this.num(m, AttrId.WorldPosZ);
     if (px != null && py != null) return { x: px, y: py, z: pz ?? 60 };
-    return this.fallbackPos(kind, teamId) ?? this.layoutPos(i, n);
+    return fallback ?? this.layoutPos(i, n);
   }
 
   private displayName(kind: UnitKind, id: number, classId?: number): string {
@@ -449,10 +484,17 @@ export class AttributeStore {
       // Ammo = launch allowance (17mm + 42mm). Bases show team coins instead.
       const a17 = this.num(m, AttrId.Ammo17mmCount);
       const a42 = this.num(m, AttrId.Ammo42mmCount);
+      const dartAmmo = this.num(m, AttrId.RealDartAmmoCount) ?? this.num(m, AttrId.AmmoDartCount);
+      const engineerCarriedCores =
+        classId === CLASS_ID.Engineer ? this.num(m, AttrId.EngineerCarriedTechCoreCount) : undefined;
+      const engineerTeamEnergyCores =
+        classId === CLASS_ID.Engineer ? this.num(m, AttrId.EngineerTeamEnergyUnitStock) : undefined;
       const coins = this.num(m, AttrId.TM_Coins);
       const ammo =
         kind === 'base' && coins != null
           ? coins
+          : classId === CLASS_ID.Dart && dartAmmo != null
+            ? dartAmmo
           : a17 != null || a42 != null
             ? (a17 ?? 0) + (a42 ?? 0)
             : undefined;
@@ -494,8 +536,8 @@ export class AttributeStore {
         }
       }
 
-      const pos = this.resolvePos(m, kind, teamId, i, n);
-      const yaw = this.num(m, AttrId.ChassisYaw) ?? this.fallbackYaw(kind, teamId);
+      const pos = this.resolvePos(m, kind, teamId, classId, i, n);
+      const yaw = this.num(m, AttrId.ChassisYaw) ?? this.fallbackYaw(kind, teamId, classId);
       const turretYaw = this.num(m, AttrId.TurretYaw);
       const turretPitch = this.num(m, AttrId.TurretPitch);
       const deploymentMode =
@@ -535,6 +577,13 @@ export class AttributeStore {
         ammo,
         ammo17: a17,
         ammo42: a42,
+        dartAmmo,
+        engineerCarriedCores:
+          engineerCarriedCores != null ? Math.max(0, Math.round(engineerCarriedCores)) : undefined,
+        engineerTeamEnergyCores:
+          engineerTeamEnergyCores != null ? Math.max(0, Math.round(engineerTeamEnergyCores)) : undefined,
+        dartHitCount:
+          kind === 'base' ? this.num(m, AttrId.TM_BaseDamageCount) : undefined,
         firingLocked,
         heat,
         score: this.num(m, AttrId.DamageAppliedTotal) ?? 0,

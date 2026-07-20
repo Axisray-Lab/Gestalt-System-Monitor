@@ -8,10 +8,13 @@
     "start": "tsx src/index.ts",
     "mock": "tsx src/index.ts --mock",
     "scenario": "tsx src/index.ts --scenario",
+    "replay": "tsx src/index.ts --trace",
+    "test": "node --test src/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@gsm/protocol": "*",
+    "flatbuffers": "^25.9.23",
     "ws": "^8.18.0"
   },
   "devDependencies": {

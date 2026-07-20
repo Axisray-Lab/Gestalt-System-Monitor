@@ -11,34 +11,69 @@
  */
 import dgram from 'node:dgram';
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
+import { networkInterfaces } from 'node:os';
+import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   DISCOVERY_PORT,
   DISCOVERY_MAGIC,
   ROOM_EXPIRY_MS,
+  BROADCAST_INTERVAL_MS,
   AGENT_BROWSER_PORT,
   type BeaconPayload,
   type DiscoveredProcess,
   type AgentProcessListMessage,
   type AgentLauncherStatusMessage,
+  type HeadlessLaunch,
   type LaunchHeadlessRequest,
+  type StopHeadlessRequest,
+  type LauncherAutoSaveStatus,
 } from '@gsm/protocol';
-import { LaunchManager } from './launcher';
+import { LaunchManager, type HeadlessLaunchContext } from './launcher';
+import {
+  applyHeadlessMatchArgs,
+  buildStandaloneHeadlessLaunch,
+  buildUeHeadlessLaunch,
+  splitArgs,
+  type HeadlessLaunchConfig,
+} from './headless-launch';
 import { startMock } from './mock';
 import { startScenarioMock } from './mock';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { TraceReplayer } from './trace-replayer';
 
 const argv = process.argv.slice(2);
+const workspaceRoot = findWorkspaceRoot();
+loadLocalEnv(workspaceRoot);
+
+// Dev launch-source override (local standalone vs Steam), set live via
+// `POST /launch/source` by the desktop dock's "启动源" toggle. buildHeadlessLaunchConfig
+// consults it BEFORE the env fallback, so flipping the source takes effect on the
+// NEXT launch with no agent respawn (no orphaned games, no aborted batch). Only the
+// 'standalone' profile honours it — both sources reuse the standalone arg builder and
+// differ solely in exe/cwd, so the launch stays "ready" either way.
+let launchSourceOverride: { source: string; executablePath?: string; cwd?: string } | undefined;
+
 const MOCK = argv.includes('--mock');
 const MOCK_SCENARIO = argv.includes('--scenario');
 const browserPort = numFlag('--port', AGENT_BROWSER_PORT);
+const ownerToken = process.env.GSM_OWNER_TOKEN?.trim();
+const headlessLaunch = buildHeadlessLaunchConfig();
+const defaultSaveDir = path.resolve(
+  workspaceRoot,
+  stringFlag('--autosave-dir', process.env.GSM_AUTOSAVE_DIR ?? 'traces/autosave') ?? 'traces/autosave',
+);
 const launcher = new LaunchManager(
   {
     gameName: stringFlag('--game-name', process.env.GSM_GAME_NAME ?? 'Gestalt System') ?? 'Gestalt System',
     steamAppId: stringFlag('--steam-app-id', process.env.GSM_STEAM_APP_ID),
     manualInstallDir: stringFlag('--game-dir', process.env.GSM_GAME_DIR),
-    executablePath: stringFlag('--game-exe', process.env.GSM_GAME_EXE),
+    executablePath: stringFlag('--game-exe', process.env.GSM_GAME_EXE ?? headlessLaunch.executablePath),
     executableName: stringFlag('--game-exe-name', process.env.GSM_GAME_EXE_NAME),
-    headlessArgs: splitArgs(stringFlag('--headless-args', process.env.GSM_HEADLESS_ARGS ?? '--headless')),
+    createLaunchConfig: buildHeadlessLaunchConfig,
+    autoSave: autoSaveStatus(headlessLaunch, defaultSaveDir),
+    defaultSaveDir,
     resourceBudget: {
       perMatchMemoryBytes:
         numFlag('--match-memory-mb', numEnv('GSM_HEADLESS_MEMORY_MB', 2048)) * 1024 * 1024,
@@ -49,6 +84,144 @@ const launcher = new LaunchManager(
   },
   () => broadcastLauncherStatus(),
 );
+
+function buildHeadlessLaunchConfig(context: HeadlessLaunchContext = {}): HeadlessLaunchConfig {
+  const explicitArgs = stringFlag('--headless-args', process.env.GSM_HEADLESS_ARGS);
+  if (explicitArgs?.trim()) {
+    const verbatim = boolFlag('--headless-verbatim', boolEnv('GSM_HEADLESS_VERBATIM', false));
+    return {
+      args: applyHeadlessMatchArgs(splitArgs(explicitArgs, verbatim), context.match, { quoteExec: verbatim }),
+      windowsVerbatimArguments: verbatim,
+      autoSaveAvailable: false,
+      autoSaveEnabled: context.match?.attrrecord ?? explicitArgs.includes('-attrrecord'),
+      autoSaveMode: 'configured-args',
+    };
+  }
+
+  const profile = stringFlag('--headless-profile', process.env.GSM_HEADLESS_PROFILE)
+    ?.trim()
+    .toLowerCase();
+  if (profile === 'ue') {
+    return buildUeHeadlessLaunch({
+      executablePath: stringFlag('--ue-exe', process.env.GSM_UE_EXE ?? process.env.GSM_GAME_EXE),
+      projectPath:
+        stringFlag('--ue-project', process.env.GSM_UE_PROJECT) ??
+        stringFlag('--uproject', process.env.GSM_UPROJECT),
+      mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 4))),
+      render: renderFlag(),
+      unifiedReplay: context.autoSave === true,
+      attrRecord: boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
+      attrHz: numFlag('--attr-hz', numEnv('GSM_HEADLESS_ATTR_HZ', 10)),
+      logPath: context.autoSave ? context.logPath : undefined,
+      userDir: context.autoSave ? context.userDir : undefined,
+      hudHidden: numFlag('--hud-hidden', numEnv('GSM_HEADLESS_HUD_HIDDEN', 0)),
+      netType: numFlag('--net-type', numEnv('GSM_HEADLESS_NET_TYPE', 0)),
+      connMethod: numFlag('--conn-method', numEnv('GSM_HEADLESS_CONN_METHOD', 0)),
+      autostartDelayMs: numFlag('--autostart-delay-ms', numEnv('GSM_HEADLESS_AUTOSTART_DELAY_MS', 3000)),
+      execDelayMs: numFlag('--exec-delay-ms', numEnv('GSM_HEADLESS_EXEC_DELAY_MS', 15000)),
+      exec: optionalStringFlag('--headless-exec', process.env.GSM_HEADLESS_EXEC),
+      execCmds: optionalStringFlag('--headless-exec-cmds', process.env.GSM_HEADLESS_EXEC_CMDS),
+      matchIntervalSec: numFlag('--match-interval', numEnv('GSM_HEADLESS_MATCH_INTERVAL_SEC', 0)),
+      match: context.match,
+    });
+  }
+
+  if (profile === 'standalone') {
+    return buildStandaloneHeadlessLaunch({
+      executablePath:
+        launchSourceOverride?.executablePath ??
+        stringFlag('--standalone-exe', process.env.GSM_STANDALONE_EXE ?? process.env.GSM_GAME_EXE),
+      cwd: launchSourceOverride?.cwd ?? optionalStringFlag('--standalone-cwd', process.env.GSM_STANDALONE_CWD),
+      mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 4))),
+      render: renderFlag(),
+      unifiedReplay: context.autoSave === true,
+      attrRecord: boolFlag('--attrrecord', boolEnv('GSM_HEADLESS_ATTR_RECORD', false)),
+      attrHz: numFlag('--attr-hz', numEnv('GSM_HEADLESS_ATTR_HZ', 10)),
+      logPath: context.autoSave ? context.logPath : undefined,
+      userDir: context.autoSave ? context.userDir : undefined,
+      hudHidden: numFlag('--hud-hidden', numEnv('GSM_HEADLESS_HUD_HIDDEN', 0)),
+      netType: numFlag('--net-type', numEnv('GSM_HEADLESS_NET_TYPE', 0)),
+      connMethod: numFlag('--conn-method', numEnv('GSM_HEADLESS_CONN_METHOD', 0)),
+      autostartDelayMs: numFlag('--autostart-delay-ms', numEnv('GSM_HEADLESS_AUTOSTART_DELAY_MS', 3000)),
+      execDelayMs: numFlag('--exec-delay-ms', numEnv('GSM_HEADLESS_EXEC_DELAY_MS', 15000)),
+      exec: optionalStringFlag('--headless-exec', process.env.GSM_HEADLESS_EXEC),
+      execCmds: optionalStringFlag('--headless-exec-cmds', process.env.GSM_HEADLESS_EXEC_CMDS),
+      matchIntervalSec: numFlag('--match-interval', numEnv('GSM_HEADLESS_MATCH_INTERVAL_SEC', 0)),
+      match: context.match,
+    });
+  }
+
+  if (profile) {
+    return { args: [], error: `Unknown headless launch profile "${profile}".` };
+  }
+
+  return {
+    args: [],
+    error:
+      'Headless auto-battle launch is not configured. Set GSM_HEADLESS_ARGS or GSM_HEADLESS_PROFILE=standalone.',
+  };
+}
+
+function autoSaveStatus(config: HeadlessLaunchConfig, defaultSaveDir: string): LauncherAutoSaveStatus {
+  const available = config.autoSaveAvailable === true;
+  return {
+    available,
+    enabledByDefault: available && config.autoSaveEnabled === true,
+    mode: config.autoSaveMode ?? (available ? 'watch-ws' : 'off'),
+    defaultSaveDir,
+    reason: available
+      ? undefined
+      : config.autoSaveMode === 'configured-args'
+        ? 'Autosave needs the standalone or ue headless profile so the agent can discover each worker WebSocket.'
+        : 'Autosave is unavailable until a headless launch profile is configured.',
+  };
+}
+
+function findWorkspaceRoot(): string {
+  let current = process.cwd();
+  for (let i = 0; i < 6; i += 1) {
+    if (
+      existsSync(path.join(current, 'package.json')) &&
+      existsSync(path.join(current, 'packages'))
+    ) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return process.cwd();
+}
+
+function loadLocalEnv(root: string): void {
+  const candidates = [
+    path.resolve(root, '.env.local'),
+    path.resolve(process.cwd(), '.env.local'),
+  ];
+  for (const envPath of candidates) {
+    if (!existsSync(envPath)) continue;
+    const text = readFileSync(envPath, 'utf8');
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq <= 0) continue;
+      const key = trimmed.slice(0, eq).trim();
+      if (process.env[key] != null) continue;
+      process.env[key] = unquoteEnvValue(trimmed.slice(eq + 1).trim());
+    }
+  }
+}
+
+function unquoteEnvValue(value: string): string {
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
 
 function numFlag(flag: string, def: number): number {
   const raw = stringFlag(flag);
@@ -62,6 +235,25 @@ function numEnv(key: string, def: number): number {
   return Number.isFinite(n) ? n : def;
 }
 
+function boolEnv(key: string, def: boolean): boolean {
+  return parseBool(process.env[key], def);
+}
+
+function boolFlag(flag: string, def: boolean): boolean {
+  const i = argv.indexOf(flag);
+  if (i < 0) return def;
+  const next = argv[i + 1];
+  if (!next || next.startsWith('--')) return true;
+  return parseBool(next, def);
+}
+
+function parseBool(value: string | undefined, def: boolean): boolean {
+  if (value == null || value.trim() === '') return def;
+  if (/^(1|true|yes|on)$/i.test(value)) return true;
+  if (/^(0|false|no|off)$/i.test(value)) return false;
+  return def;
+}
+
 function stringFlag(flag: string, def?: string): string | undefined {
   const prefix = `${flag}=`;
   const inline = argv.find((arg) => arg.startsWith(prefix));
@@ -71,17 +263,33 @@ function stringFlag(flag: string, def?: string): string | undefined {
   return def;
 }
 
-function splitArgs(value: string | undefined): string[] {
-  if (!value?.trim()) return [];
-  const args: string[] = [];
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(value))) args.push(match[1] ?? match[2] ?? match[3]);
-  return args;
+function optionalStringFlag(flag: string, def?: string): string | undefined {
+  const value = stringFlag(flag, def)?.trim();
+  return value ? value : undefined;
+}
+
+function renderFlag(): 'nullrhi' | 'offscreen' | 'windowed' {
+  const value = stringFlag('--headless-render', process.env.GSM_HEADLESS_RENDER ?? 'nullrhi')
+    ?.trim()
+    .toLowerCase();
+  if (value === 'offscreen' || value === 'windowed') return value;
+  return 'nullrhi';
 }
 
 const processes = new Map<string, DiscoveredProcess>();
+const localLaunchProcesses = new Map<
+  string,
+  { launch: HeadlessLaunch; process?: DiscoveredProcess; loggedPending?: boolean }
+>();
 const keyOf = (matchId: string, ip: string) => `${matchId}@${ip}`;
+
+function websocketHostForBeacon(sourceIp: string): string {
+  if (sourceIp === '127.0.0.1') return sourceIp;
+  const isLocal = Object.values(networkInterfaces()).some((addresses) =>
+    addresses?.some((address) => address.family === 'IPv4' && address.address === sourceIp),
+  );
+  return isLocal ? '127.0.0.1' : sourceIp;
+}
 
 // --- UDP beacon listener (mirrors the game's LAN beacon semantics) ------------
 const udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
@@ -97,21 +305,33 @@ udp.on('message', (buf, rinfo) => {
   if (typeof payload?.matchId !== 'string' || typeof payload?.wsPort !== 'number') return;
 
   const ip = rinfo.address;
+  const wsHost = websocketHostForBeacon(ip);
   const k = keyOf(payload.matchId, ip);
-  const isNew = !processes.has(k);
-  processes.set(k, {
+  const previous = processes.get(k);
+  const localLaunch = localLaunchForBeacon(payload);
+  const nextProcess: DiscoveredProcess = {
     ...payload,
     sourceIp: ip,
     lastSeen: Date.now(),
-    wsUrl: `ws://${ip}:${payload.wsPort}`,
-  });
-  if (isNew) {
-    log(`+ ${payload.name ?? payload.matchId}  ws://${ip}:${payload.wsPort}`);
+    wsUrl: `ws://${wsHost}:${payload.wsPort}`,
+    ...(localLaunch
+      ? { localLaunchId: localLaunch.id, localLaunchPid: localLaunch.pid }
+      : {}),
+  };
+  processes.set(k, nextProcess);
+  if (localLaunch) launcher.setLaunchWsUrl(localLaunch.id, nextProcess.wsUrl);
+  if (!previous) {
+    log(`+ ${payload.name ?? payload.matchId}  ${nextProcess.wsUrl}`);
+    broadcastList();
+  } else if (previous.localLaunchId !== nextProcess.localLaunchId || previous.localLaunchPid !== nextProcess.localLaunchPid) {
     broadcastList();
   }
 });
 
-udp.on('error', (err) => console.error('[agent] udp error:', err.message));
+udp.on('error', (err) => {
+  console.error('[agent] udp error:', err.message);
+  if (!shuttingDown) shutdownAgent('UDP server error', 1);
+});
 udp.bind(DISCOVERY_PORT, () => {
   try {
     udp.setBroadcast(true);
@@ -122,10 +342,11 @@ udp.bind(DISCOVERY_PORT, () => {
 });
 
 // --- expiry sweep -------------------------------------------------------------
-setInterval(() => {
+const expirySweepTimer = setInterval(() => {
   const now = Date.now();
   let changed = false;
   for (const [k, p] of processes) {
+    if (isLocalLaunchProcessKey(k)) continue;
     if (now - p.lastSeen > ROOM_EXPIRY_MS) {
       processes.delete(k);
       changed = true;
@@ -134,6 +355,72 @@ setInterval(() => {
   }
   if (changed) broadcastList();
 }, 1000);
+expirySweepTimer.unref?.();
+
+// --- dev launch-source toggle (local standalone vs Steam) ---------------------
+function defaultStandaloneExe(): string | undefined {
+  return stringFlag('--standalone-exe', process.env.GSM_STANDALONE_EXE ?? process.env.GSM_GAME_EXE);
+}
+
+/**
+ * Resolve the REAL Steam-installed executable. `steam.ts` findExecutable checks the
+ * global `GSM_GAME_EXE`/`GSM_STANDALONE_EXE` override first, so a discovered Steam
+ * candidate's executablePath can be "polluted" to point at the local standalone exe.
+ * Only trust the candidate's exe if it actually lives inside the Steam install dir;
+ * otherwise scan that dir for the packaged game exe.
+ */
+function resolveSteamExe(candidate: { executablePath?: string; installDir: string }): {
+  executablePath?: string;
+  cwd?: string;
+} {
+  const installDir = candidate.installDir;
+  const isInside = (p?: string): boolean =>
+    !!p && path.resolve(p).toLowerCase().startsWith(path.resolve(installDir).toLowerCase());
+  if (isInside(candidate.executablePath)) {
+    return { executablePath: candidate.executablePath, cwd: path.dirname(candidate.executablePath!) };
+  }
+  try {
+    const exes = readdirSync(installDir).filter((name) => /\.exe$/i.test(name));
+    const pick =
+      exes.find((name) => /gestalt/i.test(name)) ??
+      exes.find((name) => /robotbridgedemo/i.test(name)) ??
+      exes[0];
+    if (pick) return { executablePath: path.join(installDir, pick), cwd: installDir };
+  } catch {
+    /* fall through to the candidate's own path */
+  }
+  return { executablePath: candidate.executablePath, cwd: candidate.installDir };
+}
+
+function launchSourceState(): { source: string; executablePath?: string } {
+  if (launchSourceOverride) {
+    return { source: launchSourceOverride.source, executablePath: launchSourceOverride.executablePath };
+  }
+  return { source: 'standalone', executablePath: defaultStandaloneExe() };
+}
+
+function applyLaunchSource(source: string): { source: string; executablePath?: string; error?: string } {
+  const normalized = (source ?? '').trim().toLowerCase();
+  if (normalized === '' || normalized === 'standalone' || normalized === 'local') {
+    launchSourceOverride = undefined; // fall back to env/.env.local standalone exe
+    log('launch source -> local standalone');
+    return { source: 'standalone', executablePath: defaultStandaloneExe() };
+  }
+  if (normalized === 'steam') {
+    const steam = launcher.status().candidates.find((candidate) => candidate.source === 'steam');
+    if (!steam) {
+      return { source: 'steam', error: 'No Steam install of the game was discovered.' };
+    }
+    const resolved = resolveSteamExe(steam);
+    if (!resolved.executablePath) {
+      return { source: 'steam', error: 'No launchable Steam executable was found in the install dir.' };
+    }
+    launchSourceOverride = { source: 'steam', executablePath: resolved.executablePath, cwd: resolved.cwd };
+    log(`launch source -> steam (${resolved.executablePath})`);
+    return { source: 'steam', executablePath: resolved.executablePath };
+  }
+  return { source: normalized, error: `Unknown launch source "${source}".` };
+}
 
 // --- browser-facing HTTP + WS -------------------------------------------------
 const server = http.createServer(async (req, res) => {
@@ -143,7 +430,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS');
-  res.setHeader('access-control-allow-headers', 'content-type');
+  res.setHeader('access-control-allow-headers', 'content-type,x-gsm-owner-token');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -152,6 +439,22 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+
+  if (url.pathname === '/shutdown') {
+    if (req.method !== 'POST') {
+      res.setHeader('allow', 'POST');
+      writeJson(res, 405, { ok: false, error: 'method not allowed' });
+      return;
+    }
+    if (!isLoopbackAddress(req.socket.remoteAddress) || !ownerTokenMatches(req.headers['x-gsm-owner-token'])) {
+      writeJson(res, 403, { ok: false, error: 'forbidden' });
+      return;
+    }
+    res.setHeader('connection', 'close');
+    writeJson(res, 202, { ok: true });
+    setImmediate(() => shutdownAgent('owner request', 0));
+    return;
+  }
 
   if (req.method === 'GET' && url.pathname === '/processes') {
     writeJson(res, 200, listMessage());
@@ -167,6 +470,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const request = await readJsonBody<LaunchHeadlessRequest>(req);
       const response = launcher.launch(request);
+      registerLocalLaunches(response.launched);
       writeJson(res, response.ok ? 200 : 409, response);
     } catch (err) {
       writeJson(res, 400, {
@@ -179,11 +483,54 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/launch/stop') {
+    try {
+      const request = await readJsonBody<StopHeadlessRequest>(req);
+      const response = launcher.stop(request);
+      if (response.stopped) removeLocalLaunchProcess(response.stopped);
+      refreshLocalLaunches();
+      writeJson(res, response.ok ? 200 : 404, response);
+    } catch (err) {
+      writeJson(res, 400, {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+        status: launcher.status(),
+      });
+    }
+    return;
+  }
+
+  if (url.pathname === '/launch/source' && (req.method === 'POST' || req.method === 'GET')) {
+    try {
+      let source: string | null | undefined;
+      if (req.method === 'POST') {
+        const body = await readJsonBody<{ source?: string }>(req);
+        source = body.source;
+      } else {
+        source = url.searchParams.get('source');
+      }
+      const result = source ? applyLaunchSource(source) : launchSourceState();
+      if (source) broadcastLauncherStatus();
+      writeJson(res, 'error' in result && result.error ? 409 : 200, { ok: !('error' in result && result.error), ...result });
+    } catch (err) {
+      writeJson(res, 400, { ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+    return;
+  }
+
   res.writeHead(200, { 'content-type': 'text/plain' });
   res.end('gsm-agent ok');
 });
 
 const wss = new WebSocketServer({ server });
+wss.on('error', (err: NodeJS.ErrnoException) => {
+  // The attached HTTP server emits the same listen failure and owns the
+  // EADDRINUSE policy below; handling it twice would upgrade a clean surrender
+  // into exit code 1.
+  if (err.code === 'EADDRINUSE' || shuttingDown) return;
+  console.error('[agent] websocket server error:', err.message);
+  shutdownAgent('WebSocket server error', 1);
+});
 wss.on('connection', (ws, req) => {
   if (!isAllowedOrigin(req.headers.origin)) {
     ws.close();
@@ -192,9 +539,99 @@ wss.on('connection', (ws, req) => {
   sendJson(ws, listMessage());
   sendJson(ws, launcherMessage());
 });
+server.on('error', (err: NodeJS.ErrnoException) => {
+  if (shuttingDown) return;
+  if (err.code === 'EADDRINUSE') {
+    // Another agent already owns the browser port. The desktop supervisor treats a
+    // healthy agent on this port as "current" and keeps using it, so the right move
+    // is to surrender quietly rather than crash with an uncaught exception.
+    log(`browser port ${browserPort} already in use — another agent is running; exiting.`);
+    shutdownAgent('browser port already in use', 0);
+    return;
+  }
+  console.error('[agent] http server error:', err.message);
+  shutdownAgent('HTTP server error', 1);
+});
 server.listen(browserPort, 'localhost', () => log(`serving process list on ws://localhost:${browserPort}`));
 const launcherBroadcastTimer = setInterval(() => broadcastLauncherStatus(), 2000);
 launcherBroadcastTimer.unref?.();
+const localLaunchHeartbeat = setInterval(() => refreshLocalLaunches(), BROADCAST_INTERVAL_MS);
+localLaunchHeartbeat.unref?.();
+
+// Top-level shutdown: every explicit exit and fatal server error converges here so
+// launched games, recorders, sockets, timers, and trace replayers have one owner.
+// The synchronous process-exit fallback covers any dependency that still calls
+// process.exit() directly; normal callers use shutdownAgent so the requested exit
+// code is preserved and the event loop gets a turn to flush an HTTP response.
+const shutdownHooks = new Set<() => void>();
+let cleanupStarted = false;
+let shuttingDown = false;
+let shutdownExitCode = 0;
+
+function registerShutdownHook(hook: () => void): void {
+  shutdownHooks.add(hook);
+}
+
+function cleanupAgentResources(reason: string): void {
+  if (cleanupStarted) return;
+  cleanupStarted = true;
+  log(`shutting down (${reason}) — terminating launched games + recorders`);
+  for (const hook of shutdownHooks) {
+    try {
+      hook();
+    } catch (err) {
+      console.error('[agent] shutdown hook failed:', err instanceof Error ? err.message : err);
+    }
+  }
+  shutdownHooks.clear();
+  clearInterval(expirySweepTimer);
+  clearInterval(launcherBroadcastTimer);
+  clearInterval(localLaunchHeartbeat);
+  try {
+    launcher.shutdownAll();
+  } catch (err) {
+    console.error('[agent] shutdownAll failed:', err instanceof Error ? err.message : err);
+  }
+  for (const ws of wss.clients) ws.terminate();
+  try {
+    wss.close();
+  } catch {
+    /* best effort */
+  }
+  try {
+    udp.close();
+  } catch {
+    /* best effort */
+  }
+  try {
+    server.close();
+  } catch {
+    /* best effort */
+  }
+}
+
+function shutdownAgent(reason: string, exitCode = 0): void {
+  shutdownExitCode = Math.max(shutdownExitCode, exitCode);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  cleanupAgentResources(reason);
+  setImmediate(() => process.exit(shutdownExitCode));
+}
+process.once('SIGINT', () => shutdownAgent('SIGINT', 0));
+process.once('SIGTERM', () => shutdownAgent('SIGTERM', 0));
+process.once('SIGHUP', () => shutdownAgent('SIGHUP', 0));
+process.once('uncaughtException', (err) => {
+  console.error('[agent] uncaught exception:', err);
+  shutdownAgent('uncaught exception', 1);
+});
+process.once('unhandledRejection', (reason) => {
+  console.error('[agent] unhandled rejection:', reason);
+  shutdownAgent('unhandled rejection', 1);
+});
+process.once('exit', (exitCode) => {
+  shutdownExitCode = Math.max(shutdownExitCode, exitCode);
+  cleanupAgentResources(`process exit ${shutdownExitCode}`);
+});
 
 function listMessage(): AgentProcessListMessage {
   const list = [...processes.values()].sort((a, b) => a.matchId.localeCompare(b.matchId));
@@ -209,6 +646,151 @@ function broadcastList() {
 function broadcastLauncherStatus() {
   broadcastJson(launcherMessage());
 }
+
+function registerLocalLaunches(launches: HeadlessLaunch[]) {
+  if (launches.length === 0) return;
+  if (launches.length > 1) {
+    log('local standalone ws fallback maps only the first launch until the LAN beacon provides per-match ports');
+  }
+
+  const launch = launches[0];
+  const entry = { launch };
+  localLaunchProcesses.set(launch.id, entry);
+  refreshLocalLaunchEntry(launch.id, entry);
+}
+
+function refreshLocalLaunches() {
+  if (localLaunchProcesses.size === 0) return;
+  let changed = false;
+  for (const [key, entry] of localLaunchProcesses) {
+    if (entry.launch.status !== 'running') {
+      changed = removeLocalLaunchProcess(entry.launch) || changed;
+      continue;
+    }
+    changed = refreshLocalLaunchEntry(key, entry) || changed;
+  }
+  if (changed) broadcastList();
+}
+
+function refreshLocalLaunchEntry(
+  key: string,
+  entry: { launch: HeadlessLaunch; process?: DiscoveredProcess; loggedPending?: boolean },
+): boolean {
+  const wsPort = localStandaloneWsPort(entry.launch.startedAt, entry.launch.logPath);
+  const now = Date.now();
+  if (wsPort == null) {
+    if (!entry.loggedPending) {
+      log(
+        `local standalone ${entry.launch.pid} is waiting for GSM_STANDALONE_LOG or --standalone-ws-port to expose a ws port`,
+      );
+      entry.loggedPending = true;
+    }
+    return false;
+  }
+
+  if (!entry.process) {
+    entry.process = {
+      matchId: `local-standalone-${entry.launch.id}`,
+      name: `Local standalone ${entry.launch.pid}`,
+      mapId: numFlag('--mapid', numFlag('--map-id', numEnv('GSM_HEADLESS_MAP_ID', 4))),
+      wsPort,
+      sourceIp: '127.0.0.1',
+      lastSeen: now,
+      wsUrl: `ws://127.0.0.1:${wsPort}`,
+      localLaunchId: entry.launch.id,
+      localLaunchPid: entry.launch.pid,
+    };
+    processes.set(keyOf(entry.process.matchId, entry.process.sourceIp), entry.process);
+    launcher.setLaunchWsUrl(entry.launch.id, entry.process.wsUrl);
+    log(`+ ${entry.process.name}  ${entry.process.wsUrl} (local launch fallback)`);
+    return true;
+  }
+
+  const previousUrl = entry.process.wsUrl;
+  entry.process.wsPort = wsPort;
+  entry.process.wsUrl = `ws://127.0.0.1:${wsPort}`;
+  entry.process.lastSeen = now;
+  entry.process.localLaunchId = entry.launch.id;
+  entry.process.localLaunchPid = entry.launch.pid;
+  processes.set(keyOf(entry.process.matchId, entry.process.sourceIp), entry.process);
+  launcher.setLaunchWsUrl(entry.launch.id, entry.process.wsUrl);
+  if (entry.process.wsUrl !== previousUrl) {
+    log(`~ ${entry.process.name}  ${previousUrl} -> ${entry.process.wsUrl} (local launch fallback)`);
+  }
+  return true;
+}
+
+function isLocalLaunchProcessKey(key: string): boolean {
+  for (const entry of localLaunchProcesses.values()) {
+    if (!entry.process) continue;
+    if (keyOf(entry.process.matchId, entry.process.sourceIp) === key) return true;
+  }
+  return false;
+}
+
+function localLaunchForBeacon(payload: BeaconPayload): HeadlessLaunch | null {
+  const pid = pidFromMatchId(payload.matchId);
+  const runningEntries = [...localLaunchProcesses.values()].filter((entry) => entry.launch.status === 'running');
+  for (const entry of localLaunchProcesses.values()) {
+    if (entry.launch.status !== 'running') continue;
+    if (pid != null && entry.launch.pid === pid) return entry.launch;
+    const wsPort = localStandaloneWsPort(entry.launch.startedAt, entry.launch.logPath);
+    if (wsPort != null && wsPort === payload.wsPort) return entry.launch;
+  }
+  const unboundEntries = runningEntries.filter((entry) => !entry.process);
+  if (unboundEntries.length === 1) return unboundEntries[0].launch;
+  return null;
+}
+
+function pidFromMatchId(matchId: string): number | undefined {
+  const match = matchId.match(/(?:^|[-_])(\d+)$/);
+  const pid = Number(match?.[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+function removeLocalLaunchProcess(launch: HeadlessLaunch): boolean {
+  let changed = false;
+  for (const [key, process] of processes) {
+    if (process.localLaunchId !== launch.id && process.localLaunchPid !== launch.pid) continue;
+    processes.delete(key);
+    changed = true;
+  }
+  const entry = localLaunchProcesses.get(launch.id);
+  if (entry?.process) {
+    const key = keyOf(entry.process.matchId, entry.process.sourceIp);
+    if (processes.delete(key)) changed = true;
+  }
+  localLaunchProcesses.delete(launch.id);
+  if (changed) broadcastList();
+  return changed;
+}
+
+function localStandaloneWsPort(startedAt?: number, launchLogPath?: string): number | undefined {
+  const logPort = localStandaloneWsPortFromLog(startedAt, launchLogPath);
+  if (logPort != null) return logPort;
+  const port = numFlag('--standalone-ws-port', numEnv('GSM_STANDALONE_WS_PORT', 0));
+  return port > 0 ? port : undefined;
+}
+
+function localStandaloneWsPortFromLog(startedAt?: number, launchLogPath?: string): number | undefined {
+  const logPath = launchLogPath ?? optionalStringFlag('--standalone-log', process.env.GSM_STANDALONE_LOG);
+  if (!logPath) return undefined;
+  try {
+    const stat = statSync(logPath);
+    if (startedAt != null && stat.mtimeMs + 1000 < startedAt) return undefined;
+    const bytes = readFileSync(logPath);
+    const tail = bytes.subarray(Math.max(0, bytes.length - 256 * 1024)).toString('utf8');
+    // The game logs the host:port form, e.g. "WebSocket server started on 0.0.0.0:17463";
+    // older builds logged "...on port 9240". The host group must END in ":" so it never
+    // swallows the port digits (a greedy "[\d.]*:?" would capture "0" from "port 9240").
+    const matches = [...tail.matchAll(/WebSocket server started on (?:port\s+)?(?:[\d.]*:)?(\d+)/gi)];
+    const port = Number(matches.at(-1)?.[1]);
+    return Number.isFinite(port) && port > 0 ? port : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function broadcastJson(value: unknown) {
   const msg = JSON.stringify(value);
   for (const ws of wss.clients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
@@ -219,6 +801,21 @@ function sendJson(ws: WebSocket, value: unknown) {
 function writeJson(res: http.ServerResponse, status: number, value: unknown) {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(value));
+}
+function ownerTokenMatches(header: string | string[] | undefined): boolean {
+  if (!ownerToken || typeof header !== 'string') return false;
+  const expected = Buffer.from(ownerToken, 'utf8');
+  const actual = Buffer.from(header, 'utf8');
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  const normalized = address.toLowerCase();
+  return (
+    normalized === '::1' ||
+    normalized.startsWith('127.') ||
+    normalized.startsWith('::ffff:127.')
+  );
 }
 function setCorsHeaders(req: http.IncomingMessage, res: http.ServerResponse): boolean {
   const origin = req.headers.origin;
@@ -233,7 +830,13 @@ function isAllowedOrigin(origin: string | undefined): boolean {
   if (!origin) return true;
   try {
     const url = new URL(origin);
-    return url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '::1';
+    const hostname = url.hostname.toLowerCase();
+    return (
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '::1' ||
+      hostname.endsWith('.localhost')
+    );
   } catch {
     return false;
   }
@@ -274,4 +877,212 @@ if (MOCK) {
 if (MOCK_SCENARIO) {
   log('--scenario: running realistic Map-9 AI match simulation (4 matches, ~420s)');
   startScenarioMock();
+}
+const TRACE_PATH = stringFlag('--trace');
+const TRACE_DIR = stringFlag('--trace-dir', process.env.GSM_TRACE_DIR);
+const TRACE_DIRS = stringFlag('--trace-dirs', process.env.GSM_TRACE_DIRS); // comma-separated: dir1,dir2,dir3
+const TRACE_ROOT = stringFlag('--trace-root', process.env.GSM_TRACE_ROOT ?? path.join(workspaceRoot, 'traces'));
+const TRACE_AUTO_DISCOVERY = !TRACE_PATH && !TRACE_DIR && !TRACE_DIRS;
+const TRACE_LOOP = boolFlag('--trace-loop', boolEnv('GSM_TRACE_LOOP', TRACE_AUTO_DISCOVERY));
+if (TRACE_PATH) {
+  log(`--trace: replaying recorded trace: ${TRACE_PATH}`);
+  const replayer = new TraceReplayer({
+    tracePath: TRACE_PATH,
+    speed: numFlag('--trace-speed', 1),
+    loop: TRACE_LOOP,
+  });
+  // Register the replayed match directly in the agent's process list
+  // (UDP loopback beacon is unreliable on Windows)
+  const replayerProcess: DiscoveredProcess = {
+    matchId: 'trace-replay',
+    name: `Trace Replay — Map 4`,
+    mapId: 4,
+    wsPort: 9240,
+    sourceIp: '127.0.0.1',
+    lastSeen: Date.now(),
+    wsUrl: 'ws://127.0.0.1:9240',
+  };
+  processes.set(keyOf(replayerProcess.matchId, replayerProcess.sourceIp), replayerProcess);
+  broadcastList();
+
+  // Keep the trace process alive in the list
+  const keepAlive = setInterval(() => {
+    const k = keyOf(replayerProcess.matchId, replayerProcess.sourceIp);
+    const existing = processes.get(k);
+    if (existing) {
+      existing.lastSeen = Date.now();
+      broadcastList();
+    }
+  }, BROADCAST_INTERVAL_MS);
+
+  replayer.start().catch((err) => {
+    console.error('[agent] trace replayer failed:', err);
+    shutdownAgent('trace replayer failure', 1);
+  });
+  registerShutdownHook(() => {
+    clearInterval(keepAlive);
+    const k = keyOf(replayerProcess.matchId, replayerProcess.sourceIp);
+    processes.delete(k);
+    broadcastList();
+    void replayer.stop();
+  });
+}
+
+// --- trace replay (supports --trace, --trace-dir, --trace-dirs) --------------
+function loadTraceDir(dirPath: string, packetLabel: string, portBase: number) {
+  const files = readdirSync(dirPath)
+    .filter(isReplayTraceFile)
+    .sort();
+  if (files.length === 0) {
+    log(`--trace-dir: no iter-*.trace.json / *.rbrecord.json.gz / *.rbreplay files found in ${dirPath}`);
+    return { replayers: [] as TraceReplayer[], procs: [] as DiscoveredProcess[] };
+  }
+  log(`--trace-dir: loading ${files.length} iterations from ${dirPath} (packet=${packetLabel})`);
+
+  const replayers: TraceReplayer[] = [];
+  const procs: DiscoveredProcess[] = [];
+
+  for (let i = 0; i < files.length; i++) {
+    const tracePath = path.join(dirPath, files[i]);
+    // Legacy traces number via iter-NNN; rbrecord files via _m<NNN> (match index).
+    const iterMatch = files[i].match(/iter-(\d+)/) ?? files[i].match(/_m(\d+)/);
+    const iterNum = iterMatch ? parseInt(iterMatch[1], 10) : i + 1;
+
+    let winnerMark = '';
+    let mapId = 4;
+    try {
+      const trace = TraceReplayer.inspect(tracePath);
+      mapId = trace.mapId;
+      const w = trace.summary?.winner;
+      if (w === 'team0') winnerMark = ' (R win)';
+      else if (w === 'team1') winnerMark = ' (B win)';
+      else if (w === 'team0_hp') winnerMark = ' (R+)';
+      else if (w === 'team1_hp') winnerMark = ' (B+)';
+    } catch { /* ignore */ }
+
+    const wsPort = portBase + i;
+    const matchId = `${packetLabel}-iter-${iterNum}`;
+    const replayer = new TraceReplayer({
+      tracePath,
+      wsPort,
+      speed: numFlag('--trace-speed', 1),
+      loop: TRACE_LOOP,
+    });
+
+    const proc: DiscoveredProcess = {
+      matchId,
+      name: `Iter ${iterNum}${winnerMark}`,
+      mapId,
+      wsPort,
+      sourceIp: '127.0.0.1',
+      lastSeen: Date.now(),
+      wsUrl: `ws://127.0.0.1:${wsPort}`,
+    };
+    processes.set(keyOf(proc.matchId, proc.sourceIp), proc);
+
+    replayer.start().catch(err => console.error(`[agent] ${matchId} failed:`, err));
+    replayers.push(replayer);
+    procs.push(proc);
+  }
+  return { replayers, procs };
+}
+
+// Build list of {dir, label} from explicit flags, or auto-discover the default
+// replay library under ./traces when no trace flags are supplied.
+const traceLoads: { dir: string; label: string; port: number }[] = [];
+let nextTracePort = 9240;
+
+function appendTraceLoad(dir: string, label = path.basename(dir).replace(/\\/g, '/')): void {
+  const resolvedDir = resolveTraceDir(dir);
+  const count = traceFileCount(resolvedDir);
+  if (count === 0) return;
+  traceLoads.push({ dir: resolvedDir, label, port: nextTracePort });
+  nextTracePort += count + 1;
+}
+
+if (TRACE_DIR) {
+  appendTraceLoad(TRACE_DIR);
+}
+if (TRACE_DIRS) {
+  for (const dir of TRACE_DIRS.split(',').map(s => s.trim()).filter(Boolean)) {
+    appendTraceLoad(dir);
+  }
+}
+if (TRACE_AUTO_DISCOVERY && TRACE_ROOT) {
+  for (const dir of discoverTraceDirs(TRACE_ROOT)) {
+    appendTraceLoad(dir);
+  }
+}
+
+if (traceLoads.length > 0) {
+  const allReplayers: TraceReplayer[] = [];
+  const allProcs: DiscoveredProcess[] = [];
+
+  for (const tl of traceLoads) {
+    const { replayers, procs } = loadTraceDir(tl.dir, tl.label, tl.port);
+    allReplayers.push(...replayers);
+    allProcs.push(...procs);
+  }
+  const loadTs = Date.now();
+  for (const p of allProcs) p.lastSeen = loadTs;
+  broadcastList();
+
+  // One shared heartbeat re-asserts every replay process (self-healing if one
+  // briefly expired under load) and broadcasts once per interval. The old design
+  // gave each of the N replays its own interval that broadcast the whole list —
+  // O(N^2) work that, with 66 matches, drifted past the 5s expiry and dropped
+  // matches for good (the per-replay timer only refreshed an *existing* entry, so
+  // once expired it never came back).
+  const heartbeat = setInterval(() => {
+    const now = Date.now();
+    for (const p of allProcs) {
+      p.lastSeen = now;
+      processes.set(keyOf(p.matchId, p.sourceIp), p);
+    }
+    broadcastList();
+  }, BROADCAST_INTERVAL_MS);
+
+  registerShutdownHook(() => {
+    clearInterval(heartbeat);
+    for (const r of allReplayers) void r.stop();
+  });
+}
+
+// A replayable file is a legacy compact trace, historical rbrecord/1 capture, or
+// RBREPLAY whose native world Attribute events project onto the same synthetic WS API.
+function isReplayTraceFile(name: string): boolean {
+  return (name.includes('.iter-') && name.endsWith('.trace.json')) ||
+    name.endsWith('.rbrecord.json.gz') ||
+    name.endsWith('.rbreplay');
+}
+
+function traceFileCount(dirPath: string): number {
+  try {
+    return readdirSync(dirPath).filter(isReplayTraceFile).length;
+  } catch {
+    return 0;
+  }
+}
+
+function resolveTraceDir(dirPath: string): string {
+  if (path.isAbsolute(dirPath)) return dirPath;
+  const fromWorkspace = path.resolve(workspaceRoot, dirPath);
+  if (existsSync(fromWorkspace)) return fromWorkspace;
+  return path.resolve(process.cwd(), dirPath);
+}
+
+function discoverTraceDirs(root: string): string[] {
+  if (!existsSync(root)) return [];
+  const dirs: string[] = [];
+  if (traceFileCount(root) > 0) dirs.push(root);
+  try {
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const dir = path.join(root, entry.name);
+      if (traceFileCount(dir) > 0) dirs.push(dir);
+    }
+  } catch {
+    /* ignore unreadable trace roots */
+  }
+  return dirs.sort((a, b) => a.localeCompare(b));
 }

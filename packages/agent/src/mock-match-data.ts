@@ -61,7 +61,7 @@ export function makeMap9Wireframe(): MapWireframe {
   ];
 
   return {
-    mapId: 'RMUC2026_Map9',
+    mapId: 'RMUC2026_Map4',
     lines: [outer, inner, redBase, blueBase, redOutpost, blueOutpost, tunnel],
     bounds: ARENA_BOUNDS,
   };
