@@ -170,4 +170,6 @@ the SPA with `?agent=ws://localhost:7790`.
   right-handed (`packages/web/src/three/coords.ts`).
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full wire contract and
-the game-side support real matches need.
+the game-side support real matches need. For the live + RBREPLAY AttributeMap
+decode, lifecycle, semantic projection, and renderer reading path, see
+[`docs/ATTRIBUTE_MAP_PIPELINE.md`](docs/ATTRIBUTE_MAP_PIPELINE.md).
