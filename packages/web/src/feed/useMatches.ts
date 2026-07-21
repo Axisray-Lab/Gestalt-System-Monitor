@@ -1,6 +1,7 @@
 import { reactive, ref, watch, onUnmounted, type Ref } from 'vue';
 import type { DiscoveredProcess, MapWireframe, WorldSnapshot } from '@gsm/protocol';
 import { createMockFeed } from './mockFeed';
+import type { StaticReplayDescriptor } from './staticReplayCatalog';
 import { createWsFeed } from './wsFeed';
 import type { FeedSource, MatchView } from './types';
 
@@ -8,8 +9,8 @@ const keyOf = (p: DiscoveredProcess) => `${p.matchId}@${p.sourceIp}`;
 
 /** Options for {@link useMatches}. */
 export interface UseMatchesOptions {
-  /** How many built-in mock matches to spawn (all render the RMUC2026 arena). Default 1. */
-  mockCount?: number;
+  /** Static, browser-hosted replay fixtures. Empty by default for live/dev use. */
+  staticReplays?: readonly StaticReplayDescriptor[];
 }
 
 /** Side-effect hooks into the renderer — kept here so unit lifecycle ordering lives in one place. */
@@ -30,7 +31,7 @@ interface Entry {
 
 /**
  * Reconciles the live discovery list into a set of simultaneously-open feeds:
- * the built-in mock (always present) plus one WebSocket feed per discovered
+ * configured static replays plus one WebSocket feed per discovered
  * process. As matches come and go it creates/destroys units + feeds, keyed by
  * `${matchId}@${sourceIp}` so the sidebar list and in-scene focus stay aligned.
  *
@@ -42,7 +43,8 @@ export function useMatches(
   hooks: MatchHooks,
   opts: UseMatchesOptions = {}
 ) {
-  const mockKeys = Array.from({ length: opts.mockCount ?? 1 }, (_, i) => `mock-${i}`);
+  const staticReplays = opts.staticReplays ?? [];
+  const staticReplayByKey = new Map(staticReplays.map((replay) => [replay.key, replay]));
   const entries = new Map<string, Entry>();
   const matches = ref<MatchView[]>([]);
   let activeKeys = new Set<string>();
@@ -87,7 +89,7 @@ export function useMatches(
 
   function reconcile(procs: DiscoveredProcess[]): void {
     const desired = new Map<string, DiscoveredProcess | null>();
-    for (const k of mockKeys) desired.set(k, null); // built-in mocks always present
+    for (const replay of staticReplays) desired.set(replay.key, null);
     for (const p of procs) desired.set(keyOf(p), p);
 
     for (const [key, p] of desired) {
@@ -102,8 +104,10 @@ export function useMatches(
         }
         continue;
       }
-      if (mockKeys.includes(key)) add(key, `RMUC2026AI #${mockKeys.indexOf(key) + 1}`, createMockFeed());
-      else if (p) add(key, p.name ?? p.matchId, createWsFeed(p.wsUrl, p.mapId), p);
+      const staticReplay = staticReplayByKey.get(key);
+      if (staticReplay) add(key, staticReplay.label, createMockFeed(staticReplay));
+      else if (p)
+        add(key, p.name ?? p.matchId, createWsFeed(p.wsUrl, p.mapId), p);
     }
     for (const key of [...entries.keys()]) {
       if (!desired.has(key)) remove(key);

@@ -957,7 +957,8 @@ export class MatchUnit {
           viz.buildingModel,
           now * 0.001,
           buildingDestroyed(viz.lastV),
-          buildingDeployed(viz.lastV)
+          buildingDeployed(viz.lastV),
+          viz.lastV?.outpostAngularSpeedDeg
         );
       }
       if (focused) viz.bodyCorruptionUniforms.time.value = now * 0.001 + viz.group.id * 0.017;
@@ -2346,14 +2347,16 @@ export class MatchUnit {
     }
 
     const showingRepairCount = v.kind === 'outpost' && v.repairCount != null;
-    const showingEngineerCore =
+    const showingEngineerMeta =
       v.classId === CLASS_ENGINEER &&
-      (v.engineerCarriedCores != null || v.engineerTeamEnergyCores != null);
+      (v.engineerCarriedCores != null ||
+        v.engineerTeamEnergyCores != null ||
+        v.engineerAssemblyLevel != null);
     p.ammoWrap.classList.toggle('repair-count', showingRepairCount);
 
     // ⊘ + ammo: lock shows + ammo dims when firing-locked. Outposts and engineers
     // use this corner for their own resource counters instead.
-    const locked = showingRepairCount || showingEngineerCore ? null : (v.firingLocked ?? null);
+    const locked = showingRepairCount || showingEngineerMeta ? null : (v.firingLocked ?? null);
     if (locked !== p.last.locked) {
       p.lock.hidden = locked !== true;
       p.ammo.classList.toggle('dim', locked === true);
@@ -2361,18 +2364,22 @@ export class MatchUnit {
     }
     const topRight = showingRepairCount
       ? String(Math.max(0, Math.round(v.repairCount!)))
-      : showingEngineerCore
-        ? String(
-            Math.max(
-              0,
-              Math.round(v.engineerCarriedCores != null && v.engineerCarriedCores > 0
-                ? v.engineerCarriedCores
-                : (v.engineerTeamEnergyCores ?? 0)),
-            ),
-          )
-      : v.ammo != null
-        ? String(v.ammo)
-        : '—';
+      : showingEngineerMeta
+        ? v.engineerCarriedCores != null || v.engineerTeamEnergyCores != null
+          ? String(
+              Math.max(
+                0,
+                Math.round(
+                  v.engineerCarriedCores != null && v.engineerCarriedCores > 0
+                    ? v.engineerCarriedCores
+                    : (v.engineerTeamEnergyCores ?? 0)
+                )
+              )
+            )
+          : `L${Math.max(0, Math.round(v.engineerAssemblyLevel ?? 0))}`
+        : v.ammo != null
+          ? String(v.ammo)
+          : '—';
     if (topRight !== p.last.ammo) {
       p.ammo.textContent = topRight;
       p.last.ammo = topRight;
@@ -2450,7 +2457,11 @@ export class MatchUnit {
     }
 
     // Buff pips.
-    const buffs = (v.buffs ?? []).join(',');
+    const buffValues = Object.entries(v.buffValues ?? {})
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${key}:${value}`)
+      .join(',');
+    const buffs = `${(v.buffs ?? []).join(',')}|${buffValues}`;
     if (buffs !== p.last.buffs) {
       const set = new Set(v.buffs ?? []);
       // Enhanced mode glows ONLY the sentry's own gain pip, tagged `enh:<key>` by
@@ -2467,6 +2478,14 @@ export class MatchUnit {
         const shown = set.has(key);
         pip.hidden = !shown;
         pip.classList.toggle('enhanced', shown && key === enhancedKey);
+        const magnitude =
+          v.buffValues?.[key as keyof NonNullable<VehicleState['buffValues']>];
+        const title =
+          shown && magnitude != null && magnitude > 0
+            ? `${BUFF_ICONS[key].title} +${Math.round(magnitude) / 10}%`
+            : BUFF_ICONS[key].title;
+        pip.title = title;
+        pip.setAttribute('aria-label', title);
       }
       p.last.buffs = buffs;
     }
@@ -2489,6 +2508,5 @@ export class MatchUnit {
     }
   }
 }
-
 
 

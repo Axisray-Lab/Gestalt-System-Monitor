@@ -70,6 +70,10 @@ export interface VehicleState {
   score?: number;
   /** Active status glyphs to show as head-of-unit icons (buffs, debuffs, sentry state). */
   buffs?: string[];
+  /** Active buff magnitudes in thousandths, keyed like `buffs` (250 = +25%). */
+  buffValues?: Partial<
+    Record<'def' | 'atk' | 'heal' | 'power' | 'cool' | 'vuln', number>
+  >;
   /** Optional resolved target id hint, used for dart visualisation when supplied. */
   dartTargetId?: number;
   /** Dart unit launch allowance, used to detect dart launches from ammo drops. */
@@ -88,6 +92,14 @@ export interface VehicleState {
   engineerCarriedCores?: number;
   /** Engineer team energy-unit stock, used when the engineer is not carrying a core. */
   engineerTeamEnergyCores?: number;
+  /** Highest engineer assembly level completed by this team. */
+  engineerAssemblyLevel?: number;
+  /** Per-level completed assembly counts, indexed by level 1..4. */
+  engineerAssemblyCounts?: [number, number, number, number];
+  /** Outpost rotor angular speed in degrees per second. */
+  outpostAngularSpeedDeg?: number;
+  /** Whether the outpost has entered its rule-driven stop sequence. */
+  outpostRotationStopRequested?: boolean;
   /** Shooter locked out (FiringLocked) → ⊘ icon + dimmed ammo. */
   firingLocked?: boolean;
   /** Firing heat, 0..1 (current / max). */

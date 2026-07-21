@@ -234,7 +234,11 @@ function teamTotal(vehicles: VehicleState[]) {
         />
       </div>
       <div v-if="!agentConnected" class="hint">
-        Local service is starting — showing built-in mock only.
+        {{
+          matches.length > 0
+            ? 'Local service is starting — showing configured static replays.'
+            : 'Local service is starting…'
+        }}
       </div>
 
       <template v-for="grp in packetGroups" :key="grp.firstKey">

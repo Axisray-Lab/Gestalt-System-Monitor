@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import { useDiscovery } from '@/discovery/useDiscovery';
 import { useMatches, type MatchHooks } from '@/feed/useMatches';
+import { configuredStaticReplays } from '@/feed/staticReplayCatalog';
 import { drainFeedPerf, feedPerf } from '@/feed/feedPerf';
 import { DioramaScene, type ThreePerformanceStats } from '@/three/DioramaScene';
 import type { HeadlessMatchConfig, WorldSnapshot } from '@gsm/protocol';
@@ -135,7 +136,9 @@ const hooks: MatchHooks = {
 };
 // No built-in synthetic mock: matches come from the agent (real LAN discovery +
 // the auto-replayed local datasets multi-1/15/50). See the gsmAgent vite plugin.
-const { matches, start, setActiveKeys } = useMatches(processes, hooks, { mockCount: 0 });
+const { matches, start, setActiveKeys } = useMatches(processes, hooks, {
+  staticReplays: configuredStaticReplays(),
+});
 
 watch(focusedKey, (k) => scene?.applyFocus(k));
 watch(showPerformanceHud, (enabled) => {

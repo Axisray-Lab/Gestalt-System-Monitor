@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { ThreeMFLoader } from 'three/examples/jsm/loaders/3MFLoader.js';
+import { publicAssetUrl } from '@/publicAssetUrl';
 import { UE_TO_M } from './coords';
 
 export interface MapModelDef {
@@ -33,7 +34,7 @@ export interface MapModelDef {
  * `monitor.mapGeometry` feed; the mock does too.
  */
 const RMUC2026: MapModelDef = {
-  url: '/maps/RMUC2026_Half.3mf',
+  url: 'maps/RMUC2026_Half.3mf',
   join: 'half-x-180',
   halfRotateY: Math.PI,
   mirrorLongAxis: true,
@@ -91,7 +92,7 @@ const cache = new Map<string, Promise<THREE.Group>>();
 
 function rawLoad(url: string): Promise<THREE.Group> {
   return new Promise((resolve, reject) => {
-    new ThreeMFLoader().load(url, resolve, undefined, reject);
+    new ThreeMFLoader().load(publicAssetUrl(url), resolve, undefined, reject);
   });
 }
 

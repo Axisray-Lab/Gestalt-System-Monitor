@@ -14,7 +14,7 @@ import {
 /**
  * Subscribes to the local discovery agent's WebSocket for the live LAN process
  * list. If the agent isn't running, `connected` stays false and the list is
- * empty — the app still works against the built-in mock.
+ * empty — configured static replay fixtures remain usable without the agent.
  */
 export function useDiscovery(agentUrl = defaultAgentUrl()) {
   const processes = ref<DiscoveredProcess[]>([]);

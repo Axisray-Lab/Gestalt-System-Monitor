@@ -35,6 +35,7 @@ import {
 } from '@gsm/protocol';
 import { useDiscovery } from '@/discovery/useDiscovery';
 import { useMatches, type MatchHooks } from '@/feed/useMatches';
+import { configuredStaticReplays } from '@/feed/staticReplayCatalog';
 import type { FeedStatus, MatchView } from '@/feed/types';
 import { DioramaScene, type ThreePerformanceStats } from '@/three/DioramaScene';
 
@@ -274,7 +275,9 @@ const hooks: MatchHooks = {
   },
 };
 
-const { matches, start, setActiveKeys } = useMatches(processes, hooks, { mockCount: 0 });
+const { matches, start, setActiveKeys } = useMatches(processes, hooks, {
+  staticReplays: configuredStaticReplays(),
+});
 
 const assignedFolderByKey = computed(() => {
   const assigned = new Map<string, string>();

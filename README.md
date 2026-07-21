@@ -5,11 +5,11 @@ matches on the local network and renders each one in the browser with
 **Three.js** — map wireframe, vehicle point positions, and a floating info panel
 above every car.
 
-> Status: **front-end scaffold (v0)**. The SPA runs today against a built-in mock
-> match. Watching *real* matches additionally needs a small amount of game-side
-> support — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-> ("Game-side requirements"). The monitor is built so that work can land
-> independently.
+> Status: **front-end scaffold (v0)**. GitHub Pages includes three static
+> RMUC 2026 regional-final replay series. Watching _live_ matches additionally
+> needs a small amount of game-side support — see
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ("Game-side requirements").
+> The monitor is built so that work can land independently.
 
 ## Why an "agent"
 
@@ -54,7 +54,8 @@ npm run desktop:dev               # web@5180 + Rust-owned agent@7788 + Tauri doc
 # or, detached + clean (Windows):  pwsh scripts/monitor-start.ps1 -Restart
 ```
 
-- The SPA opens on the **Built-in mock match** immediately (no agent required).
+- The GitHub Pages build opens with the three **RMUC 2026 regional-final**
+  replay series available without an agent.
 - With `GSM_AGENT="--mock"`, two fake "LAN matches" appear in the sidebar; click one
   to watch its live `ws://` feed end-to-end.
 - The dev server auto-discovers replay datasets under `./traces` — see
@@ -69,6 +70,52 @@ npm run desktop:dev               # web@5180 + Rust-owned agent@7788 + Tauri doc
 > detached AppBar watchdog and persisted lease also cover crashes/forced exits; the
 > stop script verifies that the native work area returned to its pre-launch value. See
 > [`docs/DESKTOP.md`](docs/DESKTOP.md#startup--shutdown-resource-lifecycle-read-this-for-killed-but-not-released).
+
+## RMUC 2026 GitHub Pages replays
+
+The Pages build enables three static replay series derived from the official
+RMUC 2026 regional dataset:
+
+- East regional final M88 — Shandong University of Science and Technology vs.
+  China University of Petroleum (East China), four games.
+- South regional final M88 — Wuyi University vs. South China Agricultural
+  University, three games.
+- North regional final M90 — Northeastern University vs. Harbin Institute of
+  Technology, four games.
+
+The official robot and structure samples are 1 Hz. The fixture generator emits
+the Monitor replay contract at 10 Hz: pose values use deterministic interpolation,
+while health, level, economy, buff, and other discrete state use step/hold
+semantics. It does not add vehicle physics or recalculate authoritative damage.
+
+Remaining launch allowance is not an authoritative field in the public dataset.
+The replay therefore labels ground-robot ammunition as a deterministic estimate
+and records its derivation, bounds, and anomalies in the fixture metadata.
+It must not be interpreted as an official value.
+
+Buff event rows do not carry their numeric effects. Values that are determinate
+from the public competition rules — including terrain, energy-mechanism, and
+technology-level effects — are reconstructed from those rules and the official
+event timeline. The dataset's vulnerability field is projected as an icon-only
+boolean; these fixtures do **not** claim to recover a vulnerability multiplier.
+
+Generate and strictly verify the fixtures with:
+
+```bash
+npm run generate:rmuc2026-pages
+npm run verify:rmuc2026-pages
+```
+
+Both commands fail on missing or unexpected source data and invalid replay
+output. There is no synthetic replay or silent fallback. See the
+[fixture README](packages/web/public/replays/rmuc2026-regionals/README.md) for
+the file-level provenance and limitations.
+
+The derived replay data is distributed under
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/), following
+the [official RMUC 2026 dataset release](https://bbs.robomaster.com/article/1936220?source=1).
+This notice applies to the derived fixture data and does not relicense the
+Monitor source code.
 
 ## Local launcher
 

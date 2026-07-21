@@ -16,6 +16,8 @@
     "agent:mock": "npm run mock -w @gsm/agent --",
     "agent:scenario": "npm run scenario -w @gsm/agent --",
     "agent:replay": "npm run replay -w @gsm/agent --",
+    "generate:rmuc2026-pages": "node packages/agent/src/rmuc2026-pages-replay.mjs",
+    "verify:rmuc2026-pages": "node packages/agent/src/rmuc2026-pages-replay.mjs --validate-only",
     "build": "npm run build -w @gsm/web",
     "build:web": "npm exec -w @gsm/web -- vite build",
     "desktop:dev": "npm run dev -w @gsm/desktop",

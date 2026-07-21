@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import * as SkeletonUtils from 'three/examples/jsm/utils/SkeletonUtils.js';
+import { publicAssetUrl } from '@/publicAssetUrl';
 import {
   createSurfaceCorruptionUniforms,
   installSurfaceCorruptionMaterial,
@@ -32,15 +33,16 @@ export interface LoadedBuildingModel {
   lastUpdateSeconds: number | null;
   rotor: THREE.Object3D | null;
   rotorBaseQuaternion: THREE.Quaternion | null;
+  rotorAngle: number;
 }
 
 const DEFS: Record<BuildingModelKind, BuildingModelDef> = {
   base: {
-    url: '/models/buildings/base.glb',
+    url: 'models/buildings/base.glb',
     yawOffset: -Math.PI / 2,
     worldOffset: { x: 0.18, y: 0, z: 0 },
   },
-  outpost: { url: '/models/buildings/outpost.glb', yawOffset: Math.PI / 2 },
+  outpost: { url: 'models/buildings/outpost.glb', yawOffset: Math.PI / 2 },
 };
 
 interface RawBuildingModel {
@@ -63,7 +65,7 @@ function rawLoad(kind: BuildingModelKind): Promise<RawBuildingModel> {
   if (!p) {
     p = new Promise((resolve, reject) => {
       new GLTFLoader().load(
-        DEFS[kind].url,
+        publicAssetUrl(DEFS[kind].url),
         (gltf) => resolve({ scene: gltf.scene, animations: gltf.animations }),
         undefined,
         reject
@@ -199,6 +201,7 @@ export async function loadBuildingModel(kind: BuildingModelKind): Promise<Loaded
     lastUpdateSeconds: null,
     rotor,
     rotorBaseQuaternion: rotor ? rotor.quaternion.clone() : null,
+    rotorAngle: 0,
   };
 }
 
@@ -235,13 +238,14 @@ export function updateBuildingModel(
   model: LoadedBuildingModel,
   elapsedSeconds: number,
   destroyed = false,
-  deployed?: boolean
+  deployed?: boolean,
+  outpostAngularSpeedDeg?: number
 ): void {
+  const dt =
+    model.lastUpdateSeconds == null
+      ? 0
+      : Math.max(0, Math.min(0.25, elapsedSeconds - model.lastUpdateSeconds));
   if (model.kind === 'base' && model.mixer && model.baseAction && model.baseAnimationDuration > 0) {
-    const dt =
-      model.lastUpdateSeconds == null
-        ? 0
-        : Math.max(0, Math.min(0.25, elapsedSeconds - model.lastUpdateSeconds));
     const targetOpenAmount = destroyed
       ? 0.86 + Math.sin(elapsedSeconds * 14 + model.phaseOffset * 8) * 0.025
       : deployed === true
@@ -263,9 +267,16 @@ export function updateBuildingModel(
   model.lastUpdateSeconds = elapsedSeconds;
 
   if (model.kind === 'outpost' && model.rotor && model.rotorBaseQuaternion) {
-    const spinSpeed = destroyed ? 0.08 : 1.45;
-    const stutter = destroyed ? Math.sin(elapsedSeconds * 18 + model.phaseOffset * 6) * 0.025 : 0;
-    tmpRotorSpin.setFromAxisAngle(OUTPOST_SPIN_AXIS, elapsedSeconds * spinSpeed + stutter);
+    const hasProjectedSpeed =
+      typeof outpostAngularSpeedDeg === 'number' &&
+      Number.isFinite(outpostAngularSpeedDeg);
+    const spinSpeed = hasProjectedSpeed
+      ? THREE.MathUtils.degToRad(outpostAngularSpeedDeg)
+      : destroyed ? 0.08 : 1.45;
+    model.rotorAngle += spinSpeed * dt;
+    const stutter =
+      !hasProjectedSpeed && destroyed ? Math.sin(elapsedSeconds * 18 + model.phaseOffset * 6) * 0.025 : 0;
+    tmpRotorSpin.setFromAxisAngle(OUTPOST_SPIN_AXIS, model.rotorAngle + stutter);
     model.rotor.quaternion.copy(model.rotorBaseQuaternion).multiply(tmpRotorSpin);
     model.rotor.updateMatrixWorld(true);
   }

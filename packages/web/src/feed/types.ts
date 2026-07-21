@@ -22,7 +22,7 @@ export interface FeedSource {
 
 /**
  * One row in the sidebar match list — the reactive projection of a live match
- * (built-in mock or a discovered process). The renderer keys units by the same
+ * (configured static replay or a discovered process). The renderer keys units by the same
  * string, so list highlight and in-scene focus stay in sync.
  */
 export interface MatchView {

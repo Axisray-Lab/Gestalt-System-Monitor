@@ -41,8 +41,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify RMUC 2026 replay fixtures
+        run: npm run verify:rmuc2026-pages
+
       - name: Build web app
         run: npm run build
+        env:
+          VITE_GSM_STATIC_REPLAYS: rmuc2026-regionals
 
       - name: Setup Pages
         uses: actions/configure-pages@v6

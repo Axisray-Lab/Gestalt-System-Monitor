@@ -121,6 +121,8 @@ const BUFF_DEFS: { key: string; id: AttrId; on: (v: number) => boolean }[] = [
   { key: 'cool', id: AttrId.TerrainCrossingColdMultiplierThou, on: (v) => v > 0 },
   { key: 'weak', id: AttrId.Weakened, on: (v) => v === 1 }, // 虚弱
   { key: 'blind', id: AttrId.Blocked, on: (v) => v === 1 }, // 致盲/受阻
+  // The public regional dataset exposes only an icon-worthy vulnerability bit.
+  { key: 'vuln', id: AttrId.RadarDoubleVulnerabilityActive, on: (v) => v === 1 },
   // 易伤 — DamageMultiplierThou is a DEBUFF (damage TAKEN multiplier), not a gain;
   // fires independently of AttackMultiplierThou on Hero/Infantry/Sentry.
   { key: 'vuln', id: AttrId.DamageMultiplierThou, on: (v) => v > 0 },
@@ -441,6 +443,14 @@ export class AttributeStore {
       .map(([mapId, m]) => ({ mapId, m, kind: this.kindFor(mapId, m, registered, now) }))
       .filter((e): e is { mapId: number; m: Record<string, number>; kind: UnitKind } => e.kind != null);
     const outpostRebuildCountsByTeam = new Map<number, number>();
+    const engineerMetaByTeam = new Map<
+      number,
+      {
+        teamEnergyCores?: number;
+        assemblyLevel?: number;
+        assemblyCounts: [number, number, number, number];
+      }
+    >();
     for (const { m, kind } of maps) {
       if (kind !== 'base') continue;
       const teamId = this.num(m, AttrId.TeamID);
@@ -453,6 +463,26 @@ export class AttributeStore {
           Math.round(teamId),
           baseDamaged && rebuildCount != null && rebuildCount >= 0 ? rebuildCount : 0
         );
+        const assemblyCounts = [
+          this.num(m, AttrId.RMUC2026_Tech_L1) ?? 0,
+          this.num(m, AttrId.RMUC2026_Tech_L2) ?? 0,
+          this.num(m, AttrId.RMUC2026_Tech_L3) ?? 0,
+          this.num(m, AttrId.RMUC2026_Tech_L4) ?? 0,
+        ].map((value) => Math.max(0, Math.round(value))) as [
+          number,
+          number,
+          number,
+          number,
+        ];
+        let assemblyLevel = 0;
+        for (let level = 1; level <= assemblyCounts.length; level += 1) {
+          if (assemblyCounts[level - 1] > 0) assemblyLevel = level;
+        }
+        engineerMetaByTeam.set(Math.round(teamId), {
+          teamEnergyCores: this.num(m, AttrId.EngineerTeamEnergyUnitStock),
+          assemblyLevel,
+          assemblyCounts,
+        });
       }
     }
     const n = maps.length;
@@ -516,6 +546,15 @@ export class AttributeStore {
             : 0
           : undefined;
       const reviveProgressMax = this.num(m, AttrId.ReviveProgressMax);
+      const reviveProgress = this.num(m, AttrId.ReviveProgress);
+      const respawnProgress =
+        kind === 'robot' &&
+        defeated === true &&
+        reviveProgress != null &&
+        reviveProgressMax != null &&
+        reviveProgressMax > 0
+          ? clamp01(reviveProgress / reviveProgressMax)
+          : undefined;
       // Base 展开/deploy state = BC_State(73000001)===1 (the base controller opens up,
       // exposing its core just before it can be destroyed). NOT 10000101 (Tech_L4).
       const deployedAttr = kind === 'base' ? this.num(m, AttrId.BC_State) : undefined;
@@ -525,6 +564,26 @@ export class AttributeStore {
       // Buffs come from VALUE positions (BUFF_DEFS); dedupe since several gains have
       // multiple source attributes (e.g. cool = rune/fortress/terrain-crossing).
       const buffs = [...new Set(BUFF_DEFS.filter((d) => d.on(this.num(m, d.id) ?? 0)).map((d) => d.key))];
+      const buffValues: NonNullable<VehicleState['buffValues']> = {};
+      const setBuffValue = (
+        key: keyof NonNullable<VehicleState['buffValues']>,
+        value: number | undefined
+      ) => {
+        if (value != null && value > 0) buffValues[key] = value;
+      };
+      setBuffValue('def', this.num(m, AttrId.DefenseMultiplierThou));
+      setBuffValue('atk', this.num(m, AttrId.AttackMultiplierThou));
+      setBuffValue('heal', this.num(m, AttrId.RecoverMultiplierThou));
+      setBuffValue('power', this.num(m, AttrId.PowerMultiplierThou));
+      setBuffValue(
+        'cool',
+        Math.max(
+          this.num(m, AttrId.ColdMultiplierThou) ?? 0,
+          this.num(m, AttrId.FortressCoolingValue) ?? 0,
+          this.num(m, AttrId.TerrainCrossingColdMultiplierThou) ?? 0
+        )
+      );
+      setBuffValue('vuln', this.num(m, AttrId.DamageMultiplierThou));
       // The sentry shows exactly ONE mode gain (def/atk/cool), picked from its value
       // positions. Enhanced mode amplifies only THAT gain, so we tag it `enh:<key>`
       // and let the panel glow just that one pip (not every active buff).
@@ -533,6 +592,13 @@ export class AttributeStore {
         if (gain) {
           if (!buffs.includes(gain)) buffs.push(gain);
           if (this.num(m, AttrId.SentryModeEnhanced) === 1) buffs.push(`enh:${gain}`);
+          const sentryValue =
+            gain === 'def'
+              ? this.num(m, AttrId.SentryDefenseMultiplierThou)
+              : gain === 'cool'
+                ? this.num(m, AttrId.SentryColdMultiplierThou)
+                : this.num(m, AttrId.SentryPowerCoefficientThou);
+          setBuffValue(gain, sentryValue);
         }
       }
 
@@ -542,6 +608,19 @@ export class AttributeStore {
       const turretPitch = this.num(m, AttrId.TurretPitch);
       const deploymentMode =
         classId === CLASS_ID.Hero ? this.num(m, AttrId.IsInDeploymentMode) : undefined;
+      const roundedTeamId = teamId != null ? Math.round(teamId) : undefined;
+      const engineerMeta = roundedTeamId != null ? engineerMetaByTeam.get(roundedTeamId) : undefined;
+      const engineerAssemblyLevel =
+        classId === CLASS_ID.Engineer
+          ? (this.num(m, AttrId.EngineerAssemblyMaxCompletedLevel) ??
+            engineerMeta?.assemblyLevel)
+          : undefined;
+      const outpostAngularSpeedRaw =
+        kind === 'outpost' ? this.num(m, AttrId.OP_AngularSpeed) : undefined;
+      const outpostStopRequested =
+        kind === 'outpost'
+          ? this.num(m, AttrId.OP_RotationStopRequested)
+          : undefined;
 
       return {
         id,
@@ -566,6 +645,7 @@ export class AttributeStore {
               ? deployedAttr === 1
               : undefined,
         repairProgress,
+        respawnProgress,
         repairCount:
           repairCount != null && repairCount >= 0 ? Math.round(repairCount) : undefined,
         respawnTotalMs:
@@ -573,6 +653,7 @@ export class AttributeStore {
             ? Math.round(reviveProgressMax * (reviveProgressMax < 1000 ? 1000 : 1))
             : undefined,
         buffs: buffs.length ? buffs : undefined,
+        buffValues: Object.keys(buffValues).length > 0 ? buffValues : undefined,
         level: level != null && level > 0 ? level : undefined,
         ammo,
         ammo17: a17,
@@ -581,9 +662,23 @@ export class AttributeStore {
         engineerCarriedCores:
           engineerCarriedCores != null ? Math.max(0, Math.round(engineerCarriedCores)) : undefined,
         engineerTeamEnergyCores:
-          engineerTeamEnergyCores != null ? Math.max(0, Math.round(engineerTeamEnergyCores)) : undefined,
+          engineerTeamEnergyCores != null
+            ? Math.max(0, Math.round(engineerTeamEnergyCores))
+            : engineerMeta?.teamEnergyCores != null
+              ? Math.max(0, Math.round(engineerMeta.teamEnergyCores))
+              : undefined,
+        engineerAssemblyLevel:
+          engineerAssemblyLevel != null
+            ? Math.max(0, Math.round(engineerAssemblyLevel))
+            : undefined,
+        engineerAssemblyCounts:
+          classId === CLASS_ID.Engineer ? engineerMeta?.assemblyCounts : undefined,
+        outpostAngularSpeedDeg:
+          outpostAngularSpeedRaw != null ? outpostAngularSpeedRaw / 1000 : undefined,
+        outpostRotationStopRequested:
+          outpostStopRequested != null ? outpostStopRequested === 1 : undefined,
         dartHitCount:
-          kind === 'base' ? this.num(m, AttrId.TM_BaseDamageCount) : undefined,
+          kind === 'base' ? this.num(m, AttrId.TM_DartBaseHitCount) : undefined,
         firingLocked,
         heat,
         score: this.num(m, AttrId.DamageAppliedTotal) ?? 0,
