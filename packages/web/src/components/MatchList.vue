@@ -43,11 +43,11 @@ interface PacketGroup {
   members: MatchView[];
 }
 
-const packetGroups = computed<PacketGroup[]>(() => {
+function buildPacketGroups(matches: readonly MatchView[]): PacketGroup[] {
   const groups = new Map<string, MatchView[]>();
   const singles: MatchView[] = [];
 
-  for (const m of props.matches) {
+  for (const m of matches) {
     if (m.key.includes('iter-')) {
       const prefix = m.key.replace(/iter-\d+.*$/, 'iter');
       let arr = groups.get(prefix);
@@ -86,7 +86,123 @@ const packetGroups = computed<PacketGroup[]>(() => {
   }
 
   return result;
+}
+
+type StaticMatch = MatchView & { staticReplay: NonNullable<MatchView['staticReplay']> };
+
+interface CatalogMapGroup {
+  key: string;
+  label: string;
+  matches: StaticMatch[];
+}
+
+interface CatalogRegionGroup {
+  key: string;
+  label: string;
+  matches: StaticMatch[];
+}
+
+const staticMatches = computed<StaticMatch[]>(() =>
+  props.matches.filter((match): match is StaticMatch => match.staticReplay !== undefined)
+);
+const packetGroups = computed<PacketGroup[]>(() =>
+  buildPacketGroups(props.matches.filter(match => match.staticReplay === undefined))
+);
+const mapGroups = computed<CatalogMapGroup[]>(() => {
+  const groups = new Map<string, CatalogMapGroup>();
+  for (const match of staticMatches.value) {
+    const metadata = match.staticReplay;
+    const group = groups.get(metadata.mapKey) ?? {
+      key: metadata.mapKey,
+      label: metadata.mapLabel,
+      matches: [],
+    };
+    group.matches.push(match);
+    groups.set(group.key, group);
+  }
+  return [...groups.values()].map(group => ({
+    ...group,
+    matches: [...group.matches].sort(
+      (left, right) => left.staticReplay.matchNumber - right.staticReplay.matchNumber
+    ),
+  }));
 });
+
+const activeMapKey = ref<string | null>(null);
+const activeRegionKey = ref<string | null>(null);
+const replayPage = ref(1);
+const REPLAYS_PER_PAGE = 12;
+
+watch(
+  mapGroups,
+  groups => {
+    if (!groups.some(group => group.key === activeMapKey.value)) {
+      activeMapKey.value = groups[0]?.key ?? null;
+    }
+  },
+  { immediate: true }
+);
+
+const activeMap = computed(() =>
+  mapGroups.value.find(group => group.key === activeMapKey.value) ?? null
+);
+const regionGroups = computed<CatalogRegionGroup[]>(() => {
+  const groups = new Map<string, CatalogRegionGroup>();
+  for (const match of activeMap.value?.matches ?? []) {
+    const metadata = match.staticReplay;
+    const group = groups.get(metadata.regionKey) ?? {
+      key: metadata.regionKey,
+      label: metadata.regionLabel,
+      matches: [],
+    };
+    group.matches.push(match);
+    groups.set(group.key, group);
+  }
+  return [...groups.values()].map(group => ({
+    ...group,
+    matches: [...group.matches].sort(
+      (left, right) => left.staticReplay.matchNumber - right.staticReplay.matchNumber
+    ),
+  }));
+});
+
+watch(
+  regionGroups,
+  groups => {
+    if (!groups.some(group => group.key === activeRegionKey.value)) {
+      activeRegionKey.value = groups[0]?.key ?? null;
+    }
+  },
+  { immediate: true }
+);
+
+const activeRegion = computed(() =>
+  regionGroups.value.find(group => group.key === activeRegionKey.value) ?? null
+);
+const replayPageCount = computed(() =>
+  Math.ceil((activeRegion.value?.matches.length ?? 0) / REPLAYS_PER_PAGE)
+);
+const pagedReplays = computed(() => {
+  const start = (replayPage.value - 1) * REPLAYS_PER_PAGE;
+  return activeRegion.value?.matches.slice(start, start + REPLAYS_PER_PAGE) ?? [];
+});
+
+watch([activeMapKey, activeRegionKey], () => (replayPage.value = 1));
+watch(replayPageCount, count => {
+  if (count > 0 && replayPage.value > count) replayPage.value = count;
+});
+
+function formatMatchNumber(matchNumber: number): string {
+  return `M${String(matchNumber).padStart(3, '0')}`;
+}
+
+function previousReplayPage(): void {
+  if (replayPage.value > 1) replayPage.value -= 1;
+}
+
+function nextReplayPage(): void {
+  if (replayPage.value < replayPageCount.value) replayPage.value += 1;
+}
 
 // Iteration siblings: all matches in the same packet as the focused one
 const iterSiblings = computed(() => {
@@ -240,6 +356,75 @@ function teamTotal(vehicles: VehicleState[]) {
             : 'Local service is starting…'
         }}
       </div>
+
+      <section v-if="mapGroups.length > 0" class="replay-catalog" aria-label="Static replay catalog">
+        <nav class="catalog-tabs map-tabs" aria-label="Available maps">
+          <button
+            v-for="map in mapGroups"
+            :key="map.key"
+            type="button"
+            :class="{ active: map.key === activeMapKey }"
+            :aria-current="map.key === activeMapKey ? 'page' : undefined"
+            @click="activeMapKey = map.key"
+          >
+            <span>{{ map.label }}</span>
+            <small>{{ map.matches.length }}</small>
+          </button>
+        </nav>
+
+        <nav class="catalog-tabs region-tabs" aria-label="RMUC 2026 regions">
+          <button
+            v-for="region in regionGroups"
+            :key="region.key"
+            type="button"
+            :class="{ active: region.key === activeRegionKey }"
+            :aria-current="region.key === activeRegionKey ? 'page' : undefined"
+            @click="activeRegionKey = region.key"
+          >
+            <span>{{ region.label }}</span>
+            <small>{{ region.matches.length }}</small>
+          </button>
+        </nav>
+
+        <div v-if="replayPageCount > 1" class="catalog-pagination" aria-label="Replay pages">
+          <button type="button" :disabled="replayPage === 1" @click="previousReplayPage">上一页</button>
+          <span>{{ replayPage }} / {{ replayPageCount }}</span>
+          <button
+            type="button"
+            :disabled="replayPage === replayPageCount"
+            @click="nextReplayPage"
+          >
+            下一页
+          </button>
+        </div>
+
+        <div class="catalog-replays">
+          <button
+            v-for="match in pagedReplays"
+            :key="match.key"
+            type="button"
+            class="proc catalog-replay"
+            :class="{ active: match.key === focusedKey }"
+            @click="emit('focus', match.key)"
+          >
+            <strong class="catalog-match-number">
+              {{ formatMatchNumber(match.staticReplay.matchNumber) }}
+            </strong>
+            <span class="proc-text">
+              <span class="proc-name catalog-teams">
+                {{ match.staticReplay.redSchool }}
+                <i aria-hidden="true">vs</i>
+                {{ match.staticReplay.blueSchool }}
+              </span>
+              <span class="proc-sub">
+                {{ match.staticReplay.roundCount }} 局 · {{ match.status }}
+              </span>
+            </span>
+          </button>
+        </div>
+      </section>
+
+      <div v-if="packetGroups.length > 0" class="sec-title">Live</div>
 
       <template v-for="grp in packetGroups" :key="grp.firstKey">
         <!-- Single match (not a packet) -->

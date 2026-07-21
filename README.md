@@ -5,8 +5,8 @@ matches on the local network and renders each one in the browser with
 **Three.js** — map wireframe, vehicle point positions, and a floating info panel
 above every car.
 
-> Status: **front-end scaffold (v0)**. GitHub Pages includes three static
-> RMUC 2026 regional-final replay series. Watching _live_ matches additionally
+> Status: **front-end scaffold (v0)**. GitHub Pages includes all 266 static
+> RMUC 2026 regional match series. Watching _live_ matches additionally
 > needs a small amount of game-side support — see
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ("Game-side requirements").
 > The monitor is built so that work can land independently.
@@ -54,8 +54,8 @@ npm run desktop:dev               # web@5180 + Rust-owned agent@7788 + Tauri doc
 # or, detached + clean (Windows):  pwsh scripts/monitor-start.ps1 -Restart
 ```
 
-- The GitHub Pages build opens with the three **RMUC 2026 regional-final**
-  replay series available without an agent.
+- The GitHub Pages build opens with all **RMUC 2026 regional** replay series,
+  grouped by East, South, and North, available without an agent.
 - With `GSM_AGENT="--mock"`, two fake "LAN matches" appear in the sidebar; click one
   to watch its live `ws://` feed end-to-end.
 - The dev server auto-discovers replay datasets under `./traces` — see
@@ -73,20 +73,17 @@ npm run desktop:dev               # web@5180 + Rust-owned agent@7788 + Tauri doc
 
 ## RMUC 2026 GitHub Pages replays
 
-The Pages build enables three static replay series derived from the official
-RMUC 2026 regional dataset:
-
-- East regional final M88 — Shandong University of Science and Technology vs.
-  China University of Petroleum (East China), four games.
-- South regional final M88 — Wuyi University vs. South China Agricultural
-  University, three games.
-- North regional final M90 — Northeastern University vs. Harbin Institute of
-  Technology, four games.
+The Pages build enables all 266 match series derived from the official RMUC 2026
+regional dataset: East M001–M088 (203 games), South M001–M088 (204 games), and
+North M001–M090 (206 games). Each catalog item keeps the two-to-four official
+games in that match number together.
 
 The official robot and structure samples are 1 Hz. The fixture generator emits
-the Monitor replay contract at 10 Hz: pose values use deterministic interpolation,
-while health, level, economy, buff, and other discrete state use step/hold
-semantics. It does not add vehicle physics or recalculate authoritative damage.
+the Monitor replay contract at 10 Hz. Pose, current health, structure health,
+and firing heat use deterministic interpolation between exact official anchors;
+death, revival, levels, limits, economy, buffs, and other discrete state use
+step/hold semantics. It does not add vehicle physics or recalculate authoritative
+damage.
 
 Remaining launch allowance is not an authoritative field in the public dataset.
 The replay therefore labels ground-robot ammunition as a deterministic estimate
@@ -104,6 +101,7 @@ Generate and strictly verify the fixtures with:
 ```bash
 npm run generate:rmuc2026-pages
 npm run verify:rmuc2026-pages
+npm run verify:rmuc2026-pages-assets
 ```
 
 Both commands fail on missing or unexpected source data and invalid replay

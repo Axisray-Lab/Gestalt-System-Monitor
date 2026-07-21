@@ -1,19 +1,25 @@
-# RMUC 2026 regional-final replay fixtures
+# RMUC 2026 regional replay fixtures
 
-This directory contains three static replay series generated from the official
+This directory contains all 266 match series generated from the official
 RMUC 2026 regional dataset for the Monitor GitHub Pages build:
 
-| File                   | Series                   | Games |
-| ---------------------- | ------------------------ | ----: |
-| `east-final-m88.json`  | East regional final M88  |     4 |
-| `south-final-m88.json` | South regional final M88 |     3 |
-| `north-final-m90.json` | North regional final M90 |     4 |
+| Directory | Series | Games |
+| --------- | -----: | ----: |
+| `east/`   |     88 |   203 |
+| `south/`  |     88 |   204 |
+| `north/`  |     90 |   206 |
+
+Each `mNNN.json.gzip` file contains the complete two-to-four-game series for one
+official regional match number. The gzip transport keeps the complete 10 Hz
+replay library within the GitHub Pages site-size limit; the replay payload
+inside remains `gsm-watch-replay/2` JSON and is decoded strictly by the client.
 
 Regenerate and validate the files from the Monitor repository root:
 
 ```bash
 npm run generate:rmuc2026-pages
 npm run verify:rmuc2026-pages
+npm run verify:rmuc2026-pages-assets
 ```
 
 The generator owns source-path resolution and validates the expected dataset
@@ -22,14 +28,18 @@ terminates the command; no substitute fixture or synthetic fallback is used.
 
 ## Transformation and inference
 
-- The official samples are 1 Hz. Poses are deterministically interpolated into
-  100 ms frames (10 Hz); discrete state is held until the next official sample.
+- The official samples are 1 Hz. Poses, current health, structure health, and
+  current firing heat are deterministically interpolated into 100 ms frames
+  (10 Hz). Every official whole-second anchor remains exact. Death, revival,
+  levels, limits, buffs, coins, and other discrete state are held.
 - Health and the official replay trajectory remain authoritative. The fixture
   does not simulate vehicle physics or recompute damage.
 - Remaining launch allowance is not present as an authoritative source field.
   Ground-robot ammunition is an explicitly labelled deterministic estimate.
   Its provenance, safe bounds, unresolved spend, and detected anomalies are
-  stored in each replay file's metadata.
+  stored in each replay file's metadata. Spending that cannot be uniquely
+  assigned to ammunition, support, buyback, or repair remains explicitly
+  unclassified rather than being forced into one operation.
 - Buff event rows contain names and timing but no numeric values. Numeric effects
   that the public competition rules determine are reconstructed from the rules
   and official event timeline. This includes applicable terrain,

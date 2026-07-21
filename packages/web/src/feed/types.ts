@@ -26,11 +26,24 @@ export interface FeedSource {
  * string, so list highlight and in-scene focus stay in sync.
  */
 export interface MatchView {
-  /** 'mock' for the built-in match, else `${matchId}@${sourceIp}`. */
+  /** Static replay catalog key, or `${matchId}@${sourceIp}` for a live process. */
   key: string;
   label: string;
   status: FeedStatus;
   playerCount?: number;
+  /** Present only for browser-hosted replay catalog entries. */
+  staticReplay?: {
+    competitionKey: string;
+    competitionLabel: string;
+    mapKey: string;
+    mapLabel: string;
+    regionKey: string;
+    regionLabel: string;
+    matchNumber: number;
+    roundCount: number;
+    redSchool: string;
+    blueSchool: string;
+  };
   /** Present when the local service started this live process. */
   localLaunchId?: string;
   localLaunchPid?: number;

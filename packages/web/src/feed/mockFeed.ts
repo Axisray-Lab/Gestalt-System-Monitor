@@ -9,7 +9,17 @@ import {
 import type { StaticReplayDescriptor } from './staticReplayCatalog';
 import type { FeedSource, FeedStatus } from './types';
 
-async function loadRecordedReplay(
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error('This browser does not support replay integrity verification');
+  }
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)]
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+export async function loadRecordedReplay(
   descriptor: StaticReplayDescriptor,
   signal: AbortSignal
 ): Promise<RecordedReplay> {
@@ -22,7 +32,43 @@ async function loadRecordedReplay(
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} while loading ${url}`);
   }
-  return parseRecordedReplay(await response.json());
+  if (descriptor.encoding !== 'gzip') {
+    throw new Error(`Unsupported static replay encoding: ${String(descriptor.encoding)}`);
+  }
+  if (response.body === null) {
+    throw new Error(`Response body is missing while loading ${url}`);
+  }
+  if (typeof globalThis.DecompressionStream !== 'function') {
+    throw new Error('This browser does not support gzip replay decompression');
+  }
+  const compressed = await new Response(response.body).arrayBuffer();
+  if (compressed.byteLength !== descriptor.compressedBytes) {
+    throw new Error(
+      `Compressed byte count mismatch for ${descriptor.key}: ` +
+        `${compressed.byteLength} != ${descriptor.compressedBytes}`
+    );
+  }
+  const digest = await sha256Hex(compressed);
+  if (digest !== descriptor.sha256) {
+    throw new Error(`SHA-256 mismatch for ${descriptor.key}: ${digest} != ${descriptor.sha256}`);
+  }
+  const decompressed = new Blob([compressed]).stream().pipeThrough(
+    new DecompressionStream('gzip'),
+    { signal }
+  );
+  const json = await new Response(decompressed).text();
+  const replay = parseRecordedReplay(JSON.parse(json) as unknown);
+  if (
+    replay.frameCount !== descriptor.frameCount ||
+    replay.durationMs !== descriptor.durationMs
+  ) {
+    throw new Error(
+      `Replay metadata mismatch for ${descriptor.key}: ` +
+        `frames ${replay.frameCount}/${descriptor.frameCount}, ` +
+        `duration ${replay.durationMs}/${descriptor.durationMs}`
+    );
+  }
+  return replay;
 }
 
 export function createMockFeed(descriptor: StaticReplayDescriptor): FeedSource {

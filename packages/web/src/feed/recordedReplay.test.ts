@@ -63,12 +63,12 @@ describe('recorded replay validation', () => {
   it('resolves project-Pages assets below the configured base', () => {
     expect(
       replayAssetUrl(
-        'replays/rmuc2026-regionals/east-final-m88.json',
+        'replays/rmuc2026-regionals/east/m088.json.gzip',
         './',
         'https://example.test/Gestalt-System-Monitor/index.html'
       )
     ).toBe(
-      'https://example.test/Gestalt-System-Monitor/replays/rmuc2026-regionals/east-final-m88.json'
+      'https://example.test/Gestalt-System-Monitor/replays/rmuc2026-regionals/east/m088.json.gzip'
     );
   });
 

@@ -136,11 +136,15 @@ const hooks: MatchHooks = {
 };
 // No built-in synthetic mock: matches come from the agent (real LAN discovery +
 // the auto-replayed local datasets multi-1/15/50). See the gsmAgent vite plugin.
-const { matches, start, setActiveKeys } = useMatches(processes, hooks, {
+const { matches, start, setActiveKeys, setFocusedKey } = useMatches(processes, hooks, {
   staticReplays: configuredStaticReplays(),
 });
 
-watch(focusedKey, (k) => scene?.applyFocus(k));
+watch(focusedKey, (key) => {
+  snapshotMap.value = {};
+  setFocusedKey(key);
+  scene?.applyFocus(key);
+});
 watch(showPerformanceHud, (enabled) => {
   try {
     window.localStorage.setItem(PERF_HUD_STORAGE_KEY, enabled ? '1' : '0');

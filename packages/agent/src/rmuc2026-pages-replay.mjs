@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
 /**
- * Build the three RMUC 2026 regional-final GitHub Pages fixtures from the
- * official public SQLite dataset.
+ * Build all RMUC 2026 regional GitHub Pages fixtures from the official public
+ * SQLite dataset, grouped as one compressed replay per match series.
  *
  * The public dataset is 1 Hz. Position and angle attributes are deterministically
- * interpolated to the Monitor's 10 Hz consumption cadence. Damage, buffs, coins,
- * levels and other rule states remain step/hold values.
+ * interpolated to the Monitor's 10 Hz consumption cadence. Current health and
+ * firing heat are anchored linear projections; lifecycle, buffs, coins, levels,
+ * limits and other rule states remain step/hold values.
  */
 
 import { createHash } from 'node:crypto';
@@ -19,9 +20,13 @@ import {
 } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { once } from 'node:events';
+import { pipeline } from 'node:stream/promises';
 import { DatabaseSync } from 'node:sqlite';
+import { createGzip, gunzip } from 'node:zlib';
+import { promisify } from 'node:util';
 
 const REPLAY_SCHEMA = 'gsm-watch-replay/2';
+const CATALOG_SCHEMA = 'gsm-static-replay-catalog/1';
 const AMMO_INFERENCE_SCHEMA = 'gsm-ammo-inference/1';
 const BUFF_PROJECTION_SCHEMA = 'gsm-rmuc2026-buff-projection/1';
 const FRAME_MS = 100;
@@ -32,6 +37,7 @@ const EXPECTED_DATABASE_SHA256 =
   '53ac64efeaf570c0e21d8c3724dcefcb0123196b3c7ef963183a911863f724a7';
 const DATASET_ARTICLE_URL =
   'https://bbs.robomaster.com/article/1936220?source=1';
+const gunzipAsync = promisify(gunzip);
 const BUFF_RULE_VALUES = {
   terrain: {
     road: { defenseThou: 250, durationSeconds: 5 },
@@ -69,50 +75,37 @@ const BUFF_RULE_VALUES = {
   },
 };
 
-const SERIES = [
+const REGIONS = [
   {
     key: 'east',
-    region: '东部赛区',
-    matchNumber: 88,
-    redSchool: '山东科技大学',
-    blueSchool: '中国石油大学（华东）',
-    gameIds: [1779693823256, 1779694694514, 1779696117794, 1779697007200],
-    output: 'east-final-m88.json',
-    label: 'RMUC2026 东部决赛 M88',
+    sourceName: '东部赛区',
+    label: '东部赛区',
+    expectedMatches: 88,
+    expectedRounds: 203,
     rulesEffective: 'V1.5.0',
   },
   {
     key: 'south',
-    region: '南部赛区',
-    matchNumber: 88,
-    redSchool: '五邑大学',
-    blueSchool: '华南农业大学',
-    gameIds: [1779001883111, 1779002815710, 1779004144178],
-    output: 'south-final-m88.json',
-    label: 'RMUC2026 南部决赛 M88',
+    sourceName: '南部赛区',
+    label: '南部赛区',
+    expectedMatches: 88,
+    expectedRounds: 204,
     rulesEffective: 'V1.4.2',
   },
   {
     key: 'north',
-    region: '北部赛区',
-    matchNumber: 90,
-    redSchool: '东北大学',
-    blueSchool: '哈尔滨工业大学',
-    gameIds: [1780389108168, 1780389810101, 1780391063510, 1780391866389],
-    output: 'north-final-m90.json',
-    label: 'RMUC2026 北部决赛 M90',
+    sourceName: '北部赛区',
+    label: '北部赛区',
+    expectedMatches: 90,
+    expectedRounds: 206,
     rulesEffective: 'V1.5.0',
   },
 ];
+const EXPECTED_SERIES_COUNT = 266;
+const EXPECTED_ROUND_COUNT = 613;
 
 const ROBOT_IDS = [1, 2, 3, 4, 6, 7, 101, 102, 103, 104, 106, 107];
 const BUILDING_IDS = [10, 11, 110, 111];
-const KNOWN_ALL_MISSING = new Set([
-  '1779696117794:102',
-  '1779697007200:102',
-  '1780391866389:106',
-]);
-const KNOWN_POINT_MISSING = new Set(['1780391866389:107:253']);
 
 const CLASS_ID = {
   Hero: 1001,
@@ -298,23 +291,19 @@ const STRUCTURES = {
   },
 };
 
-const EXPECTED_AUDIT = {
+const EXPECTED_SOURCE_AUDIT = {
   buffCategories: {
-    小能量机关增益: 207,
-    大能量机关增益: 74,
-    飞坡: 60,
-    台阶跨越: 22,
-    过中央高地: 16,
+    小能量机关增益: 2701,
+    大能量机关增益: 1816,
+    飞坡: 651,
+    台阶跨越: 1002,
+    过中央高地: 1064,
   },
-  smallRuneCompletions: 30,
-  bigRuneCompletions: 8,
-  bigRuneCrossTeamRows: 35,
-  bigRuneMissingRecipientGroups: 3,
-  assemblyLevels: { 1: 15, 2: 17, 3: 15, 4: 0 },
-  vulnerableRobotSamples: 16257,
-  robotSamples: 53330,
-  terrainOverlaps: 5,
-  dartBuffCounterEvents: 6,
+  assemblyLevels: { 1: 884, 2: 884, 3: 626, 4: 0 },
+  vulnerableRobotSamples: 510805,
+  robotSamples: 2990075,
+  robotSeries: 7151,
+  missingRobotSamples: 8,
 };
 
 const RULE_SOURCE_SHA256 = {
@@ -345,7 +334,20 @@ function parseArgs(argv) {
       'replays',
       'rmuc2026-regionals'
     ),
+    catalog: resolve(
+      process.cwd(),
+      'packages',
+      'web',
+      'src',
+      'feed',
+      'rmuc2026ReplayCatalog.generated.json'
+    ),
     validateOnly: false,
+    verifyAssetsOnly: false,
+    auditOnly: false,
+    catalogOnly: false,
+    series: null,
+    region: null,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -355,8 +357,40 @@ function parseArgs(argv) {
       options.outputDir = resolve(
         argv[++index] ?? fail('--output-dir requires a path')
       );
+    else if (arg === '--catalog')
+      options.catalog = resolve(
+        argv[++index] ?? fail('--catalog requires a path')
+      );
+    else if (arg === '--series')
+      options.series = argv[++index] ?? fail('--series requires region:MNNN');
+    else if (arg === '--region')
+      options.region = argv[++index] ?? fail('--region requires a key');
     else if (arg === '--validate-only') options.validateOnly = true;
+    else if (arg === '--verify-assets-only') options.verifyAssetsOnly = true;
+    else if (arg === '--audit-only') options.auditOnly = true;
+    else if (arg === '--catalog-only') options.catalogOnly = true;
     else fail(`unknown argument ${arg}`);
+  }
+  const modes = [
+    options.validateOnly,
+    options.verifyAssetsOnly,
+    options.auditOnly,
+    options.catalogOnly,
+  ].filter(Boolean).length;
+  if (modes > 1) fail('validation/audit/catalog modes are mutually exclusive');
+  if (options.series != null && options.region != null)
+    fail('--series and --region are mutually exclusive');
+  if (
+    (options.catalogOnly || options.auditOnly) &&
+    (options.series != null || options.region != null)
+  ) {
+    fail('--catalog-only and --audit-only do not accept --series or --region');
+  }
+  if (
+    options.region != null &&
+    !REGIONS.some(region => region.key === options.region)
+  ) {
+    fail(`--region must be east, south, or north: ${options.region}`);
   }
   return options;
 }
@@ -394,6 +428,31 @@ function roundNumber(value, digits = 3) {
   const scale = 10 ** digits;
   const rounded = Math.round(value * scale) / scale;
   return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function interpolateAnchoredValue(left, right, alpha, holdUntilRight = false) {
+  finite(left, 'interpolation left value');
+  finite(right, 'interpolation right value');
+  finite(alpha, 'interpolation alpha');
+  if (alpha <= 0 || left === right) return left;
+  if (alpha >= 1) return right;
+  if (holdUntilRight) return left;
+  return roundNumber(left + (right - left) * alpha);
+}
+
+function interpolateHealth(left, right, alpha) {
+  const holdUntilRight =
+    left.hpMax !== right.hpMax || (left.hp <= 0 && right.hp > 0);
+  const value = interpolateAnchoredValue(
+    left.hp,
+    right.hp,
+    alpha,
+    holdUntilRight
+  );
+  if (alpha > 0 && alpha < 1 && left.hp > 0 && right.hp <= 0) {
+    return Math.max(1, value);
+  }
+  return value;
 }
 
 function teamIdForRobot(robotId) {
@@ -459,8 +518,12 @@ function officialLevel(state) {
     );
   }
   if (teamNumber === 2) {
-    if (state.heat17Max !== 0 || state.heat42Max !== 0)
-      fail(`engineer ${state.robotId} has heat limits`);
+    if (![0, 40].includes(state.heat17Max) || state.heat42Max !== 0)
+      fail(
+        `engineer ${state.robotId} has unsupported heat limits ${state.heat17Max}/${state.heat42Max}`
+      );
+    if (state.fired17 != null || state.fired42 != null)
+      fail(`engineer ${state.robotId} unexpectedly has a firing counter`);
     return 1;
   }
   if (teamNumber === 3 || teamNumber === 4) {
@@ -480,8 +543,10 @@ function officialLevel(state) {
     );
   }
   if (teamNumber === 7) {
-    if (state.heat17Max !== 260 || state.heat42Max !== 0)
-      fail(`sentry ${state.robotId} heat limits drifted`);
+    if (![100, 260].includes(state.heat17Max) || state.heat42Max !== 0)
+      fail(
+        `sentry ${state.robotId} has unsupported heat limits ${state.heat17Max}/${state.heat42Max}`
+      );
     return 1;
   }
   fail(`cannot derive level for robot ${state.robotId}`);
@@ -505,6 +570,325 @@ function requireTables(database) {
   for (const table of ['matches', 'timeseries', 'events']) {
     if (!tables.has(table)) fail(`database is missing table ${table}`);
   }
+}
+
+function paddedMatchNumber(matchNumber) {
+  return String(matchNumber).padStart(3, '0');
+}
+
+function loadSeriesConfigs(database) {
+  const rows = database
+    .prepare(
+      `
+    SELECT
+      赛区 AS region,
+      场次号 AS matchNumber,
+      赛程 AS schedule,
+      局号 AS roundNumber,
+      game_id AS gameId,
+      web_game_id AS webGameId,
+      红方学校 AS redSchool,
+      蓝方学校 AS blueSchool,
+      胜方 AS winner,
+      开始时间 AS startedLocal,
+      时长秒 AS durationSeconds
+    FROM matches
+    ORDER BY 赛区, 场次号, 局号
+  `
+    )
+    .all();
+  if (rows.length !== EXPECTED_ROUND_COUNT) {
+    fail(
+      `official catalog has ${rows.length} rounds, expected ${EXPECTED_ROUND_COUNT}`
+    );
+  }
+  const regionBySourceName = new Map(
+    REGIONS.map(region => [region.sourceName, region])
+  );
+  const grouped = new Map();
+  const gameIds = new Set();
+  const webGameIds = new Set();
+  for (const row of rows) {
+    const region = regionBySourceName.get(row.region);
+    if (!region) fail(`catalog has unsupported region ${String(row.region)}`);
+    const matchNumber = nonNegativeInteger(
+      row.matchNumber,
+      `${row.region} match number`
+    );
+    if (matchNumber <= 0)
+      fail(`${row.region} has non-positive match number ${matchNumber}`);
+    const roundNumber = nonNegativeInteger(
+      row.roundNumber,
+      `${row.region} M${matchNumber} round number`
+    );
+    if (roundNumber <= 0)
+      fail(`${row.region} M${matchNumber} has non-positive round number`);
+    const gameId = nonNegativeInteger(
+      row.gameId,
+      `${row.region} M${matchNumber} game_id`
+    );
+    const webGameId = nonNegativeInteger(
+      row.webGameId,
+      `${row.region} M${matchNumber} web_game_id`
+    );
+    if (gameIds.has(gameId) || webGameIds.has(webGameId)) {
+      fail(`${row.region} M${matchNumber} duplicates a game identifier`);
+    }
+    gameIds.add(gameId);
+    webGameIds.add(webGameId);
+    for (const [field, value] of Object.entries({
+      schedule: row.schedule,
+      redSchool: row.redSchool,
+      blueSchool: row.blueSchool,
+      winner: row.winner,
+      startedLocal: row.startedLocal,
+    })) {
+      if (typeof value !== 'string' || value.length === 0) {
+        fail(`${row.region} M${matchNumber} has invalid ${field}`);
+      }
+    }
+    row.durationSeconds = nonNegativeInteger(
+      row.durationSeconds,
+      `${row.region} M${matchNumber} round duration`
+    );
+    const key = `${region.key}:${matchNumber}`;
+    const group = grouped.get(key) ?? { region, matchNumber, rows: [] };
+    group.rows.push({ ...row, gameId, webGameId, roundNumber });
+    grouped.set(key, group);
+  }
+
+  const configs = [];
+  for (const region of REGIONS) {
+    const regionGroups = [...grouped.values()]
+      .filter(group => group.region === region)
+      .sort((left, right) => left.matchNumber - right.matchNumber);
+    if (regionGroups.length !== region.expectedMatches) {
+      fail(
+        `${region.sourceName} has ${regionGroups.length} matches, expected ${region.expectedMatches}`
+      );
+    }
+    let roundCount = 0;
+    for (let index = 0; index < regionGroups.length; index += 1) {
+      const group = regionGroups[index];
+      const expectedMatchNumber = index + 1;
+      if (group.matchNumber !== expectedMatchNumber) {
+        fail(
+          `${region.sourceName} match sequence jumps ${expectedMatchNumber}->${group.matchNumber}`
+        );
+      }
+      const first = group.rows[0];
+      for (let roundIndex = 0; roundIndex < group.rows.length; roundIndex += 1) {
+        const row = group.rows[roundIndex];
+        if (
+          row.roundNumber !== roundIndex + 1 ||
+          row.region !== region.sourceName ||
+          row.matchNumber !== group.matchNumber ||
+          row.schedule !== first.schedule ||
+          row.redSchool !== first.redSchool ||
+          row.blueSchool !== first.blueSchool
+        ) {
+          fail(
+            `${region.sourceName} M${group.matchNumber} round ${roundIndex + 1} identity drifted`
+          );
+        }
+      }
+      roundCount += group.rows.length;
+      const padded = paddedMatchNumber(group.matchNumber);
+      configs.push({
+        key: `rmuc2026-${region.key}-m${padded}`,
+        regionKey: region.key,
+        region: region.sourceName,
+        regionLabel: region.label,
+        matchNumber: group.matchNumber,
+        schedule: first.schedule,
+        redSchool: first.redSchool,
+        blueSchool: first.blueSchool,
+        gameIds: group.rows.map(row => row.gameId),
+        webGameIds: group.rows.map(row => row.webGameId),
+        rounds: group.rows.map(row => ({
+          roundNumber: row.roundNumber,
+          gameId: row.gameId,
+          webGameId: row.webGameId,
+          winner: row.winner,
+          startedLocal: row.startedLocal,
+          durationSeconds: row.durationSeconds,
+        })),
+        roundCount: group.rows.length,
+        output: `${region.key}/m${padded}.json.gzip`,
+        label: `RMUC2026 ${region.label} M${padded} · ${first.redSchool} vs ${first.blueSchool} · 推断弹量`,
+        rulesEffective: region.rulesEffective,
+      });
+    }
+    if (roundCount !== region.expectedRounds) {
+      fail(
+        `${region.sourceName} has ${roundCount} rounds, expected ${region.expectedRounds}`
+      );
+    }
+  }
+  if (configs.length !== EXPECTED_SERIES_COUNT) {
+    fail(
+      `official catalog has ${configs.length} series, expected ${EXPECTED_SERIES_COUNT}`
+    );
+  }
+  return configs;
+}
+
+function replayCatalog(configs, databaseSha256) {
+  for (const config of configs) {
+    if (
+      !config.asset ||
+      !Number.isSafeInteger(config.asset.frames) ||
+      !Number.isSafeInteger(config.asset.durationMs) ||
+      !Number.isSafeInteger(config.asset.bytes) ||
+      !/^[0-9a-f]{64}$/.test(config.asset.sha256)
+    ) {
+      fail(`${config.key} has invalid generated asset metadata`);
+    }
+  }
+  return {
+    schema: CATALOG_SCHEMA,
+    databaseSha256,
+    competition: {
+      key: 'rmuc2026',
+      label: 'RMUC2026',
+      mapKey: 'rmuc2026',
+      mapLabel: 'RMUC2026',
+    },
+    seriesCount: configs.length,
+    roundCount: configs.reduce((sum, config) => sum + config.roundCount, 0),
+    regions: REGIONS.map(region => ({
+      key: region.key,
+      label: region.label,
+      replays: configs
+        .filter(config => config.regionKey === region.key)
+        .map(config => ({
+          key: config.key,
+          label: config.label,
+          assetPath: `replays/rmuc2026-regionals/${config.output}`,
+          encoding: 'gzip',
+          regionKey: config.regionKey,
+          regionLabel: config.regionLabel,
+          matchNumber: config.matchNumber,
+          roundCount: config.roundCount,
+          redSchool: config.redSchool,
+          blueSchool: config.blueSchool,
+          frameCount: config.asset.frames,
+          durationMs: config.asset.durationMs,
+          compressedBytes: config.asset.bytes,
+          sha256: config.asset.sha256,
+        })),
+    })),
+  };
+}
+
+async function writeCatalog(configs, databaseSha256, catalogPath) {
+  const catalog = replayCatalog(configs, databaseSha256);
+  const temporary = `${catalogPath}.${process.pid}.tmp`;
+  await fs.mkdir(dirname(catalogPath), { recursive: true });
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(catalog, null, 2)}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+    });
+    await fs.rm(catalogPath, { force: true });
+    await fs.rename(temporary, catalogPath);
+  } catch (error) {
+    await fs.rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+async function readGeneratedCatalog(catalogPath) {
+  if (!existsSync(catalogPath) || !statSync(catalogPath).isFile()) {
+    fail(`generated replay catalog does not exist: ${catalogPath}`);
+  }
+  let catalog;
+  try {
+    catalog = JSON.parse(await fs.readFile(catalogPath, 'utf8'));
+  } catch (error) {
+    fail(`generated replay catalog is invalid JSON: ${error.message}`);
+  }
+  if (
+    !catalog ||
+    typeof catalog !== 'object' ||
+    Array.isArray(catalog) ||
+    catalog.schema !== CATALOG_SCHEMA ||
+    catalog.databaseSha256 !== EXPECTED_DATABASE_SHA256 ||
+    catalog.competition?.key !== 'rmuc2026' ||
+    catalog.competition?.mapKey !== 'rmuc2026' ||
+    catalog.seriesCount !== EXPECTED_SERIES_COUNT ||
+    catalog.roundCount !== EXPECTED_ROUND_COUNT ||
+    !Array.isArray(catalog.regions) ||
+    catalog.regions.length !== REGIONS.length
+  ) {
+    fail(`generated replay catalog header drifted: ${catalogPath}`);
+  }
+  const descriptors = [];
+  const seenKeys = new Set();
+  const seenPaths = new Set();
+  let roundCount = 0;
+  for (let regionIndex = 0; regionIndex < REGIONS.length; regionIndex += 1) {
+    const expectedRegion = REGIONS[regionIndex];
+    const region = catalog.regions[regionIndex];
+    if (
+      !region ||
+      region.key !== expectedRegion.key ||
+      region.label !== expectedRegion.label ||
+      !Array.isArray(region.replays) ||
+      region.replays.length !== expectedRegion.expectedMatches
+    ) {
+      fail(`${catalogPath} region ${expectedRegion.key} drifted`);
+    }
+    for (let index = 0; index < region.replays.length; index += 1) {
+      const descriptor = region.replays[index];
+      const expectedMatchNumber = index + 1;
+      const expectedPath = `replays/rmuc2026-regionals/${expectedRegion.key}/m${paddedMatchNumber(expectedMatchNumber)}.json.gzip`;
+      if (
+        !descriptor ||
+        typeof descriptor !== 'object' ||
+        Array.isArray(descriptor) ||
+        typeof descriptor.key !== 'string' ||
+        typeof descriptor.label !== 'string' ||
+        descriptor.assetPath !== expectedPath ||
+        descriptor.encoding !== 'gzip' ||
+        descriptor.regionKey !== expectedRegion.key ||
+        descriptor.regionLabel !== expectedRegion.label ||
+        descriptor.matchNumber !== expectedMatchNumber ||
+        !Number.isSafeInteger(descriptor.roundCount) ||
+        descriptor.roundCount < 2 ||
+        descriptor.roundCount > 4 ||
+        typeof descriptor.redSchool !== 'string' ||
+        descriptor.redSchool.length === 0 ||
+        typeof descriptor.blueSchool !== 'string' ||
+        descriptor.blueSchool.length === 0 ||
+        !Number.isSafeInteger(descriptor.frameCount) ||
+        descriptor.frameCount <= 0 ||
+        !Number.isSafeInteger(descriptor.durationMs) ||
+        descriptor.durationMs !== descriptor.frameCount * FRAME_MS ||
+        !Number.isSafeInteger(descriptor.compressedBytes) ||
+        descriptor.compressedBytes <= 0 ||
+        typeof descriptor.sha256 !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(descriptor.sha256) ||
+        seenKeys.has(descriptor.key) ||
+        seenPaths.has(descriptor.assetPath)
+      ) {
+        fail(
+          `${catalogPath} ${expectedRegion.key} M${expectedMatchNumber} descriptor drifted`
+        );
+      }
+      seenKeys.add(descriptor.key);
+      seenPaths.add(descriptor.assetPath);
+      roundCount += descriptor.roundCount;
+      descriptors.push(descriptor);
+    }
+  }
+  if (
+    descriptors.length !== EXPECTED_SERIES_COUNT ||
+    roundCount !== EXPECTED_ROUND_COUNT
+  ) {
+    fail(`${catalogPath} descriptor totals drifted`);
+  }
+  return { catalog, descriptors };
 }
 
 function loadRound(database, match) {
@@ -657,6 +1041,12 @@ function loadRound(database, match) {
   const groups = [...groupsBySecond.values()].sort(
     (left, right) => left.second - right.second
   );
+  const deployedRobotIds = [
+    ...new Set(groups.flatMap(group => group.robots.map(state => state.robotId))),
+  ].sort((left, right) => left - right);
+  if (deployedRobotIds.length === 0)
+    fail(`game ${match.gameId} has no deployed robots`);
+  const missingRobotSamples = [];
   let previousSecond = 0;
   for (const group of groups) {
     if (group.second !== previousSecond + 1) {
@@ -666,20 +1056,9 @@ function loadRound(database, match) {
     }
     previousSecond = group.second;
     const actualRobots = new Set(group.robots.map(state => state.robotId));
-    for (const robotId of ROBOT_IDS) {
-      const allMissing = KNOWN_ALL_MISSING.has(`${match.gameId}:${robotId}`);
-      const pointMissing = KNOWN_POINT_MISSING.has(
-        `${match.gameId}:${robotId}:${group.second}`
-      );
-      if (!allMissing && !pointMissing && !actualRobots.has(robotId)) {
-        fail(
-          `game ${match.gameId} second ${group.second} unexpectedly misses robot ${robotId}`
-        );
-      }
-      if ((allMissing || pointMissing) && actualRobots.has(robotId)) {
-        fail(
-          `game ${match.gameId} second ${group.second} known gap robot ${robotId} is no longer missing`
-        );
+    for (const robotId of deployedRobotIds) {
+      if (!actualRobots.has(robotId)) {
+        missingRobotSamples.push({ robotId, second: group.second });
       }
     }
     const buildings = new Set(group.buildings.map(state => state.robotId));
@@ -699,6 +1078,20 @@ function loadRound(database, match) {
     fail(
       `game ${match.gameId} sample range ${groups[0].second}..${groups.at(-1).second} does not match duration ${match.durationSeconds}`
     );
+  }
+
+  for (const robotId of deployedRobotIds) {
+    const states = groups.flatMap(group =>
+      group.robots.filter(state => state.robotId === robotId)
+    );
+    if (
+      states[0]?.second !== 1 ||
+      states.at(-1)?.second !== sampleMaxSecond
+    ) {
+      fail(
+        `game ${match.gameId} robot ${robotId} coverage ${states[0]?.second}..${states.at(-1)?.second} does not span 1..${sampleMaxSecond}`
+      );
+    }
   }
 
   const events = database
@@ -764,6 +1157,7 @@ function loadRound(database, match) {
     byRobot: buildRobotSeries(match.gameId, groups),
     groupBySecond: new Map(groups.map(group => [group.second, group])),
     sampleMaxSecond,
+    missingRobotSamples,
   };
 }
 
@@ -820,6 +1214,7 @@ function loadSeries(database, config) {
       赛程 AS schedule,
       局号 AS roundNumber,
       game_id AS gameId,
+      web_game_id AS webGameId,
       红方学校 AS redSchool,
       蓝方学校 AS blueSchool,
       胜方 AS winner,
@@ -838,6 +1233,7 @@ function loadSeries(database, config) {
     if (
       row.roundNumber !== index + 1 ||
       row.gameId !== config.gameIds[index] ||
+      row.webGameId !== config.webGameIds[index] ||
       row.redSchool !== config.redSchool ||
       row.blueSchool !== config.blueSchool
     ) {
@@ -945,8 +1341,10 @@ function projectRoundEconomy(round) {
   const audit = {
     teamSpend: 0,
     paidSupport: 0,
+    unclassifiedRemainder: 0,
     purchaseRevive: { count: 0, coins: 0 },
     confirmedRemoteRepair: { count: 0, coins: 0 },
+    ambiguousRemoteRepair: { groups: 0, candidates: 0, requiredCoins: 0 },
     ambiguous: 0,
   };
 
@@ -965,20 +1363,24 @@ function projectRoundEconomy(round) {
         previousTotal == null
           ? cumulativeSpend
           : cumulativeSpend - previousCumulativeSpend;
-      const paidSupport = spend % 10;
-      if (![0, 1, 2].includes(paidSupport)) {
+      const remainder = spend % 10;
+      if (![0, 1, 2, 5, 8].includes(remainder)) {
         fail(
-          `${pointContext} unsupported paid-support remainder ${paidSupport}`
+          `${pointContext} unsupported non-ammo remainder ${remainder}`
         );
       }
+      const paidSupport = remainder === 1 || remainder === 2 ? remainder : 0;
+      const unclassifiedRemainder =
+        remainder === 5 || remainder === 8 ? remainder : 0;
       buckets.set(economyBucketKey(teamId, group.second), {
         teamId,
         second: group.second,
         spend,
-        unassigned: spend - paidSupport,
+        unassigned: spend - remainder,
       });
       audit.teamSpend += spend;
       audit.paidSupport += paidSupport;
+      audit.unclassifiedRemainder += unclassifiedRemainder;
       previousTotal = coins.total;
       previousCumulativeSpend = cumulativeSpend;
     }
@@ -994,14 +1396,15 @@ function projectRoundEconomy(round) {
         fail(`${context} robot ${robotId} revive crosses a source gap`);
       }
       const restoredRatio = current.hp / current.hpMax;
-      if (restoredRatio <= 0.2) continue;
-      if (restoredRatio < 0.8) {
+      if (restoredRatio <= 0.25) continue;
+      if (restoredRatio < 0.9) {
         fail(
           `${context} robot ${robotId} second ${current.second} ambiguous revive ratio ${restoredRatio}`
         );
       }
       const price =
-        Math.ceil((current.second - 1) / 60) * 80 + officialLevel(current) * 20;
+        Math.ceil((current.second - 1) / 60) * 80 +
+        officialLevel(previous) * 20;
       const bucket = buckets.get(
         economyBucketKey(teamIdForRobot(robotId), current.second)
       );
@@ -1060,7 +1463,10 @@ function projectRoundEconomy(round) {
       0
     );
     if (!bucket || bucket.unassigned < required) {
-      fail(`${context} remote repairs ${required} exceed spend bucket ${key}`);
+      audit.ambiguousRemoteRepair.groups += 1;
+      audit.ambiguousRemoteRepair.candidates += candidates.length;
+      audit.ambiguousRemoteRepair.requiredCoins += required;
+      continue;
     }
     bucket.unassigned -= required;
     confirmedRemoteRepairs.push(...candidates);
@@ -1107,6 +1513,7 @@ function projectRoundEconomy(round) {
   }
   const classified =
     audit.paidSupport +
+    audit.unclassifiedRemainder +
     audit.purchaseRevive.coins +
     audit.confirmedRemoteRepair.coins +
     audit.ambiguous;
@@ -1475,6 +1882,7 @@ function projectRoundBuffs(round) {
     bigRuneMissingRecipientGroups: 0,
     assemblyLevels: { 1: 0, 2: 0, 3: 0, 4: 0 },
     terrainOverlaps: 0,
+    terrainEventsForDefeated: 0,
     dartBuffCounterEvents: 0,
   };
 
@@ -1571,8 +1979,10 @@ function projectRoundBuffs(round) {
           );
         }
         const state = stateByEntity.get(event.robotId);
-        if (hpAt(round, event.robotId, second) <= 0)
-          fail(`${context} terrain buff targets defeated robot`);
+        if (hpAt(round, event.robotId, second) <= 0) {
+          audit.terrainEventsForDefeated += 1;
+          continue;
+        }
         const duration =
           event.category === '台阶跨越'
             ? 5
@@ -1753,6 +2163,17 @@ function robotAttributesAt(preparedRound, robotId, localMs) {
   const teamNumber = teamNumberForRobot(robotId);
   const caliber = gunCaliberForTeamNumber(teamNumber);
   const classId = classForTeamNumber(teamNumber);
+  const health = interpolateHealth(left, right, alpha);
+  const leftHeat = caliber === 42 ? left.heat42 : left.heat17;
+  const rightHeat = caliber === 42 ? right.heat42 : right.heat17;
+  const leftHeatMax = caliber === 42 ? left.heat42Max : left.heat17Max;
+  const rightHeatMax = caliber === 42 ? right.heat42Max : right.heat17Max;
+  const firingHeat = interpolateAnchoredValue(
+    leftHeat,
+    rightHeat,
+    alpha,
+    leftHeatMax !== rightHeatMax || (left.hp <= 0 && right.hp > 0)
+  );
   const stepSecond = Math.max(
     1,
     Math.min(preparedRound.round.sampleMaxSecond, Math.floor(targetSecond))
@@ -1779,10 +2200,10 @@ function robotAttributesAt(preparedRound, robotId, localMs) {
         )
       : left.reviveProgress;
   const attributes = {
-    [A.Health]: left.hp,
+    [A.Health]: health,
     [A.ReviveCount]: left.reviveCount,
     [A.PurchaseReviveCount]: left.purchaseReviveCount,
-    [A.FiringHeat1]: caliber === 42 ? left.heat42 : left.heat17,
+    [A.FiringHeat1]: firingHeat,
     [A.FiringHeat2]: 0,
     [A.ReviveProgress]: deadProgress,
     [A.ReviveSpeed]: left.hp <= 0 ? 1 : 0,
@@ -1815,7 +2236,7 @@ function robotAttributesAt(preparedRound, robotId, localMs) {
     [A.DartCounterBuffSuspended]: buffs.suspended,
     [A.HPMainColorSwitch]: buffs.hpColorSwitch,
     [A.HPSideColorSwitch]: buffs.hpColorSwitch,
-    [A.HPProgress]: roundNumber(left.hp / left.hpMax, 6),
+    [A.HPProgress]: roundNumber(health / left.hpMax, 6),
     [A.Class]: classId,
     [A.Level]: officialLevel(left),
     [A.HealthMax]: left.hpMax,
@@ -1973,23 +2394,40 @@ function structureAttributesAt(
   localMs,
   rotationState
 ) {
+  const targetSecond = Math.max(
+    1,
+    Math.min(
+      preparedRound.round.sampleMaxSecond,
+      1 + localMs / 1000
+    )
+  );
   const sampleSecond = Math.max(
     1,
     Math.min(
       preparedRound.round.sampleMaxSecond,
-      Math.floor(1 + localMs / 1000)
+      Math.floor(targetSecond)
     )
   );
+  const nextSecond = Math.min(
+    preparedRound.round.sampleMaxSecond,
+    Math.ceil(targetSecond)
+  );
   const group = preparedRound.round.groupBySecond.get(sampleSecond);
-  if (!group)
+  const nextGroup = preparedRound.round.groupBySecond.get(nextSecond);
+  if (!group || !nextGroup)
     fail(
-      `game ${preparedRound.round.match.gameId} misses second ${sampleSecond}`
+      `game ${preparedRound.round.match.gameId} misses building interpolation seconds ${sampleSecond}/${nextSecond}`
     );
   const state = group.buildings.find(item => item.robotId === buildingId);
-  if (!state)
+  const nextState = nextGroup.buildings.find(
+    item => item.robotId === buildingId
+  );
+  if (!state || !nextState)
     fail(
       `game ${preparedRound.round.match.gameId} misses building ${buildingId}`
     );
+  const alpha = nextSecond === sampleSecond ? 0 : targetSecond - sampleSecond;
+  const health = interpolateHealth(state, nextState, alpha);
   const definition = STRUCTURES[buildingId];
   const buffs = preparedRound.buffs.framesBySecond
     .get(sampleSecond)
@@ -2008,7 +2446,7 @@ function structureAttributesAt(
     sampleSecond
   );
   const attributes = {
-    [A.Health]: state.hp,
+    [A.Health]: health,
     [A.TeamID]: definition.teamId,
     [A.TeamNumber]: definition.kind === 'base' ? 8 : 9,
     [A.WorldPosX]: definition.x,
@@ -2019,7 +2457,7 @@ function structureAttributesAt(
     [A.Defeated]: state.hp <= 0 ? 1 : 0,
     [A.HPMainColorSwitch]: buffs.hpColorSwitch,
     [A.HPSideColorSwitch]: buffs.hpColorSwitch,
-    [A.HPProgress]: roundNumber(state.hp / state.hpMax, 6),
+    [A.HPProgress]: roundNumber(health / state.hpMax, 6),
     [A.Class]: definition.classId,
     [A.HealthMax]: state.hpMax,
     [A.AttackMultiplierThou]: buffs.attack,
@@ -2234,8 +2672,10 @@ function economyMetadata(economy) {
   return {
     teamSpend: economy.audit.teamSpend,
     paidSupport: economy.audit.paidSupport,
+    unclassifiedRemainder: economy.audit.unclassifiedRemainder,
     purchaseRevive: economy.audit.purchaseRevive,
     confirmedRemoteRepair: economy.audit.confirmedRemoteRepair,
+    ambiguousRemoteRepair: economy.audit.ambiguousRemoteRepair,
     ambiguous: economy.audit.ambiguous,
   };
 }
@@ -2259,6 +2699,7 @@ function replayEnvelope(preparedSeries, databaseSha256) {
   const roundMetadata = preparedSeries.preparedRounds.map(prepared => ({
     roundNumber: prepared.round.match.roundNumber,
     gameId: prepared.round.match.gameId,
+    webGameId: prepared.round.match.webGameId,
     winner: prepared.round.match.winner,
     startedLocal: prepared.round.match.startedLocal,
     durationSeconds: prepared.round.match.durationSeconds,
@@ -2267,6 +2708,7 @@ function replayEnvelope(preparedSeries, databaseSha256) {
     robotIds: [...prepared.round.byRobot.keys()].sort(
       (left, right) => left - right
     ),
+    missingRobotSamples: prepared.round.missingRobotSamples,
     economy: economyMetadata(prepared.economy),
     ammo: prepared.ammo.audit,
     buffs: prepared.buffs.audit,
@@ -2312,7 +2754,18 @@ function replayEnvelope(preparedSeries, databaseSha256) {
         'inferred by central-difference trajectory direction; holds below 0.12 m displacement',
       shots:
         'official cumulative deltas distributed at rank (shotIndex+1)/(delta+1); ammo drops on the same 100ms frame',
-      heldFields: ['health', 'healthMax', 'level', 'coins', 'buff state'],
+      continuousFields: [
+        'health (except revive and max-change intervals)',
+        'firing heat (except revive and max-change intervals)',
+      ],
+      heldFields: [
+        'healthMax',
+        'firingHeatMax',
+        'defeated',
+        'level',
+        'coins',
+        'buff state',
+      ],
       physics: 'none',
     },
     inference: {
@@ -2367,12 +2820,10 @@ async function writeReplay(preparedSeries, databaseSha256, outputPath) {
   const envelope = replayEnvelope(preparedSeries, databaseSha256);
   const temporary = `${outputPath}.${process.pid}.tmp`;
   await fs.mkdir(dirname(outputPath), { recursive: true });
-  const stream = createWriteStream(temporary, {
-    encoding: 'utf8',
-    flags: 'wx',
-  });
+  const stream = createGzip({ level: 9 });
+  const destination = createWriteStream(temporary, { flags: 'wx' });
+  const completed = pipeline(stream, destination);
   try {
-    await once(stream, 'open');
     const prefix = JSON.stringify(envelope);
     await writeChunk(stream, `${prefix.slice(0, -1)},"frames":[`);
     let count = 0;
@@ -2388,10 +2839,12 @@ async function writeReplay(preparedSeries, databaseSha256, outputPath) {
     }
     await writeChunk(stream, ']}\n');
     stream.end();
-    await once(stream, 'finish');
+    await completed;
+    await fs.rm(outputPath, { force: true });
     await fs.rename(temporary, outputPath);
   } catch (error) {
     stream.destroy();
+    destination.destroy();
     await fs.rm(temporary, { force: true });
     throw error;
   }
@@ -2556,7 +3009,55 @@ function validateRoundAmmoMetadata(round, context) {
   }
 }
 
-function validateReplayObject(value, path) {
+function validateReplayIdentity(value, path, expected) {
+  if (expected == null) return;
+  const expectedRegion =
+    typeof expected.region === 'string'
+      ? expected.region
+      : REGIONS.find(region => region.key === expected.regionKey)?.sourceName;
+  if (expectedRegion == null)
+    fail(`${path} expected replay region is invalid`);
+  if (
+    value.source?.competition !== 'RMUC2026' ||
+    value.source?.region !== expectedRegion ||
+    value.source?.officialMatchNumber !== expected.matchNumber ||
+    value.source?.label !== expected.label ||
+    value.source?.teams?.red !== expected.redSchool ||
+    value.source?.teams?.blue !== expected.blueSchool
+  ) {
+    fail(`${path} replay identity does not match its catalog entry`);
+  }
+  const rounds = value.source?.rounds;
+  if (!Array.isArray(rounds) || rounds.length !== expected.roundCount) {
+    fail(`${path} replay round count does not match its catalog entry`);
+  }
+  if (!Array.isArray(expected.rounds)) return;
+  let expectedStartMs = 0;
+  for (let index = 0; index < expected.rounds.length; index += 1) {
+    const actual = rounds[index];
+    const identity = expected.rounds[index];
+    const expectedEndMs =
+      expectedStartMs + identity.durationSeconds * 1000;
+    if (
+      actual?.roundNumber !== identity.roundNumber ||
+      actual?.gameId !== identity.gameId ||
+      actual?.webGameId !== identity.webGameId ||
+      actual?.winner !== identity.winner ||
+      actual?.startedLocal !== identity.startedLocal ||
+      actual?.durationSeconds !== identity.durationSeconds ||
+      actual?.startMs !== expectedStartMs ||
+      actual?.endMs !== expectedEndMs
+    ) {
+      fail(`${path} round ${index + 1} identity or timing drifted`);
+    }
+    expectedStartMs = expectedEndMs + ROUND_GAP_MS;
+  }
+  if (value.durationMs !== expectedStartMs) {
+    fail(`${path} duration does not match its official round timings`);
+  }
+}
+
+function validateReplayObject(value, path, expected = null) {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     fail(`${path} root is not an object`);
   if (value.schema !== REPLAY_SCHEMA)
@@ -2576,10 +3077,23 @@ function validateReplayObject(value, path) {
   }
   if (value.source?.license !== 'CC BY-NC-SA 4.0')
     fail(`${path} source license is missing`);
+  validateReplayIdentity(value, path, expected);
   if (value.inference?.ammo?.schema !== AMMO_INFERENCE_SCHEMA)
     fail(`${path} ammo inference schema is missing`);
   if (value.inference?.buffs?.schema !== BUFF_PROJECTION_SCHEMA)
     fail(`${path} buff inference schema is missing`);
+  if (
+    value.interpolation?.sourceCadenceHz !== 1 ||
+    value.interpolation?.outputCadenceHz !== 10 ||
+    value.interpolation?.frameMs !== FRAME_MS ||
+    JSON.stringify(value.interpolation?.continuousFields) !==
+      JSON.stringify([
+        'health (except revive and max-change intervals)',
+        'firing heat (except revive and max-change intervals)',
+      ])
+  ) {
+    fail(`${path} interpolation contract drifted`);
+  }
   if (
     JSON.stringify(value.inference?.buffs?.values) !==
     JSON.stringify(BUFF_RULE_VALUES)
@@ -2654,6 +3168,20 @@ function validateReplayObject(value, path) {
           fail(
             `${path} frame ${index} has invalid launch allowance ${attributeValue}`
           );
+        }
+        if (
+          (numericId === A.Health || numericId === A.FiringHeat1) &&
+          attributeValue < 0
+        ) {
+          fail(
+            `${path} frame ${index} has negative continuous state ${numericId}=${attributeValue}`
+          );
+        }
+        if (
+          numericId === A.HPProgress &&
+          (attributeValue < 0 || attributeValue > 1)
+        ) {
+          fail(`${path} frame ${index} has invalid HP progress ${attributeValue}`);
         }
         if (
           numericId === A.DefenseMultiplierThou &&
@@ -2856,13 +3384,23 @@ function validateReplayObject(value, path) {
     fail(`${path} omits the official vulnerability boolean trajectory`);
 }
 
-async function validateReplayFile(path) {
+async function validateReplayFile(path, expected = null) {
   if (!existsSync(path) || !statSync(path).isFile())
     fail(`replay asset does not exist: ${path}`);
-  const parsed = JSON.parse(await fs.readFile(path, 'utf8'));
-  validateReplayObject(parsed, path);
+  if (!path.endsWith('.json.gzip'))
+    fail(`replay asset must be gzip JSON: ${path}`);
+  const compressed = await fs.readFile(path);
+  let decoded;
+  try {
+    decoded = await gunzipAsync(compressed);
+  } catch (error) {
+    fail(`${path} is not valid gzip: ${error.message}`);
+  }
+  const parsed = JSON.parse(decoded.toString('utf8'));
+  validateReplayObject(parsed, path, expected);
   return {
     bytes: statSync(path).size,
+    sha256: await sha256File(path),
     frames: parsed.frameCount,
     durationMs: parsed.durationMs,
   };
@@ -2873,82 +3411,103 @@ function addNestedCounts(target, source) {
     target[key] = (target[key] ?? 0) + value;
 }
 
-function validateDatasetAudit(preparedSeries) {
-  const audit = {
+function createDatasetAudit() {
+  return {
     buffCategories: {},
     smallRuneCompletions: 0,
     bigRuneCompletions: 0,
+    bigRuneTiers: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
     bigRuneCrossTeamRows: 0,
     bigRuneMissingRecipientGroups: 0,
     assemblyLevels: { 1: 0, 2: 0, 3: 0, 4: 0 },
     vulnerableRobotSamples: 0,
     robotSamples: 0,
+    robotSeries: 0,
+    missingRobotSamples: 0,
     terrainOverlaps: 0,
+    terrainEventsForDefeated: 0,
     dartBuffCounterEvents: 0,
     economy: {
       teamSpend: 0,
       paidSupport: 0,
+      unclassifiedRemainder: 0,
       purchaseReviveCount: 0,
       purchaseReviveCoins: 0,
       confirmedRemoteRepairCount: 0,
       confirmedRemoteRepairCoins: 0,
+      ambiguousRemoteRepairGroups: 0,
+      ambiguousRemoteRepairCandidates: 0,
+      ambiguousRemoteRepairRequiredCoins: 0,
       ambiguous: 0,
     },
   };
-  for (const series of preparedSeries) {
-    for (const prepared of series.preparedRounds) {
-      for (const group of prepared.round.groups) {
-        audit.robotSamples += group.robots.length;
-        audit.vulnerableRobotSamples += group.robots.filter(
-          state => state.vulnerable === 1
-        ).length;
-      }
-      for (const event of prepared.round.events) {
-        if (
-          event.type === '增益' &&
-          event.category in EXPECTED_AUDIT.buffCategories
-        ) {
-          audit.buffCategories[event.category] =
-            (audit.buffCategories[event.category] ?? 0) + 1;
-        }
-      }
-      const buffs = prepared.buffs.audit;
-      audit.smallRuneCompletions += buffs.smallRuneCompletions;
-      audit.bigRuneCompletions += buffs.bigRuneCompletions;
-      audit.bigRuneCrossTeamRows += buffs.bigRuneCrossTeamRows;
-      audit.bigRuneMissingRecipientGroups +=
-        buffs.bigRuneMissingRecipientGroups;
-      addNestedCounts(audit.assemblyLevels, buffs.assemblyLevels);
-      audit.terrainOverlaps += buffs.terrainOverlaps;
-      audit.dartBuffCounterEvents += buffs.dartBuffCounterEvents;
+}
+
+function addSeriesToDatasetAudit(audit, series) {
+  for (const prepared of series.preparedRounds) {
+    audit.robotSeries += prepared.round.byRobot.size;
+    audit.missingRobotSamples += prepared.round.missingRobotSamples.length;
+    for (const group of prepared.round.groups) {
+      audit.robotSamples += group.robots.length;
+      audit.vulnerableRobotSamples += group.robots.filter(
+        state => state.vulnerable === 1
+      ).length;
+    }
+    for (const event of prepared.round.events) {
       if (
-        prepared.buffs.bigRunes.some(
-          completion => completion.projection.tier !== 2
-        )
+        event.type === '增益' &&
+        event.category in EXPECTED_SOURCE_AUDIT.buffCategories
       ) {
+        audit.buffCategories[event.category] =
+          (audit.buffCategories[event.category] ?? 0) + 1;
+      }
+    }
+    const buffs = prepared.buffs.audit;
+    audit.smallRuneCompletions += buffs.smallRuneCompletions;
+    audit.bigRuneCompletions += buffs.bigRuneCompletions;
+    for (const completion of prepared.buffs.bigRunes) {
+      const tier = completion.projection.tier;
+      if (!Number.isSafeInteger(tier) || tier < 1 || tier > 5) {
         fail(
-          `game ${prepared.round.match.gameId} has a non-T2 big rune completion`
+          `game ${prepared.round.match.gameId} has invalid big-rune tier ${tier}`
         );
       }
-      const economy = prepared.economy.audit;
-      audit.economy.teamSpend += economy.teamSpend;
-      audit.economy.paidSupport += economy.paidSupport;
-      audit.economy.purchaseReviveCount += economy.purchaseRevive.count;
-      audit.economy.purchaseReviveCoins += economy.purchaseRevive.coins;
-      audit.economy.confirmedRemoteRepairCount +=
-        economy.confirmedRemoteRepair.count;
-      audit.economy.confirmedRemoteRepairCoins +=
-        economy.confirmedRemoteRepair.coins;
-      audit.economy.ambiguous += economy.ambiguous;
+      audit.bigRuneTiers[tier] += 1;
     }
+    audit.bigRuneCrossTeamRows += buffs.bigRuneCrossTeamRows;
+    audit.bigRuneMissingRecipientGroups += buffs.bigRuneMissingRecipientGroups;
+    addNestedCounts(audit.assemblyLevels, buffs.assemblyLevels);
+    audit.terrainOverlaps += buffs.terrainOverlaps;
+    audit.terrainEventsForDefeated += buffs.terrainEventsForDefeated;
+    audit.dartBuffCounterEvents += buffs.dartBuffCounterEvents;
+    const economy = prepared.economy.audit;
+    audit.economy.teamSpend += economy.teamSpend;
+    audit.economy.paidSupport += economy.paidSupport;
+    audit.economy.unclassifiedRemainder += economy.unclassifiedRemainder;
+    audit.economy.purchaseReviveCount += economy.purchaseRevive.count;
+    audit.economy.purchaseReviveCoins += economy.purchaseRevive.coins;
+    audit.economy.confirmedRemoteRepairCount +=
+      economy.confirmedRemoteRepair.count;
+    audit.economy.confirmedRemoteRepairCoins +=
+      economy.confirmedRemoteRepair.coins;
+    audit.economy.ambiguousRemoteRepairGroups +=
+      economy.ambiguousRemoteRepair.groups;
+    audit.economy.ambiguousRemoteRepairCandidates +=
+      economy.ambiguousRemoteRepair.candidates;
+    audit.economy.ambiguousRemoteRepairRequiredCoins +=
+      economy.ambiguousRemoteRepair.requiredCoins;
+    audit.economy.ambiguous += economy.ambiguous;
   }
-  for (const [key, expected] of Object.entries(EXPECTED_AUDIT)) {
+}
+
+function validateDatasetAudit(audit) {
+  for (const [key, expected] of Object.entries(EXPECTED_SOURCE_AUDIT)) {
     if (key === 'buffCategories' || key === 'assemblyLevels') continue;
     if (audit[key] !== expected)
       fail(`dataset audit ${key}=${audit[key]}, expected ${expected}`);
   }
   for (const [category, expected] of Object.entries(
-    EXPECTED_AUDIT.buffCategories
+    EXPECTED_SOURCE_AUDIT.buffCategories
   )) {
     if (audit.buffCategories[category] !== expected) {
       fail(
@@ -2957,7 +3516,7 @@ function validateDatasetAudit(preparedSeries) {
     }
   }
   for (const [level, expected] of Object.entries(
-    EXPECTED_AUDIT.assemblyLevels
+    EXPECTED_SOURCE_AUDIT.assemblyLevels
   )) {
     if (audit.assemblyLevels[level] !== expected) {
       fail(
@@ -2965,33 +3524,95 @@ function validateDatasetAudit(preparedSeries) {
       );
     }
   }
-  const expectedEconomy = {
-    teamSpend: 43683,
-    paidSupport: 4413,
-    purchaseReviveCount: 40,
-    purchaseReviveCoins: 20180,
-    confirmedRemoteRepairCount: 5,
-    confirmedRemoteRepairCoins: 750,
-    ambiguous: 18340,
-  };
-  for (const [key, expected] of Object.entries(expectedEconomy)) {
-    if (audit.economy[key] !== expected) {
-      fail(
-        `dataset economy audit ${key}=${audit.economy[key]}, expected ${expected}`
-      );
-    }
+  const classifiedSpend =
+    audit.economy.paidSupport +
+    audit.economy.unclassifiedRemainder +
+    audit.economy.purchaseReviveCoins +
+    audit.economy.confirmedRemoteRepairCoins +
+    audit.economy.ambiguous;
+  if (audit.economy.teamSpend !== classifiedSpend) {
+    fail(
+      `dataset economy audit does not balance ${audit.economy.teamSpend}!=${classifiedSpend}`
+    );
   }
   return audit;
 }
 
+function filterSeries(items, selector, regionSelector = null) {
+  if (regionSelector != null) {
+    const selected = items.filter(item => {
+      if ('regionKey' in item) return item.regionKey === regionSelector;
+      return item.key.startsWith(`rmuc2026-${regionSelector}-`);
+    });
+    const expected = REGIONS.find(region => region.key === regionSelector);
+    if (!expected || selected.length !== expected.expectedMatches) {
+      fail(
+        `--region ${regionSelector} selected ${selected.length} replays, expected ${expected?.expectedMatches}`
+      );
+    }
+    return selected;
+  }
+  if (selector == null) return items;
+  const match = /^(east|south|north):m?(\d{1,3})$/i.exec(selector);
+  if (!match) fail(`--series must use region:MNNN, received ${selector}`);
+  const key = `rmuc2026-${match[1].toLowerCase()}-m${paddedMatchNumber(Number(match[2]))}`;
+  const selected = items.filter(item => item.key === key);
+  if (selected.length !== 1) fail(`--series does not identify one replay: ${key}`);
+  return selected;
+}
+
+async function verifyReplayAssetMetadata(descriptor, outputDir) {
+  const relativePath = descriptor.assetPath.replace(
+    'replays/rmuc2026-regionals/',
+    ''
+  );
+  const path = resolve(outputDir, relativePath);
+  if (!existsSync(path) || !statSync(path).isFile())
+    fail(`replay asset does not exist: ${path}`);
+  const bytes = statSync(path).size;
+  const sha256 = await sha256File(path);
+  if (bytes !== descriptor.compressedBytes || sha256 !== descriptor.sha256) {
+    fail(`${descriptor.key} compressed asset metadata drifted`);
+  }
+  return { path, bytes, sha256 };
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  if (options.validateOnly) {
-    for (const config of SERIES) {
-      const path = resolve(options.outputDir, config.output);
-      const result = await validateReplayFile(path);
+  if (options.validateOnly || options.verifyAssetsOnly) {
+    const { descriptors } = await readGeneratedCatalog(options.catalog);
+    const selected = filterSeries(
+      descriptors,
+      options.series,
+      options.region
+    );
+    for (const descriptor of selected) {
+      if (options.verifyAssetsOnly) {
+        const result = await verifyReplayAssetMetadata(
+          descriptor,
+          options.outputDir
+        );
+        console.log(
+          `verified asset ${descriptor.key}: bytes=${result.bytes} -> ${result.path}`
+        );
+        continue;
+      }
+      const relativePath = descriptor.assetPath.replace(
+        'replays/rmuc2026-regionals/',
+        ''
+      );
+      const path = resolve(options.outputDir, relativePath);
+      const result = await validateReplayFile(path, descriptor);
+      if (
+        result.frames !== descriptor.frameCount ||
+        result.durationMs !== descriptor.durationMs ||
+        result.bytes !== descriptor.compressedBytes ||
+        result.sha256 !== descriptor.sha256
+      ) {
+        fail(`${descriptor.key} does not match generated catalog metadata`);
+      }
       console.log(
-        `validated ${config.key}: frames=${result.frames} bytes=${result.bytes} -> ${path}`
+        `validated ${descriptor.key}: frames=${result.frames} bytes=${result.bytes} -> ${path}`
       );
     }
     return;
@@ -3006,26 +3627,47 @@ async function main() {
     );
   }
   const database = new DatabaseSync(options.database, { readOnly: true });
-  let rawSeries;
   try {
     database.exec('PRAGMA query_only=ON');
     requireTables(database);
-    rawSeries = SERIES.map(config => loadSeries(database, config));
+    const configs = loadSeriesConfigs(database);
+    if (options.catalogOnly) {
+      for (const config of configs) {
+        const path = resolve(options.outputDir, config.output);
+        config.asset = await validateReplayFile(path, config);
+      }
+      await writeCatalog(configs, databaseSha256, options.catalog);
+      console.log(`generated catalog -> ${options.catalog}`);
+      return;
+    }
+    const selected = filterSeries(configs, options.series, options.region);
+    const datasetAudit = createDatasetAudit();
+    for (const config of selected) {
+      const prepared = prepareSeries(loadSeries(database, config));
+      addSeriesToDatasetAudit(datasetAudit, prepared);
+      if (!options.auditOnly) {
+        const path = resolve(options.outputDir, config.output);
+        await writeReplay(prepared, databaseSha256, path);
+        const result = await validateReplayFile(path, config);
+        config.asset = result;
+        console.log(
+          `generated ${config.key}: rounds=${prepared.preparedRounds.length} frames=${result.frames} duration_ms=${result.durationMs} bytes=${result.bytes} -> ${path}`
+        );
+      }
+    }
+    if (options.series == null && options.region == null) {
+      validateDatasetAudit(datasetAudit);
+      if (!options.auditOnly) {
+        await writeCatalog(configs, databaseSha256, options.catalog);
+      }
+      console.log(
+        `dataset audit passed: series=${configs.length} rounds=${EXPECTED_ROUND_COUNT} robot_samples=${datasetAudit.robotSamples} buffs=${Object.values(datasetAudit.buffCategories).reduce((sum, value) => sum + value, 0)} ambiguous_coins=${datasetAudit.economy.ambiguous}`
+      );
+      if (!options.auditOnly)
+        console.log(`generated catalog -> ${options.catalog}`);
+    }
   } finally {
     database.close();
-  }
-  const preparedSeries = rawSeries.map(series => prepareSeries(series));
-  const datasetAudit = validateDatasetAudit(preparedSeries);
-  console.log(
-    `dataset audit passed: robot_samples=${datasetAudit.robotSamples} buffs=${Object.values(datasetAudit.buffCategories).reduce((sum, value) => sum + value, 0)} ambiguous_coins=${datasetAudit.economy.ambiguous}`
-  );
-  for (const series of preparedSeries) {
-    const path = resolve(options.outputDir, series.config.output);
-    await writeReplay(series, databaseSha256, path);
-    const result = await validateReplayFile(path);
-    console.log(
-      `generated ${series.config.key}: rounds=${series.preparedRounds.length} frames=${result.frames} duration_ms=${result.durationMs} bytes=${result.bytes} -> ${path}`
-    );
   }
 }
 

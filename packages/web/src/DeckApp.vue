@@ -46,6 +46,16 @@ interface PacketGroup {
   kind: 'match' | 'packet' | 'folder';
 }
 
+type StaticCatalogMatch = MatchView & {
+  staticReplay: NonNullable<MatchView['staticReplay']>;
+};
+
+interface StaticCatalogGroup {
+  key: string;
+  label: string;
+  matches: StaticCatalogMatch[];
+}
+
 interface LibraryFolder {
   id: string;
   label: string;
@@ -275,8 +285,103 @@ const hooks: MatchHooks = {
   },
 };
 
-const { matches, start, setActiveKeys } = useMatches(processes, hooks, {
+const { matches, start, setActiveKeys, setFocusedKey } = useMatches(processes, hooks, {
   staticReplays: configuredStaticReplays(),
+});
+
+const DECK_REPLAYS_PER_PAGE = 12;
+const staticCatalogMatches = computed<StaticCatalogMatch[]>(() =>
+  matches.value.filter(
+    (match): match is StaticCatalogMatch => match.staticReplay !== undefined
+  )
+);
+const staticCatalogMapGroups = computed<StaticCatalogGroup[]>(() => {
+  const groups = new Map<string, StaticCatalogGroup>();
+  for (const match of staticCatalogMatches.value) {
+    const metadata = match.staticReplay;
+    const group = groups.get(metadata.mapKey) ?? {
+      key: metadata.mapKey,
+      label: metadata.mapLabel,
+      matches: [],
+    };
+    group.matches.push(match);
+    groups.set(group.key, group);
+  }
+  return [...groups.values()];
+});
+const staticCatalogMapKey = ref<string | null>(null);
+const staticCatalogRegionKey = ref<string | null>(null);
+const staticCatalogPage = ref(1);
+
+watch(
+  staticCatalogMapGroups,
+  groups => {
+    if (!groups.some(group => group.key === staticCatalogMapKey.value)) {
+      staticCatalogMapKey.value = groups[0]?.key ?? null;
+    }
+  },
+  { immediate: true }
+);
+
+const selectedStaticCatalogMap = computed(() =>
+  staticCatalogMapGroups.value.find(group => group.key === staticCatalogMapKey.value) ?? null
+);
+const staticCatalogRegionGroups = computed<StaticCatalogGroup[]>(() => {
+  const groups = new Map<string, StaticCatalogGroup>();
+  for (const match of selectedStaticCatalogMap.value?.matches ?? []) {
+    const metadata = match.staticReplay;
+    const group = groups.get(metadata.regionKey) ?? {
+      key: metadata.regionKey,
+      label: metadata.regionLabel,
+      matches: [],
+    };
+    group.matches.push(match);
+    groups.set(group.key, group);
+  }
+  return [...groups.values()].map(group => ({
+    ...group,
+    matches: [...group.matches].sort(
+      (left, right) => left.staticReplay.matchNumber - right.staticReplay.matchNumber
+    ),
+  }));
+});
+
+watch(
+  staticCatalogRegionGroups,
+  groups => {
+    if (!groups.some(group => group.key === staticCatalogRegionKey.value)) {
+      staticCatalogRegionKey.value = groups[0]?.key ?? null;
+    }
+  },
+  { immediate: true }
+);
+
+const selectedStaticCatalogRegion = computed(() =>
+  staticCatalogRegionGroups.value.find(
+    group => group.key === staticCatalogRegionKey.value
+  ) ?? null
+);
+const staticCatalogPageCount = computed(() =>
+  Math.ceil(
+    (selectedStaticCatalogRegion.value?.matches.length ?? 0) /
+      DECK_REPLAYS_PER_PAGE
+  )
+);
+const pagedStaticCatalogMatches = computed(() => {
+  const start = (staticCatalogPage.value - 1) * DECK_REPLAYS_PER_PAGE;
+  return (
+    selectedStaticCatalogRegion.value?.matches.slice(
+      start,
+      start + DECK_REPLAYS_PER_PAGE
+    ) ?? []
+  );
+});
+
+watch([staticCatalogMapKey, staticCatalogRegionKey], () => {
+  staticCatalogPage.value = 1;
+});
+watch(staticCatalogPageCount, count => {
+  if (count > 0 && staticCatalogPage.value > count) staticCatalogPage.value = count;
 });
 
 const assignedFolderByKey = computed(() => {
@@ -292,6 +397,7 @@ const baseFileGroups = computed<PacketGroup[]>(() => {
   const singles: MatchView[] = [];
 
   for (const m of matches.value) {
+    if (m.staticReplay !== undefined) continue;
     if (removedKeys.value.has(m.key)) continue;
     if (m.key.includes('iter-')) {
       const prefix = m.key.replace(/iter-\d+.*$/, 'iter');
@@ -359,9 +465,13 @@ const structures = computed(() =>
   focusedSnap.value?.vehicles.filter((v) => v.kind !== 'robot').length ?? null
 );
 const folderCount = computed(() => libraryFolders.value.length);
-const visibleFileCount = computed(() =>
-  packetGroups.value.reduce((sum, group) => sum + Math.max(1, group.members.length), 0)
-);
+const visibleFileCount = computed(() => {
+  const localCount = packetGroups.value.reduce(
+    (sum, group) => sum + Math.max(1, group.members.length),
+    0
+  );
+  return localCount + (currentFolderId.value === null ? staticCatalogMatches.value.length : 0);
+});
 const hiddenFileCount = computed(() => removedKeys.value.size);
 const selectedFileGroup = computed(() =>
   packetGroups.value.find((group) => groupActive(group)) ??
@@ -481,8 +591,9 @@ const desktopQuitDisabled = computed(
 );
 
 watch(focusedKey, (key) => {
+  snapshotMap.value = {};
+  setFocusedKey(key);
   scene?.applyFocus(key);
-  if (!key) snapshotMap.value = {};
 });
 
 watch(parallelLimit, (limit) => {
@@ -1062,6 +1173,20 @@ function iterSort(a: MatchView, b: MatchView): number {
   return na - nb;
 }
 
+function staticCatalogMatchNumber(matchNumber: number): string {
+  return `M${String(matchNumber).padStart(3, '0')}`;
+}
+
+function previousStaticCatalogPage(): void {
+  if (staticCatalogPage.value > 1) staticCatalogPage.value -= 1;
+}
+
+function nextStaticCatalogPage(): void {
+  if (staticCatalogPage.value < staticCatalogPageCount.value) {
+    staticCatalogPage.value += 1;
+  }
+}
+
 function groupStatus(group: PacketGroup): FeedStatus {
   if (group.members.some((m) => m.status === 'open')) return 'open';
   if (group.members.some((m) => m.status === 'connecting')) return 'connecting';
@@ -1118,6 +1243,7 @@ function folderToGroup(folder: LibraryFolder): PacketGroup {
   const members = folder.keys
     .map((key) => matches.value.find((m) => m.key === key))
     .filter((m): m is MatchView => m != null)
+    .filter((m) => m.staticReplay === undefined)
     .filter((m) => !removedKeys.value.has(m.key));
   return {
     firstKey: folder.id,
@@ -1758,7 +1884,82 @@ onBeforeUnmount(() => {
                 <ScrollAreaRoot class="dock-scroll-root" type="auto">
                   <ScrollAreaViewport class="dock-scroll-viewport">
                     <div class="dock-scroll">
-                      <div v-if="packetGroups.length === 0" class="file-empty">当前文件夹为空</div>
+                      <section
+                        v-if="currentFolderId === null && staticCatalogMapGroups.length > 0"
+                        class="static-replay-catalog"
+                        aria-label="Static replay catalog"
+                      >
+                        <nav class="static-catalog-tabs segmented" aria-label="Available maps">
+                          <button
+                            v-for="map in staticCatalogMapGroups"
+                            :key="map.key"
+                            type="button"
+                            :class="{ active: map.key === staticCatalogMapKey }"
+                            @click.stop="staticCatalogMapKey = map.key"
+                          >
+                            <span>{{ map.label }}</span>
+                            <small>{{ map.matches.length }}</small>
+                          </button>
+                        </nav>
+                        <nav class="static-catalog-tabs region segmented" aria-label="Replay regions">
+                          <button
+                            v-for="region in staticCatalogRegionGroups"
+                            :key="region.key"
+                            type="button"
+                            :class="{ active: region.key === staticCatalogRegionKey }"
+                            @click.stop="staticCatalogRegionKey = region.key"
+                          >
+                            <span>{{ region.label }}</span>
+                            <small>{{ region.matches.length }}</small>
+                          </button>
+                        </nav>
+                        <div
+                          v-if="staticCatalogPageCount > 1"
+                          class="file-tools static-catalog-pagination"
+                          aria-label="Replay pages"
+                        >
+                          <button
+                            type="button"
+                            :disabled="staticCatalogPage === 1"
+                            @click.stop="previousStaticCatalogPage"
+                          >
+                            上一页
+                          </button>
+                          <span>{{ staticCatalogPage }} / {{ staticCatalogPageCount }}</span>
+                          <button
+                            type="button"
+                            :disabled="staticCatalogPage === staticCatalogPageCount"
+                            @click.stop="nextStaticCatalogPage"
+                          >
+                            下一页
+                          </button>
+                        </div>
+                        <div class="static-catalog-list">
+                          <button
+                            v-for="match in pagedStaticCatalogMatches"
+                            :key="match.key"
+                            type="button"
+                            class="replay-row static-catalog-replay"
+                            :class="{ active: match.key === focusedKey }"
+                            @click.stop="focusedKey = match.key"
+                          >
+                            <span>
+                              {{ staticCatalogMatchNumber(match.staticReplay.matchNumber) }} ·
+                              {{ match.staticReplay.redSchool }} vs {{ match.staticReplay.blueSchool }}
+                            </span>
+                            <small>{{ match.staticReplay.roundCount }} 局 · {{ match.status }}</small>
+                          </button>
+                        </div>
+                      </section>
+                      <div
+                        v-if="
+                          packetGroups.length === 0 &&
+                          (currentFolderId !== null || staticCatalogMapGroups.length === 0)
+                        "
+                        class="file-empty"
+                      >
+                        当前文件夹为空
+                      </div>
                       <ContextMenuRoot v-for="group in packetGroups" :key="group.firstKey">
                         <ContextMenuTrigger as-child>
                           <div
@@ -3328,6 +3529,59 @@ onBeforeUnmount(() => {
   font-weight: 800;
 }
 
+.static-replay-catalog {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(36, 50, 64, 0.72);
+}
+
+.static-catalog-tabs {
+  grid-template-columns: repeat(auto-fit, minmax(68px, 1fr));
+}
+
+.static-catalog-tabs.region {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.static-catalog-tabs button small {
+  color: inherit;
+  font-size: var(--gsm-fs-tiny);
+  margin-left: 4px;
+  opacity: 0.72;
+}
+
+.static-catalog-list {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.static-catalog-replay {
+  min-height: 44px;
+}
+
+.static-catalog-pagination {
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  color: var(--text-dim);
+  font-size: var(--gsm-fs-caption);
+  font-variant-numeric: tabular-nums;
+}
+
+.static-catalog-pagination span {
+  text-align: center;
+}
+
+.static-catalog-pagination button {
+  width: 48px;
+}
+
+.static-catalog-pagination button:last-child {
+  justify-self: end;
+}
+
 .dock-scroll-root {
   height: 100%;
   min-height: 0;
@@ -3343,7 +3597,7 @@ onBeforeUnmount(() => {
 .dock-scroll {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-auto-rows: 44px;
+  grid-auto-rows: minmax(44px, auto);
   gap: 5px;
   align-content: start;
   min-height: 0;

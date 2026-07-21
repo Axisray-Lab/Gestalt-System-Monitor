@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - .github/workflows/deploy-pages.yml
+      - packages/agent/**
       - packages/protocol/**
       - packages/web/**
       - package.json
@@ -41,8 +42,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify RMUC 2026 replay fixtures
-        run: npm run verify:rmuc2026-pages
+      - name: Verify RMUC 2026 replay catalog and compressed assets
+        run: npm run verify:rmuc2026-pages-assets
 
       - name: Build web app
         run: npm run build
