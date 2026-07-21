@@ -19,14 +19,23 @@ import {
   statSync,
 } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { once } from 'node:events';
 import { pipeline } from 'node:stream/promises';
 import { DatabaseSync } from 'node:sqlite';
-import { createGzip, gunzip } from 'node:zlib';
+import { createGzip, gunzip, gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 
 const REPLAY_SCHEMA = 'gsm-watch-replay/2';
-const CATALOG_SCHEMA = 'gsm-static-replay-catalog/1';
+const CATALOG_SCHEMA = 'gsm-static-replay-catalog/2';
+const OVERVIEW_TRACK_SCHEMA = 'gsm-rmuc2026-overview-track/1';
+const OVERVIEW_TRACK_MAGIC = Buffer.from('GSMOVW01', 'ascii');
+const OVERVIEW_TRACK_VERSION = 1;
+const OVERVIEW_TRACK_HEADER_BYTES = 64;
+const OVERVIEW_ROUND_HEADER_BYTES = 28;
+const OVERVIEW_RECORD_BYTES = 7;
+const OVERVIEW_SAMPLE_HZ = 1;
+const OVERVIEW_POSITION_QUANTIZATION_CM = 1;
 const AMMO_INFERENCE_SCHEMA = 'gsm-ammo-inference/1';
 const BUFF_PROJECTION_SCHEMA = 'gsm-rmuc2026-buff-projection/1';
 const FRAME_MS = 100;
@@ -38,6 +47,7 @@ const EXPECTED_DATABASE_SHA256 =
 const DATASET_ARTICLE_URL =
   'https://bbs.robomaster.com/article/1936220?source=1';
 const gunzipAsync = promisify(gunzip);
+const gzipAsync = promisify(gzip);
 const BUFF_RULE_VALUES = {
   terrain: {
     road: { defenseThou: 250, durationSeconds: 5 },
@@ -733,7 +743,437 @@ function loadSeriesConfigs(database) {
   return configs;
 }
 
-function replayCatalog(configs, databaseSha256) {
+function roundDescriptors(config) {
+  if (
+    !config.asset ||
+    !Number.isSafeInteger(config.asset.frames) ||
+    !Number.isSafeInteger(config.asset.durationMs)
+  ) {
+    fail(`${config.key} has no validated series asset for round indexing`);
+  }
+  const assetPath = `replays/rmuc2026-regionals/${config.output}`;
+  let nextStartMs = 0;
+  const rounds = config.rounds.map(identity => {
+    const durationMs = identity.durationSeconds * 1000;
+    const startMs = nextStartMs;
+    const endMs = startMs + durationMs;
+    if (
+      startMs % FRAME_MS !== 0 ||
+      endMs % FRAME_MS !== 0 ||
+      durationMs <= 0
+    ) {
+      fail(`${config.key} G${identity.roundNumber} has invalid frame boundaries`);
+    }
+    const frameStartIndex = startMs / FRAME_MS;
+    const frameCount = durationMs / FRAME_MS;
+    nextStartMs = endMs + ROUND_GAP_MS;
+    return {
+      key: `${config.key}-g${identity.roundNumber}`,
+      label: `${config.label.replace(/ · 推断弹量$/, '')} · 第 ${identity.roundNumber} 局`,
+      assetKey: config.key,
+      seriesKey: config.key,
+      assetPath,
+      encoding: 'gzip',
+      regionKey: config.regionKey,
+      regionLabel: config.regionLabel,
+      matchNumber: config.matchNumber,
+      roundNumber: identity.roundNumber,
+      gameId: identity.gameId,
+      webGameId: identity.webGameId,
+      winner: identity.winner,
+      startedLocal: identity.startedLocal,
+      redSchool: config.redSchool,
+      blueSchool: config.blueSchool,
+      roundCount: 1,
+      assetRoundCount: config.roundCount,
+      startMs,
+      endMs,
+      durationMs,
+      frameStartIndex,
+      frameCount,
+      frameCountInRound: frameCount,
+      assetFrameCount: config.asset.frames,
+      assetDurationMs: config.asset.durationMs,
+      compressedBytes: config.asset.bytes,
+      sha256: config.asset.sha256,
+    };
+  });
+  if (
+    rounds.length !== config.roundCount ||
+    nextStartMs !== config.asset.durationMs ||
+    nextStartMs / FRAME_MS !== config.asset.frames
+  ) {
+    fail(`${config.key} round frame index does not cover its series asset`);
+  }
+  return rounds;
+}
+
+function overviewPosition(value, context) {
+  finite(value, context);
+  const quantized = Math.round(value / OVERVIEW_POSITION_QUANTIZATION_CM);
+  if (quantized < -32768 || quantized > 32767) {
+    fail(`${context} is outside the signed 16-bit overview range`);
+  }
+  return quantized;
+}
+
+function overviewPoseAt(states, targetSecond, context) {
+  const { left, right } = surroundingStates(states, targetSecond);
+  const alpha =
+    left.second === right.second
+      ? 0
+      : (targetSecond - left.second) / (right.second - left.second);
+  const pose = {
+    x: left.pose.x + (right.pose.x - left.pose.x) * alpha,
+    y: left.pose.y + (right.pose.y - left.pose.y) * alpha,
+    z: left.pose.z + (right.pose.z - left.pose.z) * alpha,
+  };
+  return {
+    x: overviewPosition(pose.x, `${context} x`),
+    y: overviewPosition(pose.y, `${context} y`),
+    z: overviewPosition(pose.z, `${context} z`),
+    defeated: left.hp <= 0,
+  };
+}
+
+function encodeOverviewRound(config, round) {
+  const identity = config.rounds[round.match.roundNumber - 1];
+  if (
+    !identity ||
+    identity.gameId !== round.match.gameId ||
+    identity.webGameId !== round.match.webGameId ||
+    identity.durationSeconds !== round.match.durationSeconds
+  ) {
+    fail(`${config.key} G${round.match.roundNumber} overview identity drifted`);
+  }
+  const robotIds = [...round.byRobot.keys()].sort((left, right) => left - right);
+  if (
+    robotIds.length === 0 ||
+    robotIds.length > 255 ||
+    robotIds.some(
+      (robotId, index) =>
+        !Number.isSafeInteger(robotId) ||
+        robotId <= 0 ||
+        robotId > 65535 ||
+        (index > 0 && robotIds[index - 1] >= robotId)
+    )
+  ) {
+    fail(`${config.key} G${identity.roundNumber} has invalid overview robot ids`);
+  }
+  const sampleCount = identity.durationSeconds;
+  if (!Number.isSafeInteger(sampleCount) || sampleCount <= 0 || sampleCount > 65535) {
+    fail(`${config.key} G${identity.roundNumber} has invalid overview sample count`);
+  }
+  const recordCount = sampleCount * robotIds.length;
+  const robotIdBytes = robotIds.length * 2;
+  const payloadBytes = robotIdBytes + recordCount * OVERVIEW_RECORD_BYTES;
+  const buffer = Buffer.allocUnsafe(OVERVIEW_ROUND_HEADER_BYTES + payloadBytes);
+  let offset = 0;
+  buffer.writeUInt16LE(config.matchNumber, offset);
+  offset += 2;
+  buffer.writeUInt8(identity.roundNumber, offset);
+  offset += 1;
+  buffer.writeUInt8(robotIds.length, offset);
+  offset += 1;
+  buffer.writeBigUInt64LE(BigInt(identity.gameId), offset);
+  offset += 8;
+  buffer.writeUInt32LE(identity.webGameId, offset);
+  offset += 4;
+  buffer.writeUInt16LE(identity.durationSeconds, offset);
+  offset += 2;
+  buffer.writeUInt16LE(sampleCount, offset);
+  offset += 2;
+  buffer.writeUInt32LE(recordCount, offset);
+  offset += 4;
+  buffer.writeUInt32LE(payloadBytes, offset);
+  offset += 4;
+  for (const robotId of robotIds) {
+    buffer.writeUInt16LE(robotId, offset);
+    offset += 2;
+  }
+  for (let localSecond = 0; localSecond < sampleCount; localSecond += 1) {
+    const targetSecond = Math.min(round.sampleMaxSecond, 1 + localSecond);
+    for (const robotId of robotIds) {
+      const pose = overviewPoseAt(
+        round.byRobot.get(robotId),
+        targetSecond,
+        `${config.key} G${identity.roundNumber} second ${localSecond} robot ${robotId}`
+      );
+      buffer.writeInt16LE(pose.x, offset);
+      offset += 2;
+      buffer.writeInt16LE(pose.y, offset);
+      offset += 2;
+      buffer.writeInt16LE(pose.z, offset);
+      offset += 2;
+      buffer.writeUInt8(pose.defeated ? 1 : 0, offset);
+      offset += 1;
+    }
+  }
+  if (offset !== buffer.length) {
+    fail(`${config.key} G${identity.roundNumber} overview byte count drifted`);
+  }
+  return { buffer, sampleCount, recordCount };
+}
+
+function createOverviewCollectors() {
+  return new Map(
+    REGIONS.map(region => [
+      region.key,
+      {
+        region,
+        chunks: [],
+        seriesCount: 0,
+        roundCount: 0,
+        timelineSampleCount: 0,
+        entitySampleCount: 0,
+      },
+    ])
+  );
+}
+
+function addSeriesToOverviewCollectors(collectors, item) {
+  const collector = collectors.get(item.config.regionKey);
+  if (!collector) fail(`${item.config.key} has no overview collector`);
+  if (item.config.matchNumber !== collector.seriesCount + 1) {
+    fail(
+      `${collector.region.key} overview match sequence drifted at ${collector.seriesCount + 1}`
+    );
+  }
+  const rounds = item.preparedRounds
+    ? item.preparedRounds.map(prepared => prepared.round)
+    : item.rounds;
+  if (!Array.isArray(rounds) || rounds.length !== item.config.roundCount) {
+    fail(`${item.config.key} overview round count drifted`);
+  }
+  for (const round of rounds) {
+    const encoded = encodeOverviewRound(item.config, round);
+    collector.chunks.push(encoded.buffer);
+    collector.roundCount += 1;
+    collector.timelineSampleCount += encoded.sampleCount;
+    collector.entitySampleCount += encoded.recordCount;
+  }
+  collector.seriesCount += 1;
+}
+
+function finalizeOverviewCollector(collector, databaseSha256) {
+  const { region } = collector;
+  const regionIndex = REGIONS.findIndex(item => item.key === region.key);
+  if (regionIndex < 0 || region !== REGIONS[regionIndex]) {
+    fail(`cannot encode unsupported overview region ${String(region?.key)}`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(databaseSha256)) {
+    fail(`${region.key} overview database SHA-256 is invalid`);
+  }
+  if (collector.seriesCount !== region.expectedMatches) {
+    fail(
+      `${region.key} overview has ${collector.seriesCount} series, expected ${region.expectedMatches}`
+    );
+  }
+  const {
+    chunks,
+    roundCount,
+    timelineSampleCount,
+    entitySampleCount,
+  } = collector;
+  if (roundCount !== region.expectedRounds) {
+    fail(`${region.key} overview has ${roundCount} rounds, expected ${region.expectedRounds}`);
+  }
+  const payloadBytes = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const header = Buffer.alloc(OVERVIEW_TRACK_HEADER_BYTES);
+  OVERVIEW_TRACK_MAGIC.copy(header, 0);
+  header.writeUInt16LE(OVERVIEW_TRACK_VERSION, 8);
+  header.writeUInt8(regionIndex, 10);
+  header.writeUInt8(OVERVIEW_SAMPLE_HZ, 11);
+  header.writeUInt8(OVERVIEW_RECORD_BYTES, 12);
+  header.writeUInt8(OVERVIEW_POSITION_QUANTIZATION_CM, 13);
+  header.writeUInt16LE(roundCount, 14);
+  header.writeUInt32LE(timelineSampleCount, 16);
+  header.writeUInt32LE(entitySampleCount, 20);
+  header.writeUInt32LE(payloadBytes, 24);
+  Buffer.from(databaseSha256, 'hex').copy(header, 28);
+  header.writeUInt32LE(0, 60);
+  return {
+    buffer: Buffer.concat([header, ...chunks], OVERVIEW_TRACK_HEADER_BYTES + payloadBytes),
+    roundCount,
+    timelineSampleCount,
+    entitySampleCount,
+  };
+}
+
+export function encodeOverviewRegion(regionKey, series, databaseSha256) {
+  const region = REGIONS.find(item => item.key === regionKey);
+  if (!region) fail(`cannot encode unsupported overview region ${String(regionKey)}`);
+  const collectors = createOverviewCollectors();
+  for (const item of [...series].sort((left, right) => {
+    if (left.config.regionKey !== right.config.regionKey) {
+      return left.config.regionKey.localeCompare(right.config.regionKey);
+    }
+    return left.config.matchNumber - right.config.matchNumber;
+  })) {
+    if (item.config.regionKey === region.key) {
+      addSeriesToOverviewCollectors(collectors, item);
+    }
+  }
+  return finalizeOverviewCollector(collectors.get(region.key), databaseSha256);
+}
+
+function safeGameId(value, context) {
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) fail(`${context} exceeds Number.MAX_SAFE_INTEGER`);
+  return Number(value);
+}
+
+export function validateOverviewTrackBuffer(
+  buffer,
+  regionKey,
+  databaseSha256,
+  expectedRounds
+) {
+  const region = REGIONS.find(item => item.key === regionKey);
+  if (!region) fail(`cannot validate unsupported overview region ${String(regionKey)}`);
+  if (!Buffer.isBuffer(buffer) || buffer.length <= OVERVIEW_TRACK_HEADER_BYTES) {
+    fail(`${region.key} overview track is empty or not a Buffer`);
+  }
+  if (!buffer.subarray(0, 8).equals(OVERVIEW_TRACK_MAGIC)) {
+    fail(`${region.key} overview track magic drifted`);
+  }
+  const regionIndex = REGIONS.findIndex(item => item.key === region.key);
+  const version = buffer.readUInt16LE(8);
+  const roundCount = buffer.readUInt16LE(14);
+  const timelineSampleCount = buffer.readUInt32LE(16);
+  const entitySampleCount = buffer.readUInt32LE(20);
+  const payloadBytes = buffer.readUInt32LE(24);
+  const embeddedSha256 = buffer.subarray(28, 60).toString('hex');
+  if (
+    version !== OVERVIEW_TRACK_VERSION ||
+    buffer.readUInt8(10) !== regionIndex ||
+    buffer.readUInt8(11) !== OVERVIEW_SAMPLE_HZ ||
+    buffer.readUInt8(12) !== OVERVIEW_RECORD_BYTES ||
+    buffer.readUInt8(13) !== OVERVIEW_POSITION_QUANTIZATION_CM ||
+    roundCount !== region.expectedRounds ||
+    roundCount !== expectedRounds.length ||
+    timelineSampleCount <= 0 ||
+    entitySampleCount <= 0 ||
+    payloadBytes !== buffer.length - OVERVIEW_TRACK_HEADER_BYTES ||
+    embeddedSha256 !== databaseSha256 ||
+    buffer.readUInt32LE(60) !== 0
+  ) {
+    fail(`${region.key} overview track header drifted`);
+  }
+  let offset = OVERVIEW_TRACK_HEADER_BYTES;
+  let actualTimelineSamples = 0;
+  let actualEntitySamples = 0;
+  for (let index = 0; index < expectedRounds.length; index += 1) {
+    const expected = expectedRounds[index];
+    if (offset + OVERVIEW_ROUND_HEADER_BYTES > buffer.length) {
+      fail(`${region.key} overview round ${index + 1} header is truncated`);
+    }
+    const matchNumber = buffer.readUInt16LE(offset);
+    const roundNumber = buffer.readUInt8(offset + 2);
+    const robotCount = buffer.readUInt8(offset + 3);
+    const gameId = safeGameId(
+      buffer.readBigUInt64LE(offset + 4),
+      `${region.key} overview round ${index + 1} game id`
+    );
+    const webGameId = buffer.readUInt32LE(offset + 12);
+    const durationSeconds = buffer.readUInt16LE(offset + 16);
+    const sampleCount = buffer.readUInt16LE(offset + 18);
+    const recordCount = buffer.readUInt32LE(offset + 20);
+    const roundPayloadBytes = buffer.readUInt32LE(offset + 24);
+    offset += OVERVIEW_ROUND_HEADER_BYTES;
+    if (
+      matchNumber !== expected.matchNumber ||
+      roundNumber !== expected.roundNumber ||
+      gameId !== expected.gameId ||
+      webGameId !== expected.webGameId ||
+      durationSeconds * 1000 !== expected.durationMs ||
+      sampleCount !== durationSeconds ||
+      robotCount <= 0 ||
+      recordCount !== robotCount * sampleCount ||
+      roundPayloadBytes !== robotCount * 2 + recordCount * OVERVIEW_RECORD_BYTES ||
+      offset + roundPayloadBytes > buffer.length
+    ) {
+      fail(`${expected.key} overview round header drifted`);
+    }
+    let previousRobotId = 0;
+    for (let robotIndex = 0; robotIndex < robotCount; robotIndex += 1) {
+      const robotId = buffer.readUInt16LE(offset);
+      offset += 2;
+      if (!ROBOT_IDS.includes(robotId) || robotId <= previousRobotId) {
+        fail(`${expected.key} overview robot ids drifted`);
+      }
+      previousRobotId = robotId;
+    }
+    for (let recordIndex = 0; recordIndex < recordCount; recordIndex += 1) {
+      const flags = buffer.readUInt8(offset + 6);
+      if ((flags & ~1) !== 0) fail(`${expected.key} overview flags drifted`);
+      offset += OVERVIEW_RECORD_BYTES;
+    }
+    actualTimelineSamples += sampleCount;
+    actualEntitySamples += recordCount;
+  }
+  if (
+    offset !== buffer.length ||
+    actualTimelineSamples !== timelineSampleCount ||
+    actualEntitySamples !== entitySampleCount
+  ) {
+    fail(`${region.key} overview payload totals drifted`);
+  }
+  return { roundCount, timelineSampleCount, entitySampleCount };
+}
+
+async function writeOverviewAssets(
+  configs,
+  collectors,
+  databaseSha256,
+  outputDir
+) {
+  const assets = new Map();
+  for (const region of REGIONS) {
+    const encoded = finalizeOverviewCollector(
+      collectors.get(region.key),
+      databaseSha256
+    );
+    const expectedRounds = configs
+      .filter(config => config.regionKey === region.key)
+      .flatMap(config => roundDescriptors(config));
+    validateOverviewTrackBuffer(
+      encoded.buffer,
+      region.key,
+      databaseSha256,
+      expectedRounds
+    );
+    const compressed = await gzipAsync(encoded.buffer, { level: 9 });
+    const relativePath = `overview/${region.key}.bin.gzip`;
+    const path = resolve(outputDir, relativePath);
+    const temporary = `${path}.${process.pid}.tmp`;
+    await fs.mkdir(dirname(path), { recursive: true });
+    try {
+      await fs.writeFile(temporary, compressed, { flag: 'wx' });
+      await fs.rm(path, { force: true });
+      await fs.rename(temporary, path);
+    } catch (error) {
+      await fs.rm(temporary, { force: true });
+      throw error;
+    }
+    assets.set(region.key, {
+      schema: OVERVIEW_TRACK_SCHEMA,
+      assetPath: `replays/rmuc2026-regionals/${relativePath}`,
+      encoding: 'gzip',
+      regionKey: region.key,
+      sampleHz: OVERVIEW_SAMPLE_HZ,
+      positionQuantizationCm: OVERVIEW_POSITION_QUANTIZATION_CM,
+      roundCount: encoded.roundCount,
+      timelineSampleCount: encoded.timelineSampleCount,
+      entitySampleCount: encoded.entitySampleCount,
+      uncompressedBytes: encoded.buffer.length,
+      compressedBytes: compressed.length,
+      sha256: createHash('sha256').update(compressed).digest('hex'),
+    });
+  }
+  return assets;
+}
+
+function replayCatalog(configs, databaseSha256, overviewAssets) {
   for (const config of configs) {
     if (
       !config.asset ||
@@ -743,6 +1183,30 @@ function replayCatalog(configs, databaseSha256) {
       !/^[0-9a-f]{64}$/.test(config.asset.sha256)
     ) {
       fail(`${config.key} has invalid generated asset metadata`);
+    }
+    config.catalogRounds = roundDescriptors(config);
+  }
+  if (!(overviewAssets instanceof Map) || overviewAssets.size !== REGIONS.length) {
+    fail('overview asset metadata does not cover every region');
+  }
+  for (const region of REGIONS) {
+    const asset = overviewAssets.get(region.key);
+    if (
+      !asset ||
+      asset.schema !== OVERVIEW_TRACK_SCHEMA ||
+      asset.regionKey !== region.key ||
+      asset.roundCount !== region.expectedRounds ||
+      !Number.isSafeInteger(asset.timelineSampleCount) ||
+      asset.timelineSampleCount <= 0 ||
+      !Number.isSafeInteger(asset.entitySampleCount) ||
+      asset.entitySampleCount <= 0 ||
+      !Number.isSafeInteger(asset.uncompressedBytes) ||
+      asset.uncompressedBytes <= OVERVIEW_TRACK_HEADER_BYTES ||
+      !Number.isSafeInteger(asset.compressedBytes) ||
+      asset.compressedBytes <= 0 ||
+      !/^[0-9a-f]{64}$/.test(asset.sha256)
+    ) {
+      fail(`${region.key} has invalid overview asset metadata`);
     }
   }
   return {
@@ -759,6 +1223,7 @@ function replayCatalog(configs, databaseSha256) {
     regions: REGIONS.map(region => ({
       key: region.key,
       label: region.label,
+      overviewTrack: overviewAssets.get(region.key),
       replays: configs
         .filter(config => config.regionKey === region.key)
         .map(config => ({
@@ -776,13 +1241,19 @@ function replayCatalog(configs, databaseSha256) {
           durationMs: config.asset.durationMs,
           compressedBytes: config.asset.bytes,
           sha256: config.asset.sha256,
+          rounds: config.catalogRounds,
         })),
     })),
   };
 }
 
-async function writeCatalog(configs, databaseSha256, catalogPath) {
-  const catalog = replayCatalog(configs, databaseSha256);
+async function writeCatalog(
+  configs,
+  databaseSha256,
+  overviewAssets,
+  catalogPath
+) {
+  const catalog = replayCatalog(configs, databaseSha256, overviewAssets);
   const temporary = `${catalogPath}.${process.pid}.tmp`;
   await fs.mkdir(dirname(catalogPath), { recursive: true });
   try {
@@ -798,6 +1269,21 @@ async function writeCatalog(configs, databaseSha256, catalogPath) {
   }
 }
 
+function requireExactObjectKeys(value, expectedKeys, context) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(`${context} must be an object`);
+  }
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  if (
+    actual.length !== expected.length ||
+    actual.some((key, index) => key !== expected[index])
+  ) {
+    fail(`${context} keys drifted`);
+  }
+  return value;
+}
+
 async function readGeneratedCatalog(catalogPath) {
   if (!existsSync(catalogPath) || !statSync(catalogPath).isFile()) {
     fail(`generated replay catalog does not exist: ${catalogPath}`);
@@ -808,10 +1294,17 @@ async function readGeneratedCatalog(catalogPath) {
   } catch (error) {
     fail(`generated replay catalog is invalid JSON: ${error.message}`);
   }
+  requireExactObjectKeys(
+    catalog,
+    ['schema', 'databaseSha256', 'competition', 'seriesCount', 'roundCount', 'regions'],
+    `${catalogPath} root`
+  );
+  requireExactObjectKeys(
+    catalog.competition,
+    ['key', 'label', 'mapKey', 'mapLabel'],
+    `${catalogPath} competition`
+  );
   if (
-    !catalog ||
-    typeof catalog !== 'object' ||
-    Array.isArray(catalog) ||
     catalog.schema !== CATALOG_SCHEMA ||
     catalog.databaseSha256 !== EXPECTED_DATABASE_SHA256 ||
     catalog.competition?.key !== 'rmuc2026' ||
@@ -824,12 +1317,40 @@ async function readGeneratedCatalog(catalogPath) {
     fail(`generated replay catalog header drifted: ${catalogPath}`);
   }
   const descriptors = [];
+  const roundDescriptors = [];
+  const overviewDescriptors = [];
   const seenKeys = new Set();
   const seenPaths = new Set();
+  const seenRoundKeys = new Set();
+  const seenGameIds = new Set();
+  const seenWebGameIds = new Set();
   let roundCount = 0;
   for (let regionIndex = 0; regionIndex < REGIONS.length; regionIndex += 1) {
     const expectedRegion = REGIONS[regionIndex];
     const region = catalog.regions[regionIndex];
+    requireExactObjectKeys(
+      region,
+      ['key', 'label', 'overviewTrack', 'replays'],
+      `${catalogPath} region ${expectedRegion.key}`
+    );
+    const overview = requireExactObjectKeys(
+      region.overviewTrack,
+      [
+        'schema',
+        'assetPath',
+        'encoding',
+        'regionKey',
+        'sampleHz',
+        'positionQuantizationCm',
+        'roundCount',
+        'timelineSampleCount',
+        'entitySampleCount',
+        'uncompressedBytes',
+        'compressedBytes',
+        'sha256',
+      ],
+      `${catalogPath} region ${expectedRegion.key} overview`
+    );
     if (
       !region ||
       region.key !== expectedRegion.key ||
@@ -839,8 +1360,52 @@ async function readGeneratedCatalog(catalogPath) {
     ) {
       fail(`${catalogPath} region ${expectedRegion.key} drifted`);
     }
+    if (
+      overview.schema !== OVERVIEW_TRACK_SCHEMA ||
+      overview.assetPath !==
+        `replays/rmuc2026-regionals/overview/${expectedRegion.key}.bin.gzip` ||
+      overview.encoding !== 'gzip' ||
+      overview.regionKey !== expectedRegion.key ||
+      overview.sampleHz !== OVERVIEW_SAMPLE_HZ ||
+      overview.positionQuantizationCm !== OVERVIEW_POSITION_QUANTIZATION_CM ||
+      overview.roundCount !== expectedRegion.expectedRounds ||
+      !Number.isSafeInteger(overview.timelineSampleCount) ||
+      overview.timelineSampleCount <= 0 ||
+      !Number.isSafeInteger(overview.entitySampleCount) ||
+      overview.entitySampleCount <= 0 ||
+      !Number.isSafeInteger(overview.uncompressedBytes) ||
+      overview.uncompressedBytes <= OVERVIEW_TRACK_HEADER_BYTES ||
+      !Number.isSafeInteger(overview.compressedBytes) ||
+      overview.compressedBytes <= 0 ||
+      !/^[0-9a-f]{64}$/.test(overview.sha256)
+    ) {
+      fail(`${catalogPath} region ${expectedRegion.key} overview drifted`);
+    }
+    overviewDescriptors.push(overview);
+    let regionRoundCount = 0;
     for (let index = 0; index < region.replays.length; index += 1) {
       const descriptor = region.replays[index];
+      requireExactObjectKeys(
+        descriptor,
+        [
+          'key',
+          'label',
+          'assetPath',
+          'encoding',
+          'regionKey',
+          'regionLabel',
+          'matchNumber',
+          'roundCount',
+          'redSchool',
+          'blueSchool',
+          'frameCount',
+          'durationMs',
+          'compressedBytes',
+          'sha256',
+          'rounds',
+        ],
+        `${catalogPath} ${expectedRegion.key} series ${index + 1}`
+      );
       const expectedMatchNumber = index + 1;
       const expectedPath = `replays/rmuc2026-regionals/${expectedRegion.key}/m${paddedMatchNumber(expectedMatchNumber)}.json.gzip`;
       if (
@@ -869,6 +1434,8 @@ async function readGeneratedCatalog(catalogPath) {
         descriptor.compressedBytes <= 0 ||
         typeof descriptor.sha256 !== 'string' ||
         !/^[0-9a-f]{64}$/.test(descriptor.sha256) ||
+        !Array.isArray(descriptor.rounds) ||
+        descriptor.rounds.length !== descriptor.roundCount ||
         seenKeys.has(descriptor.key) ||
         seenPaths.has(descriptor.assetPath)
       ) {
@@ -879,7 +1446,98 @@ async function readGeneratedCatalog(catalogPath) {
       seenKeys.add(descriptor.key);
       seenPaths.add(descriptor.assetPath);
       roundCount += descriptor.roundCount;
+      regionRoundCount += descriptor.roundCount;
       descriptors.push(descriptor);
+      let nextStartMs = 0;
+      for (let roundIndex = 0; roundIndex < descriptor.rounds.length; roundIndex += 1) {
+        const round = requireExactObjectKeys(
+          descriptor.rounds[roundIndex],
+          [
+            'key',
+            'label',
+            'assetKey',
+            'seriesKey',
+            'assetPath',
+            'encoding',
+            'regionKey',
+            'regionLabel',
+            'matchNumber',
+            'roundNumber',
+            'gameId',
+            'webGameId',
+            'winner',
+            'startedLocal',
+            'redSchool',
+            'blueSchool',
+            'roundCount',
+            'assetRoundCount',
+            'startMs',
+            'endMs',
+            'durationMs',
+            'frameStartIndex',
+            'frameCount',
+            'frameCountInRound',
+            'assetFrameCount',
+            'assetDurationMs',
+            'compressedBytes',
+            'sha256',
+          ],
+          `${descriptor.key} round ${roundIndex + 1}`
+        );
+        const expectedRoundNumber = roundIndex + 1;
+        if (
+          round.key !== `${descriptor.key}-g${expectedRoundNumber}` ||
+          typeof round.label !== 'string' ||
+          round.label.length === 0 ||
+          round.assetKey !== descriptor.key ||
+          round.seriesKey !== descriptor.key ||
+          round.assetPath !== descriptor.assetPath ||
+          round.encoding !== descriptor.encoding ||
+          round.regionKey !== descriptor.regionKey ||
+          round.regionLabel !== descriptor.regionLabel ||
+          round.matchNumber !== descriptor.matchNumber ||
+          round.roundNumber !== expectedRoundNumber ||
+          !Number.isSafeInteger(round.gameId) ||
+          round.gameId <= 0 ||
+          !Number.isSafeInteger(round.webGameId) ||
+          round.webGameId <= 0 ||
+          typeof round.winner !== 'string' ||
+          round.winner.length === 0 ||
+          typeof round.startedLocal !== 'string' ||
+          round.startedLocal.length === 0 ||
+          round.redSchool !== descriptor.redSchool ||
+          round.blueSchool !== descriptor.blueSchool ||
+          round.roundCount !== 1 ||
+          round.assetRoundCount !== descriptor.roundCount ||
+          round.startMs !== nextStartMs ||
+          !Number.isSafeInteger(round.endMs) ||
+          round.endMs <= round.startMs ||
+          round.durationMs !== round.endMs - round.startMs ||
+          round.frameStartIndex !== round.startMs / FRAME_MS ||
+          round.frameCount !== round.durationMs / FRAME_MS ||
+          round.frameCountInRound !== round.frameCount ||
+          round.assetFrameCount !== descriptor.frameCount ||
+          round.assetDurationMs !== descriptor.durationMs ||
+          round.compressedBytes !== descriptor.compressedBytes ||
+          round.sha256 !== descriptor.sha256 ||
+          seenRoundKeys.has(round.key) ||
+          seenGameIds.has(round.gameId) ||
+          seenWebGameIds.has(round.webGameId)
+        ) {
+          fail(`${descriptor.key} G${expectedRoundNumber} descriptor drifted`);
+        }
+        seenRoundKeys.add(round.key);
+        seenGameIds.add(round.gameId);
+        seenWebGameIds.add(round.webGameId);
+        roundDescriptors.push(round);
+        nextStartMs = round.endMs + ROUND_GAP_MS;
+      }
+      if (nextStartMs !== descriptor.durationMs) {
+        fail(`${descriptor.key} round boundaries do not cover the series asset`);
+      }
+    }
+    if (regionRoundCount !== expectedRegion.expectedRounds) {
+      fail(`${catalogPath} region ${expectedRegion.key} round total drifted`);
     }
   }
   if (
@@ -888,7 +1546,13 @@ async function readGeneratedCatalog(catalogPath) {
   ) {
     fail(`${catalogPath} descriptor totals drifted`);
   }
-  return { catalog, descriptors };
+  if (
+    roundDescriptors.length !== EXPECTED_ROUND_COUNT ||
+    overviewDescriptors.length !== REGIONS.length
+  ) {
+    fail(`${catalogPath} round or overview descriptor totals drifted`);
+  }
+  return { catalog, descriptors, roundDescriptors, overviewDescriptors };
 }
 
 function loadRound(database, match) {
@@ -3036,15 +3700,23 @@ function validateReplayIdentity(value, path, expected) {
   for (let index = 0; index < expected.rounds.length; index += 1) {
     const actual = rounds[index];
     const identity = expected.rounds[index];
+    const identityDurationSeconds =
+      Number.isSafeInteger(identity.durationSeconds) && identity.durationSeconds > 0
+        ? identity.durationSeconds
+        : Number.isSafeInteger(identity.durationMs) &&
+            identity.durationMs > 0 &&
+            identity.durationMs % 1000 === 0
+          ? identity.durationMs / 1000
+          : fail(`${path} expected round ${index + 1} duration is invalid`);
     const expectedEndMs =
-      expectedStartMs + identity.durationSeconds * 1000;
+      expectedStartMs + identityDurationSeconds * 1000;
     if (
       actual?.roundNumber !== identity.roundNumber ||
       actual?.gameId !== identity.gameId ||
       actual?.webGameId !== identity.webGameId ||
       actual?.winner !== identity.winner ||
       actual?.startedLocal !== identity.startedLocal ||
-      actual?.durationSeconds !== identity.durationSeconds ||
+      actual?.durationSeconds !== identityDurationSeconds ||
       actual?.startMs !== expectedStartMs ||
       actual?.endMs !== expectedEndMs
     ) {
@@ -3577,10 +4249,65 @@ async function verifyReplayAssetMetadata(descriptor, outputDir) {
   return { path, bytes, sha256 };
 }
 
+async function verifyOverviewAsset(
+  descriptor,
+  expectedRounds,
+  outputDir,
+  validatePayload
+) {
+  const expectedPrefix = 'replays/rmuc2026-regionals/';
+  if (!descriptor.assetPath.startsWith(expectedPrefix)) {
+    fail(`${descriptor.regionKey} overview asset path escapes the replay directory`);
+  }
+  const path = resolve(outputDir, descriptor.assetPath.slice(expectedPrefix.length));
+  if (!existsSync(path) || !statSync(path).isFile()) {
+    fail(`overview asset does not exist: ${path}`);
+  }
+  const compressed = await fs.readFile(path);
+  const digest = createHash('sha256').update(compressed).digest('hex');
+  if (
+    compressed.length !== descriptor.compressedBytes ||
+    digest !== descriptor.sha256
+  ) {
+    fail(`${descriptor.regionKey} overview compressed asset metadata drifted`);
+  }
+  if (validatePayload) {
+    let decoded;
+    try {
+      decoded = await gunzipAsync(compressed);
+    } catch (error) {
+      fail(`${path} is not valid gzip: ${error.message}`);
+    }
+    if (decoded.length !== descriptor.uncompressedBytes) {
+      fail(`${descriptor.regionKey} overview uncompressed byte count drifted`);
+    }
+    const region = REGIONS.find(item => item.key === descriptor.regionKey);
+    if (!region) fail(`unsupported overview region ${descriptor.regionKey}`);
+    const metadata = validateOverviewTrackBuffer(
+      decoded,
+      region.key,
+      EXPECTED_DATABASE_SHA256,
+      expectedRounds
+    );
+    if (
+      metadata.roundCount !== descriptor.roundCount ||
+      metadata.timelineSampleCount !== descriptor.timelineSampleCount ||
+      metadata.entitySampleCount !== descriptor.entitySampleCount
+    ) {
+      fail(`${descriptor.regionKey} overview catalog metadata drifted`);
+    }
+  }
+  return { path, bytes: compressed.length, sha256: digest };
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.validateOnly || options.verifyAssetsOnly) {
-    const { descriptors } = await readGeneratedCatalog(options.catalog);
+    const {
+      descriptors,
+      roundDescriptors: catalogRounds,
+      overviewDescriptors,
+    } = await readGeneratedCatalog(options.catalog);
     const selected = filterSeries(
       descriptors,
       options.series,
@@ -3615,6 +4342,23 @@ async function main() {
         `validated ${descriptor.key}: frames=${result.frames} bytes=${result.bytes} -> ${path}`
       );
     }
+    const selectedRegionKeys = new Set(selected.map(descriptor => descriptor.regionKey));
+    for (const overview of overviewDescriptors.filter(descriptor =>
+      selectedRegionKeys.has(descriptor.regionKey)
+    )) {
+      const expectedRounds = catalogRounds.filter(
+        round => round.regionKey === overview.regionKey
+      );
+      const result = await verifyOverviewAsset(
+        overview,
+        expectedRounds,
+        options.outputDir,
+        options.validateOnly
+      );
+      console.log(
+        `${options.validateOnly ? 'validated' : 'verified'} overview ${overview.regionKey}: bytes=${result.bytes} -> ${result.path}`
+      );
+    }
     return;
   }
   if (!existsSync(options.database) || !statSync(options.database).isFile()) {
@@ -3636,14 +4380,31 @@ async function main() {
         const path = resolve(options.outputDir, config.output);
         config.asset = await validateReplayFile(path, config);
       }
-      await writeCatalog(configs, databaseSha256, options.catalog);
+      const overviewCollectors = createOverviewCollectors();
+      for (const config of configs) {
+        addSeriesToOverviewCollectors(
+          overviewCollectors,
+          loadSeries(database, config)
+        );
+      }
+      const overviewAssets = await writeOverviewAssets(
+        configs,
+        overviewCollectors,
+        databaseSha256,
+        options.outputDir
+      );
+      await writeCatalog(configs, databaseSha256, overviewAssets, options.catalog);
       console.log(`generated catalog -> ${options.catalog}`);
       return;
     }
     const selected = filterSeries(configs, options.series, options.region);
     const datasetAudit = createDatasetAudit();
+    const overviewCollectors = createOverviewCollectors();
     for (const config of selected) {
       const prepared = prepareSeries(loadSeries(database, config));
+      if (options.series == null && options.region == null) {
+        addSeriesToOverviewCollectors(overviewCollectors, prepared);
+      }
       addSeriesToDatasetAudit(datasetAudit, prepared);
       if (!options.auditOnly) {
         const path = resolve(options.outputDir, config.output);
@@ -3658,7 +4419,18 @@ async function main() {
     if (options.series == null && options.region == null) {
       validateDatasetAudit(datasetAudit);
       if (!options.auditOnly) {
-        await writeCatalog(configs, databaseSha256, options.catalog);
+        const overviewAssets = await writeOverviewAssets(
+          configs,
+          overviewCollectors,
+          databaseSha256,
+          options.outputDir
+        );
+        await writeCatalog(
+          configs,
+          databaseSha256,
+          overviewAssets,
+          options.catalog
+        );
       }
       console.log(
         `dataset audit passed: series=${configs.length} rounds=${EXPECTED_ROUND_COUNT} robot_samples=${datasetAudit.robotSamples} buffs=${Object.values(datasetAudit.buffCategories).reduce((sum, value) => sum + value, 0)} ambiguous_coins=${datasetAudit.economy.ambiguous}`
@@ -3671,4 +4443,7 @@ async function main() {
   }
 }
 
-await main();
+const invokedPath = process.argv[1]
+  ? pathToFileURL(resolve(process.argv[1])).href
+  : null;
+if (invokedPath === import.meta.url) await main();

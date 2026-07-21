@@ -1,7 +1,7 @@
 import { onScopeDispose, reactive, ref, watch, type Ref } from 'vue';
 import type { DiscoveredProcess, MapWireframe, WorldSnapshot } from '@gsm/protocol';
 import { createMockFeed } from './mockFeed';
-import type { StaticReplayDescriptor } from './staticReplayCatalog';
+import type { StaticReplayRoundDescriptor } from './staticReplayCatalog';
 import { createWsFeed } from './wsFeed';
 import type { FeedSource, MatchView } from './types';
 
@@ -10,7 +10,7 @@ const keyOf = (process: DiscoveredProcess) => `${process.matchId}@${process.sour
 /** Options for {@link useMatches}. */
 export interface UseMatchesOptions {
   /** Static, browser-hosted replay fixtures. Empty by default for live/dev use. */
-  staticReplays?: readonly StaticReplayDescriptor[];
+  staticReplays?: readonly StaticReplayRoundDescriptor[];
 }
 
 /** Side-effect hooks into the renderer — kept here so unit lifecycle ordering lives in one place. */
@@ -21,6 +21,8 @@ export interface MatchHooks {
   onRemove(key: string): void;
   onMap(key: string, map: MapWireframe): void;
   onSnapshot(key: string, snap: WorldSnapshot): void;
+  onReplayPlayback?(key: string, paused: boolean): void;
+  onReplayDiscontinuity?(key: string): void;
 }
 
 interface Entry {
@@ -30,7 +32,7 @@ interface Entry {
   started: boolean;
 }
 
-function staticView(replay: StaticReplayDescriptor): MatchView {
+function staticView(replay: StaticReplayRoundDescriptor): MatchView {
   return reactive<MatchView>({
     key: replay.key,
     label: replay.label,
@@ -42,7 +44,10 @@ function staticView(replay: StaticReplayDescriptor): MatchView {
       mapLabel: replay.mapLabel,
       regionKey: replay.regionKey,
       regionLabel: replay.regionLabel,
+      seriesKey: replay.seriesKey,
       matchNumber: replay.matchNumber,
+      roundNumber: replay.roundNumber,
+      gameId: replay.gameId,
       roundCount: replay.roundCount,
       redSchool: replay.redSchool,
       blueSchool: replay.blueSchool,
@@ -65,7 +70,7 @@ export function useMatches(
   opts: UseMatchesOptions = {}
 ) {
   const staticReplays = opts.staticReplays ?? [];
-  const staticReplayByKey = new Map<string, StaticReplayDescriptor>();
+  const staticReplayByKey = new Map<string, StaticReplayRoundDescriptor>();
   const staticViews = new Map<string, MatchView>();
   for (const replay of staticReplays) {
     if (staticReplayByKey.has(replay.key)) {
@@ -95,6 +100,11 @@ export function useMatches(
     const entry: Entry = { kind, feed, view, started: false };
     entries.set(key, entry);
     hooks.onAdd(key, view.label);
+    feed.playback?.onState(state => {
+      view.replayPlayback = state;
+      hooks.onReplayPlayback?.(key, state.paused);
+    });
+    feed.playback?.onDiscontinuity(() => hooks.onReplayDiscontinuity?.(key));
     return entry;
   }
 
@@ -124,7 +134,10 @@ export function useMatches(
     entry.feed.close();
     hooks.onRemove(key);
     entries.delete(key);
-    if (resetStaticStatus) entry.view.status = 'idle';
+    if (resetStaticStatus) {
+      entry.view.status = 'idle';
+      delete entry.view.replayPlayback;
+    }
   }
 
   function materializeFocusedStatic(): void {
@@ -209,10 +222,36 @@ export function useMatches(
     }
   }
 
+  function staticPlaybackFor(key: string) {
+    const entry = entries.get(key);
+    if (!entry || entry.kind !== 'static') {
+      throw new Error(`Static replay is not materialized: ${key}`);
+    }
+    if (!entry.feed.playback) {
+      throw new Error(`Static replay feed does not expose playback controls: ${key}`);
+    }
+    return entry.feed.playback;
+  }
+
+  function setReplayPaused(key: string, paused: boolean): void {
+    staticPlaybackFor(key).setPaused(paused);
+  }
+
+  function seekReplay(key: string, positionMs: number): void {
+    staticPlaybackFor(key).seek(positionMs);
+  }
+
   onScopeDispose(() => {
     for (const entry of entries.values()) entry.feed.close();
     entries.clear();
   });
 
-  return { matches, start, setActiveKeys, setFocusedKey };
+  return {
+    matches,
+    start,
+    setActiveKeys,
+    setFocusedKey,
+    setReplayPaused,
+    seekReplay,
+  };
 }

@@ -1,92 +1,76 @@
 import { describe, expect, it } from 'vitest';
-import { parseStaticReplayCatalog } from './staticReplayCatalog';
-
-const digest = 'a'.repeat(64);
+import generatedCatalog from './rmuc2026ReplayCatalog.generated.json';
+import {
+  RMUC2026_OVERVIEW_SHARDS,
+  RMUC2026_ROUNDS,
+  RMUC2026_SERIES,
+  parseStaticReplayCatalog,
+} from './staticReplayCatalog';
 
 function validCatalog(): Record<string, unknown> {
-  return {
-    schema: 'gsm-static-replay-catalog/1',
-    databaseSha256: digest,
-    competition: {
-      key: 'rmuc2026',
-      label: 'RMUC 2026',
-      mapKey: 'rmuc2026',
-      mapLabel: 'RMUC 2026',
-    },
-    seriesCount: 1,
-    roundCount: 3,
-    regions: [
-      {
-        key: 'east',
-        label: '东部赛区',
-        replays: [
-          {
-            key: 'rmuc2026-east-m001',
-            label: 'M001 · 红方学校 vs 蓝方学校',
-            assetPath: 'replays/rmuc2026-regionals/east/m001.json.gzip',
-            encoding: 'gzip',
-            regionKey: 'east',
-            regionLabel: '东部赛区',
-            matchNumber: 1,
-            roundCount: 3,
-            redSchool: '红方学校',
-            blueSchool: '蓝方学校',
-            frameCount: 100,
-            durationMs: 10_000,
-            compressedBytes: 1_024,
-            sha256: digest,
-          },
-        ],
-      },
-    ],
-  };
+  return structuredClone(generatedCatalog) as Record<string, unknown>;
 }
 
-function firstReplay(catalog: Record<string, unknown>): Record<string, unknown> {
-  const regions = catalog.regions as Array<Record<string, unknown>>;
-  return (regions[0].replays as Array<Record<string, unknown>>)[0];
+function firstRegion(catalog: Record<string, unknown>): Record<string, unknown> {
+  return (catalog.regions as Array<Record<string, unknown>>)[0];
+}
+
+function firstSeries(catalog: Record<string, unknown>): Record<string, unknown> {
+  return (firstRegion(catalog).replays as Array<Record<string, unknown>>)[0];
+}
+
+function firstRound(catalog: Record<string, unknown>): Record<string, unknown> {
+  return (firstSeries(catalog).rounds as Array<Record<string, unknown>>)[0];
 }
 
 describe('static replay catalog validation', () => {
-  it('accepts the strict v1 catalog and attaches competition/map metadata', () => {
+  it('exports the exact 266 series, 613 single-game descriptors and three shards', () => {
     const parsed = parseStaticReplayCatalog(validCatalog());
 
-    expect(parsed.seriesCount).toBe(1);
-    expect(parsed.roundCount).toBe(3);
-    expect(parsed.regions[0].replays[0]).toMatchObject({
+    expect(parsed.regions.map((region) => region.replays.length)).toEqual([88, 88, 90]);
+    expect(parsed.regions.map((region) =>
+      region.replays.reduce((sum, replay) => sum + replay.roundCount, 0)
+    )).toEqual([203, 204, 206]);
+    expect(RMUC2026_SERIES).toHaveLength(266);
+    expect(RMUC2026_ROUNDS).toHaveLength(613);
+    expect(RMUC2026_OVERVIEW_SHARDS).toHaveLength(3);
+    expect(RMUC2026_ROUNDS[0]).toMatchObject({
+      key: 'rmuc2026-east-m001-g1',
+      seriesKey: 'rmuc2026-east-m001',
+      roundCount: 1,
+      startMs: 0,
+      frameStartIndex: 0,
       competitionKey: 'rmuc2026',
       mapKey: 'rmuc2026',
-      regionKey: 'east',
-      matchNumber: 1,
-      encoding: 'gzip',
     });
   });
 
   it('rejects unknown fields instead of silently accepting schema drift', () => {
     const catalog = validCatalog();
-    firstReplay(catalog).unexpected = true;
+    firstRound(catalog).unexpected = true;
 
     expect(() => parseStaticReplayCatalog(catalog)).toThrow(/contain exactly/);
   });
 
-  it('rejects a replay whose region metadata disagrees with its container', () => {
+  it('rejects a round whose shared series asset identity disagrees', () => {
     const catalog = validCatalog();
-    firstReplay(catalog).regionKey = 'south';
+    firstRound(catalog).seriesKey = 'rmuc2026-east-m999';
 
-    expect(() => parseStaticReplayCatalog(catalog)).toThrow(/must match its region/);
+    expect(() => parseStaticReplayCatalog(catalog)).toThrow(/series asset or frame boundaries/);
   });
 
-  it('rejects non-gzip descriptors without an alternate loading path', () => {
+  it('rejects a frame boundary that does not map exactly onto 100 ms frames', () => {
     const catalog = validCatalog();
-    firstReplay(catalog).encoding = 'json';
+    firstRound(catalog).endMs = 1_001;
 
-    expect(() => parseStaticReplayCatalog(catalog)).toThrow(/must equal gzip/);
+    expect(() => parseStaticReplayCatalog(catalog)).toThrow(/series asset or frame boundaries/);
   });
 
-  it('rejects catalog totals that do not match the replay descriptors', () => {
+  it('rejects overview shard metadata with the wrong regional round total', () => {
     const catalog = validCatalog();
-    catalog.roundCount = 4;
+    const overview = firstRegion(catalog).overviewTrack as Record<string, unknown>;
+    overview.roundCount = 202;
 
-    expect(() => parseStaticReplayCatalog(catalog)).toThrow(/round totals/);
+    expect(() => parseStaticReplayCatalog(catalog)).toThrow(/must equal 203/);
   });
 });

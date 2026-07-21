@@ -1,20 +1,34 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadRecordedReplay } from './mockFeed';
-import type { StaticReplayDescriptor } from './staticReplayCatalog';
+import type { StaticReplayRoundDescriptor } from './staticReplayCatalog';
 
-const descriptorBase: Omit<StaticReplayDescriptor, 'compressedBytes' | 'sha256'> = {
-  key: 'rmuc2026-east-m001',
-  label: 'M001',
+const descriptorBase: Omit<StaticReplayRoundDescriptor, 'compressedBytes' | 'sha256'> = {
+  key: 'rmuc2026-east-m001-g1',
+  label: 'M001 G1',
+  assetKey: 'rmuc2026-east-m001',
+  seriesKey: 'rmuc2026-east-m001',
   assetPath: 'replays/rmuc2026-regionals/east/m001.json.gzip',
   encoding: 'gzip',
   regionKey: 'east',
   regionLabel: '东部赛区',
   matchNumber: 1,
+  roundNumber: 1,
+  gameId: 1,
+  webGameId: 1,
+  winner: '红方',
+  startedLocal: '2026-01-01 00:00:00',
   roundCount: 1,
+  assetRoundCount: 1,
   redSchool: '红方学校',
   blueSchool: '蓝方学校',
   frameCount: 1,
+  frameCountInRound: 1,
+  assetFrameCount: 1,
   durationMs: 100,
+  assetDurationMs: 100,
+  startMs: 0,
+  endMs: 100,
+  frameStartIndex: 0,
   competitionKey: 'rmuc2026',
   competitionLabel: 'RMUC 2026',
   mapKey: 'rmuc2026',
@@ -43,7 +57,7 @@ async function gzip(text: string): Promise<ArrayBuffer> {
   return new Response(compressed).arrayBuffer();
 }
 
-async function descriptorFor(bytes: ArrayBuffer): Promise<StaticReplayDescriptor> {
+async function descriptorFor(bytes: ArrayBuffer): Promise<StaticReplayRoundDescriptor> {
   const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
   const sha256 = [...new Uint8Array(digest)]
     .map(byte => byte.toString(16).padStart(2, '0'))
@@ -94,7 +108,7 @@ describe('static gzip replay loading', () => {
 
   it('rejects a valid gzip payload whose replay metadata disagrees with the catalog', async () => {
     const bytes = await gzip(JSON.stringify(replay));
-    const descriptor = { ...(await descriptorFor(bytes)), frameCount: 2 };
+    const descriptor = { ...(await descriptorFor(bytes)), assetFrameCount: 2 };
     vi.stubGlobal('document', { baseURI: 'https://example.test/monitor/index.html' });
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(bytes, { status: 200 })));
 

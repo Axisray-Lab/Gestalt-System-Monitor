@@ -237,6 +237,7 @@ const desktopQuitBusy = ref(false);
 const desktopQuitError = ref<string | null>(null);
 const libraryNotice = ref('Autosave on');
 const performanceStats = ref<ThreePerformanceStats>({
+  sampleId: 0,
   fps: 0,
   frameMs: 0,
   frameMsMin: 0,

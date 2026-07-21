@@ -2,6 +2,7 @@
 
 interface ImportMetaEnv {
   readonly VITE_GSM_STATIC_REPLAYS?: 'rmuc2026-regionals';
+  readonly VITE_GSM_E2E?: '1';
 }
 
 interface ImportMeta {

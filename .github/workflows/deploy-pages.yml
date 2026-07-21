@@ -11,24 +11,33 @@ on:
       - packages/web/**
       - package.json
       - package-lock.json
+      - tests/e2e/**
+  pull_request:
+    paths:
+      - .github/workflows/deploy-pages.yml
+      - packages/agent/**
+      - packages/protocol/**
+      - packages/web/**
+      - package.json
+      - package-lock.json
+      - tests/e2e/**
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -45,18 +54,56 @@ jobs:
       - name: Verify RMUC 2026 replay catalog and compressed assets
         run: npm run verify:rmuc2026-pages-assets
 
+      - name: Run unit tests
+        run: npm test
+
       - name: Build web app
         run: npm run build
         env:
           VITE_GSM_STATIC_REPLAYS: rmuc2026-regionals
+          VITE_GSM_E2E: '1'
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps --only-shell chromium
+
+      - name: Run Pages browser and performance regression
+        id: e2e
+        run: npm run test:e2e
+
+      - name: Upload browser regression report
+        if: ${{ always() && steps.e2e.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: pages-e2e-report
+          path: |
+            tests/e2e/test-results/playwright-report
+            tests/e2e/test-results/playwright-results.json
+            tests/e2e/test-results/playwright-artifacts
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Setup Pages
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/configure-pages@v6
 
       - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v5
         with:
           path: packages/web/dist
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
 
       - name: Deploy to GitHub Pages
         id: deployment

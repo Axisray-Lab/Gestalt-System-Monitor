@@ -17,3 +17,4 @@ packages/agent/traces/
 *.summary.json
 # Dev-only perf telemetry sink output (real-browser stats streamed to disk).
 packages/web/perf-telemetry.log
+tests/e2e/test-results/

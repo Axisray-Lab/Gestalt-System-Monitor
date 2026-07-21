@@ -10,9 +10,22 @@ RMUC 2026 regional dataset for the Monitor GitHub Pages build:
 | `north/`  |     90 |   206 |
 
 Each `mNNN.json.gzip` file contains the complete two-to-four-game series for one
-official regional match number. The gzip transport keeps the complete 10 Hz
-replay library within the GitHub Pages site-size limit; the replay payload
-inside remains `gsm-watch-replay/2` JSON and is decoded strictly by the client.
+official regional match number. The v2 replay catalog exposes every game as an
+independent descriptor with an exact half-open frame range while all games in a
+series continue to share this one asset. No replay payload is copied. The gzip
+transport keeps the complete 10 Hz replay library within the GitHub Pages
+site-size limit; the replay payload inside remains `gsm-watch-replay/2` JSON and
+is decoded strictly by the client.
+
+`overview/east.bin.gzip`, `overview/south.bin.gzip`, and
+`overview/north.bin.gzip` are the lightweight region-wide training-ground
+tracks. They contain only the official 1 Hz robot point trajectory needed by
+the overview renderer: signed 16-bit UE-centimetre XYZ positions at a declared
+1 cm quantization and one defeated-state bit. The files use
+`gsm-rmuc2026-overview-track/1`; their byte length, SHA-256, region identity,
+round identities, sample totals, and record boundaries are verified before use.
+Focused playback always uses the corresponding authoritative 10 Hz series
+asset, not the overview track.
 
 Regenerate and validate the files from the Monitor repository root:
 
@@ -25,6 +38,9 @@ npm run verify:rmuc2026-pages-assets
 The generator owns source-path resolution and validates the expected dataset
 identity and match selection. Missing data, a source mismatch, or invalid output
 terminates the command; no substitute fixture or synthetic fallback is used.
+Catalog and overview validation also requires exactly 203 eastern, 204 southern,
+and 206 northern games (613 total), with contiguous 100 ms frame cuts and the
+explicit 3 s separators already present in each series asset.
 
 ## Transformation and inference
 

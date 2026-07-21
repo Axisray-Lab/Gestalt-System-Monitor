@@ -12,7 +12,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'focus', key: string): void;
   (e: 'overview'): void;
-  (e: 'preview', key: string | null): void;
+  (e: 'replayPaused', key: string, paused: boolean): void;
+  (e: 'replaySeek', key: string, positionMs: number): void;
 }>();
 
 
@@ -32,6 +33,32 @@ function resetCounts() {
 const focused = computed(() =>
   props.focusedKey ? props.matches.find(m => m.key === props.focusedKey) ?? null : null
 );
+const focusedPlayback = computed(() => focused.value?.replayPlayback);
+
+function replayTime(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+function seekFocusedReplay(deltaMs: number): void {
+  const match = focused.value;
+  const playback = focusedPlayback.value;
+  if (!match || !playback) {
+    throw new Error('Replay seek requested without a focused recorded replay');
+  }
+  const target = Math.max(0, Math.min(playback.durationMs - 1, playback.positionMs + deltaMs));
+  emit('replaySeek', match.key, target);
+}
+
+function toggleFocusedReplay(): void {
+  const match = focused.value;
+  const playback = focusedPlayback.value;
+  if (!match || !playback) {
+    throw new Error('Replay pause requested without a focused recorded replay');
+  }
+  emit('replayPaused', match.key, !playback.paused);
+}
 
 // ---- Packet grouping (overview) ----
 
@@ -124,7 +151,9 @@ const mapGroups = computed<CatalogMapGroup[]>(() => {
   return [...groups.values()].map(group => ({
     ...group,
     matches: [...group.matches].sort(
-      (left, right) => left.staticReplay.matchNumber - right.staticReplay.matchNumber
+      (left, right) =>
+        left.staticReplay.matchNumber - right.staticReplay.matchNumber ||
+        left.staticReplay.roundNumber - right.staticReplay.roundNumber
     ),
   }));
 });
@@ -162,7 +191,9 @@ const regionGroups = computed<CatalogRegionGroup[]>(() => {
   return [...groups.values()].map(group => ({
     ...group,
     matches: [...group.matches].sort(
-      (left, right) => left.staticReplay.matchNumber - right.staticReplay.matchNumber
+      (left, right) =>
+        left.staticReplay.matchNumber - right.staticReplay.matchNumber ||
+        left.staticReplay.roundNumber - right.staticReplay.roundNumber
     ),
   }));
 });
@@ -192,12 +223,6 @@ watch([activeMapKey, activeRegionKey], () => (replayPage.value = 1));
 watch(replayPageCount, count => {
   if (count > 0 && replayPage.value > count) replayPage.value = count;
 });
-watch(
-  pagedReplays,
-  matches => emit('preview', matches[0]?.key ?? null),
-  { immediate: true }
-);
-
 function formatMatchNumber(matchNumber: number): string {
   return `M${String(matchNumber).padStart(3, '0')}`;
 }
@@ -223,6 +248,16 @@ const iterSiblings = computed(() => {
       const nb = parseInt(b.key.match(/iter-(\d+)/)?.[1] ?? '0', 10);
       return na - nb;
     });
+});
+const replaySiblings = computed(() => {
+  const match = focused.value;
+  const metadata = match?.staticReplay;
+  if (!metadata) return [];
+  return staticMatches.value
+    .filter(candidate => candidate.staticReplay.seriesKey === metadata.seriesKey)
+    .sort(
+      (left, right) => left.staticReplay.roundNumber - right.staticReplay.roundNumber
+    );
 });
 const focusedSnap = computed(() =>
   props.focusedKey ? props.snapshotMap[props.focusedKey] : undefined
@@ -293,7 +328,7 @@ function teamTotal(vehicles: VehicleState[]) {
     <div class="brand">Gestalt<span>·</span>System Monitor</div>
 
     <template v-if="focused">
-      <button class="overview-btn" @click="emit('overview')">← Matches</button>
+      <button class="overview-btn" data-testid="replay-exit" @click="emit('overview')">← Matches</button>
       <div class="detail-header">
         <span class="detail-name">{{ focused.label }}</span>
       </div>
@@ -302,6 +337,37 @@ function teamTotal(vehicles: VehicleState[]) {
         <div class="top-stat"><span class="ts-num">{{ vehicleCount ?? '—' }}</span><span class="ts-label">Robots</span></div>
         <div class="top-stat"><span class="ts-num">{{ buildingCount ?? '—' }}</span><span class="ts-label">Bldgs</span></div>
         <div class="top-stat"><span class="ts-num">{{ focused.status }}</span><span class="ts-label">Status</span></div>
+      </div>
+
+      <div v-if="focusedPlayback" class="replay-controls" aria-label="Replay controls">
+        <button
+          type="button"
+          data-testid="replay-back"
+          title="Back 10 seconds"
+          @click="seekFocusedReplay(-10_000)"
+        >
+          −10s
+        </button>
+        <button
+          type="button"
+          class="replay-play-toggle"
+          data-testid="replay-play-toggle"
+          :aria-label="focusedPlayback.paused ? 'Play replay' : 'Pause replay'"
+          @click="toggleFocusedReplay"
+        >
+          {{ focusedPlayback.paused ? '▶' : 'Ⅱ' }}
+        </button>
+        <button
+          type="button"
+          data-testid="replay-forward"
+          title="Forward 10 seconds"
+          @click="seekFocusedReplay(10_000)"
+        >
+          +10s
+        </button>
+        <span class="replay-clock">
+          {{ replayTime(focusedPlayback.positionMs) }} / {{ replayTime(focusedPlayback.durationMs) }}
+        </span>
       </div>
 
       <!-- Iteration list (when focused match is part of a packet) -->
@@ -315,6 +381,19 @@ function teamTotal(vehicles: VehicleState[]) {
           @click="emit('focus', sib.key)"
         >
           {{ sib.label }}
+        </button>
+      </div>
+
+      <div v-if="replaySiblings.length > 1" class="iter-list">
+        <div class="sec-title">局次</div>
+        <button
+          v-for="sibling in replaySiblings"
+          :key="sibling.key"
+          class="iter-btn"
+          :class="{ active: sibling.key === focusedKey }"
+          @click="emit('focus', sibling.key)"
+        >
+          第 {{ sibling.staticReplay.roundNumber }} 局 · {{ sibling.status }}
         </button>
       </div>
 
@@ -414,7 +493,7 @@ function teamTotal(vehicles: VehicleState[]) {
             @click="emit('focus', match.key)"
           >
             <strong class="catalog-match-number">
-              {{ formatMatchNumber(match.staticReplay.matchNumber) }}
+              {{ formatMatchNumber(match.staticReplay.matchNumber) }} · G{{ match.staticReplay.roundNumber }}
             </strong>
             <span class="proc-text">
               <span class="proc-name catalog-teams">
@@ -423,7 +502,7 @@ function teamTotal(vehicles: VehicleState[]) {
                 {{ match.staticReplay.blueSchool }}
               </span>
               <span class="proc-sub">
-                {{ match.staticReplay.roundCount }} 局 · {{ match.status }}
+                第 {{ match.staticReplay.roundNumber }} 局 · {{ match.status }}
               </span>
             </span>
           </button>

@@ -3,6 +3,12 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { CSS2DRenderer } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import type { MapWireframe, WorldSnapshot } from '@gsm/protocol';
 import { MatchUnit, type SharedAssets } from './MatchUnit';
+import {
+  PreviewBatch,
+  type RoundPreviewBatchStats,
+  type RoundPreviewFrame,
+  type RoundPreviewSlot,
+} from './PreviewBatch';
 
 /** Gap (m) between grid cells. */
 const GAP = 14;
@@ -40,7 +46,7 @@ interface CameraTween {
   dur: number;
 }
 
-interface DioramaOptions {
+export interface DioramaOptions {
   /** Called when the user focuses/unfocuses by interacting with the scene (click/Esc). */
   onFocusChange?: (key: string | null) => void;
   /** Called periodically with renderer/frame statistics for the app HUD. */
@@ -51,6 +57,7 @@ interface DioramaOptions {
 }
 
 export interface ThreePerformanceStats {
+  sampleId: number;
   fps: number;
   /** Average rAF-to-rAF delta over the window. */
   frameMs: number;
@@ -85,11 +92,29 @@ export interface ThreePerformanceStats {
   activeUnitCount: number;
   /** Vehicles being interpolated across the visible boards. */
   vehicleCount: number;
+  /** Scene-level RMUC overview batch. These stay zero on the live/RL path. */
+  previewSlotCount?: number;
+  previewVisibleSlotCount?: number;
+  previewRobotCount?: number;
+  previewBuildingCount?: number;
+  previewBatchDrawCalls?: number;
+  previewBatchTriangles?: number;
+  previewFrameTimeMs?: number | null;
+  previewClockTimeMs?: number;
+  previewUpdateMs?: number;
+  focusedPreviewUnit?: boolean;
+  focusedFullUnitCount?: 0 | 1;
+  focusedKey?: string | null;
+  focusedSandboxReady?: boolean;
   focused: boolean;
   width: number;
   height: number;
   /** Recent frame times for the HUD sparkline (most recent last). */
   frameSamples: number[];
+}
+
+export interface DioramaRoundPreviewStats extends RoundPreviewBatchStats {
+  focusedFullUnitCount: 0 | 1;
 }
 
 function easeInOutCubic(x: number): number {
@@ -111,6 +136,10 @@ export class DioramaScene {
   private spot: THREE.SpotLight;
   private grid: THREE.GridHelper;
   private units = new Map<string, MatchUnit>();
+  /** RMUC-only lightweight view. Live/RL MatchUnit layout remains independent. */
+  private previewBatch: PreviewBatch | null = null;
+  /** At most one full MatchUnit may replace a lightweight round slot. */
+  private focusedPreviewUnit: { key: string; unit: MatchUnit } | null = null;
   private shared: SharedAssets;
   private ro: ResizeObserver;
   private raf = 0;
@@ -125,6 +154,7 @@ export class DioramaScene {
   private perfFrameMaxMs = 0;
   private perfLongFrames = 0;
   private perfWindowSamples: number[] = []; // frame times this window, for the percentile
+  private performanceSampleId = 0;
   private frameTrace: number[] = []; // rolling ring (FRAME_TRACE_LEN) for the sparkline
   // GPU timer query (EXT_disjoint_timer_query_webgl2): one query in flight at a time;
   // the result lands a few frames later, so we poll and carry the last good reading.
@@ -246,7 +276,144 @@ export class DioramaScene {
 
   // ---- unit management ----------------------------------------------------
 
+  /**
+   * Enable/update the explicit RMUC round overview. This is deliberately a
+   * separate bulk path: passing round keys through addUnit would allocate one
+   * full MatchUnit, map model and label per round.
+   */
+  setRoundPreviewLayout(slots: readonly RoundPreviewSlot[]): void {
+    if (this.previewBatch) {
+      this.previewBatch.setSlots(slots);
+    } else {
+      this.previewBatch = new PreviewBatch(slots);
+      this.scene.add(this.previewBatch.root);
+    }
+    if (this.focusedPreviewUnit) {
+      if (!this.previewBatch.hasSlot(this.focusedPreviewUnit.key)) {
+        throw new Error(
+          `Focused preview unit is absent from the RMUC layout: ${this.focusedPreviewUnit.key}`
+        );
+      }
+      this.previewBatch.slotPosition(
+        this.focusedPreviewUnit.key,
+        this.focusedPreviewUnit.unit.root.position
+      );
+    }
+    this.rebuildOverviewBounds();
+    if (this.focusKey === null) this.scheduleOverviewFrame();
+  }
+
+  clearRoundPreviews(): void {
+    if (!this.previewBatch) return;
+    const hadPreviewFocus =
+      this.focusKey !== null && this.previewBatch.hasSlot(this.focusKey);
+    if (this.focusedPreviewUnit) this.disposeFocusedPreviewUnit();
+    this.scene.remove(this.previewBatch.root);
+    this.previewBatch.dispose();
+    this.previewBatch = null;
+    if (hadPreviewFocus) {
+      this.focusKey = null;
+      this.spot.intensity = 0;
+      for (const unit of this.units.values()) unit.setState('normal');
+      this.applyStackVisibility();
+    }
+    this.rebuildOverviewBounds();
+    if (this.focusKey === null) this.scheduleOverviewFrame();
+  }
+
+  setRoundPreviewFrame(frame: RoundPreviewFrame): void {
+    if (!this.previewBatch) {
+      throw new Error('Cannot apply an RMUC preview frame before its round layout');
+    }
+    this.previewBatch.setFrame(frame);
+  }
+
+  setRoundPreviewClock(timeMs: number): void {
+    if (!this.previewBatch) {
+      throw new Error('Cannot drive the RMUC preview clock before its round layout');
+    }
+    this.previewBatch.setClock(timeMs);
+  }
+
+  roundPreviewStats(): DioramaRoundPreviewStats {
+    const batchStats = this.previewBatch?.stats ?? {
+      slotCount: 0,
+      visibleSlotCount: 0,
+      robotCount: 0,
+      buildingCount: 0,
+      drawCalls: 0,
+      triangles: 0,
+      frameTimeMs: null,
+      clockTimeMs: 0,
+      updateMs: 0,
+    };
+    return {
+      ...batchStats,
+      focusedFullUnitCount:
+        this.focusedPreviewUnit !== null && !this.focusedPreviewUnit.unit.occluded ? 1 : 0,
+    };
+  }
+
+  /**
+   * Materialize the only high-detail RMUC board. It stays hidden until that
+   * round is focused, then replaces the lightweight slot at the same transform.
+   */
+  addFocusedPreviewUnit(key: string, label: string): MatchUnit {
+    const batch = this.previewBatch;
+    if (!batch) throw new Error('Cannot add a focused preview unit before its round layout');
+    if (!batch.hasSlot(key)) throw new Error(`Cannot materialize an unknown round preview: ${key}`);
+    if (this.units.has(key)) throw new Error(`Round preview key collides with a live/RL unit: ${key}`);
+
+    const current = this.focusedPreviewUnit;
+    if (current?.key === key) {
+      current.unit.setLabel(label);
+      return current.unit;
+    }
+    if (current) this.disposeFocusedPreviewUnit();
+
+    const unit = new MatchUnit(key, label, this.shared);
+    batch.slotPosition(key, unit.root.position);
+    unit.onBoundsChange = () => {
+      batch.slotPosition(key, unit.root.position);
+      if (this.focusKey === key) this.updateSpotForUnit(unit);
+    };
+    const active = this.focusKey === key;
+    unit.setState(active ? 'focused' : 'normal');
+    unit.setOccluded(!active);
+    this.scene.add(unit.root);
+    this.focusedPreviewUnit = { key, unit };
+    if (active) {
+      batch.setFocused(key);
+      this.updateSpotForUnit(unit);
+      this.emitActiveKeys();
+    }
+    return unit;
+  }
+
+  removeFocusedPreviewUnit(key: string): void {
+    const current = this.focusedPreviewUnit;
+    if (!current) throw new Error(`No focused preview unit exists while removing ${key}`);
+    if (current.key !== key) {
+      throw new Error(`Focused preview unit is ${current.key}, not ${key}`);
+    }
+    this.disposeFocusedPreviewUnit();
+    this.emitActiveKeys();
+  }
+
+  private disposeFocusedPreviewUnit(): void {
+    const current = this.focusedPreviewUnit;
+    if (!current) return;
+    this.scene.remove(current.unit.root);
+    current.unit.dispose();
+    this.focusedPreviewUnit = null;
+  }
+
   addUnit(key: string, label: string): MatchUnit {
+    if (this.previewBatch?.hasSlot(key)) {
+      throw new Error(
+        `RMUC round ${key} must use addFocusedPreviewUnit; addUnit is the live/RL path`
+      );
+    }
     let unit = this.units.get(key);
     if (unit) {
       unit.setLabel(label);
@@ -261,6 +428,11 @@ export class DioramaScene {
   }
 
   removeUnit(key: string): void {
+    if (this.previewBatch?.hasSlot(key)) {
+      throw new Error(
+        `RMUC round ${key} must use removeFocusedPreviewUnit; removeUnit is the live/RL path`
+      );
+    }
     const unit = this.units.get(key);
     if (!unit) return;
     if (this.focusKey === key) {
@@ -274,10 +446,19 @@ export class DioramaScene {
   }
 
   getUnit(key: string): MatchUnit | undefined {
+    const focusedPreview = this.focusedPreviewUnit;
+    if (focusedPreview?.key === key) return focusedPreview.unit;
     return this.units.get(key);
   }
 
   setMap(key: string, map: MapWireframe): void {
+    const focusedPreview = this.focusedPreviewUnit;
+    if (focusedPreview?.key === key) {
+      focusedPreview.unit.setMap(map);
+      this.previewBatch!.slotPosition(key, focusedPreview.unit.root.position);
+      if (this.focusKey === key) this.updateSpotForUnit(focusedPreview.unit);
+      return;
+    }
     const unit = this.units.get(key);
     if (!unit) return;
     unit.setMap(map);
@@ -285,7 +466,19 @@ export class DioramaScene {
   }
 
   updateSnapshot(key: string, snap: WorldSnapshot): void {
-    this.units.get(key)?.updateSnapshot(snap);
+    this.getUnit(key)?.updateSnapshot(snap);
+  }
+
+  setReplayPaused(key: string, paused: boolean): void {
+    const unit = this.getUnit(key);
+    if (!unit) throw new Error(`Cannot set replay pause state for missing unit: ${key}`);
+    unit.setReplayPaused(paused);
+  }
+
+  markReplayDiscontinuity(key: string): void {
+    const unit = this.getUnit(key);
+    if (!unit) throw new Error(`Cannot reset replay visuals for missing unit: ${key}`);
+    unit.markReplayDiscontinuity();
   }
 
   // ---- focus --------------------------------------------------------------
@@ -297,8 +490,18 @@ export class DioramaScene {
   }
 
   focus(key: string): void {
+    if (this.previewBatch?.hasSlot(key)) {
+      this.focusPreview(key);
+      return;
+    }
     const unit = this.units.get(key);
     if (!unit || this.focusKey === key) return;
+
+    this.previewBatch?.setFocused(null);
+    if (this.focusedPreviewUnit) {
+      this.focusedPreviewUnit.unit.setState('normal');
+      this.focusedPreviewUnit.unit.setOccluded(true);
+    }
 
     const wasFocused = this.focusKey !== null;
     // The Y-shift-only path (no camera move) is correct ONLY when switching between
@@ -353,6 +556,11 @@ export class DioramaScene {
     if (this.focusKey === null) return;
     this.focusKey = null;
     this.userMovedCamera = false; // returning to overview: re-framing is wanted again
+    this.previewBatch?.setFocused(null);
+    if (this.focusedPreviewUnit) {
+      this.focusedPreviewUnit.unit.setState('normal');
+      this.focusedPreviewUnit.unit.setOccluded(true);
+    }
     for (const u of this.units.values()) {
       u.setState('normal');
       u.setPlaqueVisible(true);
@@ -363,7 +571,39 @@ export class DioramaScene {
     this.frameOverview(TWEEN_DUR);
   }
 
+  private focusPreview(key: string): void {
+    const batch = this.previewBatch;
+    if (!batch) throw new Error(`Cannot focus RMUC round without a preview batch: ${key}`);
+    if (!batch.hasSlot(key)) throw new Error(`Cannot focus unknown RMUC round: ${key}`);
+    if (this.focusKey === key) return;
+
+    this.focusKey = key;
+    batch.setFocused(key);
+    for (const unit of this.units.values()) unit.setState('dim');
+
+    const detailed = this.focusedPreviewUnit;
+    if (detailed) {
+      const active = detailed.key === key;
+      detailed.unit.setState(active ? 'focused' : 'normal');
+      detailed.unit.setOccluded(!active);
+      if (active) batch.slotPosition(key, detailed.unit.root.position);
+    }
+    this.applyStackVisibility();
+    const activeUnit = detailed?.key === key ? detailed.unit : null;
+    if (activeUnit) this.frameUnit(activeUnit, TWEEN_DUR);
+    else this.framePreviewSlot(key, TWEEN_DUR);
+  }
+
   // ---- layout & framing ---------------------------------------------------
+
+  private rebuildOverviewBounds(): void {
+    this.gridBounds.makeEmpty();
+    for (const unit of this.units.values()) {
+      if (unit.occluded) continue;
+      this.gridBounds.union(unit.worldBounds(this.tmpBox));
+    }
+    if (this.previewBatch) this.gridBounds.union(this.previewBatch.worldBounds(this.tmpBox));
+  }
 
   /** Iteration units sorted by number, for consistent Y-stack indexing. */
   private sortedIters(): MatchUnit[] {
@@ -403,7 +643,8 @@ export class DioramaScene {
   private relayout(): void {
     const list = [...this.units.values()];
     if (list.length === 0) {
-      this.gridBounds.makeEmpty();
+      this.rebuildOverviewBounds();
+      if (!this.focusKey) this.scheduleOverviewFrame();
       return;
     }
 
@@ -474,11 +715,7 @@ export class DioramaScene {
     // Apply deterministic stack visibility, then frame only the boards that
     // actually render (so a deep stack doesn't blow up the overview bounds).
     this.applyStackVisibility();
-    this.gridBounds.makeEmpty();
-    for (const u of list) {
-      if (u.occluded) continue;
-      this.gridBounds.union(u.worldBounds(this.tmpBox));
-    }
+    this.rebuildOverviewBounds();
 
     // In overview, hide plaques for non-first iteration units in each packet,
     // and set the first unit's plaque to the packet label.
@@ -505,7 +742,16 @@ export class DioramaScene {
       // A relayout while focused (a new live match arrived, or bounds settled) can
       // shift the focused board; re-aim the spotlight so its lighting doesn't drift.
       const focused = this.units.get(this.focusKey);
-      if (focused) this.updateSpotForUnit(focused);
+      if (focused) {
+        this.updateSpotForUnit(focused);
+      } else if (this.previewBatch?.hasSlot(this.focusKey)) {
+        const detailed = this.focusedPreviewUnit;
+        if (detailed?.key === this.focusKey && !detailed.unit.occluded) {
+          this.updateSpotForUnit(detailed.unit);
+        } else {
+          this.updateSpotForPreviewSlot(this.focusKey);
+        }
+      }
     }
   }
 
@@ -530,6 +776,23 @@ export class DioramaScene {
   private frameUnit(unit: MatchUnit, dur: number): void {
     const box = this.updateSpotForUnit(unit);
     this.frameBox(box, FOCUS_MARGIN, FOCUS_DIR, SPOT_INTENSITY, dur);
+  }
+
+  private framePreviewSlot(key: string, dur: number): void {
+    const box = this.updateSpotForPreviewSlot(key);
+    this.frameBox(box, FOCUS_MARGIN, FOCUS_DIR, SPOT_INTENSITY, dur);
+  }
+
+  private updateSpotForPreviewSlot(key: string): THREE.Box3 {
+    const batch = this.previewBatch;
+    if (!batch) throw new Error(`Cannot light RMUC round without a preview batch: ${key}`);
+    const box = batch.slotBounds(key, this.tmpBox);
+    const center = box.getCenter(this.tmpTgt);
+    this.spot.position.set(center.x, SPOT_HEIGHT, center.z);
+    this.spot.target.position.copy(center);
+    const radius = box.getBoundingSphere(this.tmpSphere).radius;
+    this.spot.angle = Math.min(Math.PI / 3, Math.atan((radius * 1.15) / SPOT_HEIGHT));
+    return box;
   }
 
   private updateSpotForUnit(unit: MatchUnit): THREE.Box3 {
@@ -608,12 +871,30 @@ export class DioramaScene {
       if (u.occluded) continue;
       targets.push(...u.pickTargets);
     }
+    const focusedPreview = this.focusedPreviewUnit;
+    if (focusedPreview && !focusedPreview.unit.occluded) {
+      targets.push(...focusedPreview.unit.pickTargets);
+    }
+    if (this.previewBatch) targets.push(...this.previewBatch.pickTargets);
     const hits = this.raycaster.intersectObjects(targets, false);
     if (hits.length) {
-      const unit = hits[0].object.userData.matchUnit as MatchUnit | undefined;
-      if (unit && unit.key !== this.focusKey) {
-        this.focus(unit.key);
-        this.opts.onFocusChange?.(unit.key);
+      const hit = hits[0];
+      const unit = hit.object.userData.matchUnit as MatchUnit | undefined;
+      if (unit) {
+        if (unit.key !== this.focusKey) {
+          this.focus(unit.key);
+          this.opts.onFocusChange?.(unit.key);
+        }
+      } else if (this.previewBatch?.pickTargets.includes(hit.object)) {
+        if (hit.instanceId === undefined) {
+          throw new Error('RMUC preview InstancedMesh intersection has no instanceId');
+        }
+        const slot = this.previewBatch.pick(hit.instanceId);
+        if (!slot) throw new Error(`RMUC preview pick has an invalid instanceId: ${hit.instanceId}`);
+        if (slot.key !== this.focusKey) {
+          this.focus(slot.key);
+          this.opts.onFocusChange?.(slot.key);
+        }
       }
     } else if (this.focusKey !== null) {
       this.overview();
@@ -674,6 +955,9 @@ export class DioramaScene {
     }
 
     for (const unit of this.units.values()) unit.update(dt);
+    if (this.focusedPreviewUnit && !this.focusedPreviewUnit.unit.occluded) {
+      this.focusedPreviewUnit.unit.update(dt);
+    }
     const afterUpdate = performance.now();
 
     // GPU timer wraps only the WebGL pass (CSS2D labels are DOM, not GL). Poll the
@@ -758,11 +1042,16 @@ export class DioramaScene {
     // Tell the feed layer which boards actually render, so hidden feeds can skip
     // the expensive snapshot projection — the dominant main-thread cost at many
     // simultaneous matches.
-    if (this.opts.onActiveKeysChange) {
-      const active = new Set<string>();
-      for (const u of this.units.values()) if (!u.occluded) active.add(u.key);
-      this.opts.onActiveKeysChange(active);
-    }
+    this.emitActiveKeys();
+  }
+
+  private emitActiveKeys(): void {
+    if (!this.opts.onActiveKeysChange) return;
+    const active = new Set<string>();
+    for (const unit of this.units.values()) if (!unit.occluded) active.add(unit.key);
+    const detailed = this.focusedPreviewUnit;
+    if (detailed && !detailed.unit.occluded) active.add(detailed.key);
+    this.opts.onActiveKeysChange(active);
   }
 
   private emitPerformanceStats(
@@ -799,10 +1088,17 @@ export class DioramaScene {
       activeUnits += 1;
       vehicles += u.vehicleCount;
     }
+    const focusedPreview = this.focusedPreviewUnit;
+    if (focusedPreview && !focusedPreview.unit.occluded) {
+      activeUnits += 1;
+      vehicles += focusedPreview.unit.vehicleCount;
+    }
 
     const info = this.renderer.info;
     const canvas = this.renderer.domElement;
+    const preview = this.roundPreviewStats();
     this.opts.onPerformanceStats({
+      sampleId: ++this.performanceSampleId,
       fps: (n * 1000) / this.perfElapsedMs,
       frameMs: avgFrame,
       frameMsMin: sorted[0] ?? 0,
@@ -823,9 +1119,26 @@ export class DioramaScene {
       textures: info.memory.textures,
       programs: info.programs?.length ?? 0,
       pixelRatio: this.renderer.getPixelRatio(),
-      unitCount: this.units.size,
+      unitCount: this.units.size + (this.focusedPreviewUnit === null ? 0 : 1),
       activeUnitCount: activeUnits,
       vehicleCount: vehicles,
+      previewSlotCount: preview.slotCount,
+      previewVisibleSlotCount: preview.visibleSlotCount,
+      previewRobotCount: preview.robotCount,
+      previewBuildingCount: preview.buildingCount,
+      previewBatchDrawCalls: preview.drawCalls,
+      previewBatchTriangles: preview.triangles,
+      previewFrameTimeMs: preview.frameTimeMs,
+      previewClockTimeMs: preview.clockTimeMs,
+      previewUpdateMs: preview.updateMs,
+      focusedPreviewUnit:
+        this.focusedPreviewUnit !== null && !this.focusedPreviewUnit.unit.occluded,
+      focusedFullUnitCount: preview.focusedFullUnitCount,
+      focusedKey: this.focusKey,
+      focusedSandboxReady:
+        focusedPreview !== null &&
+        focusedPreview.key === this.focusKey &&
+        focusedPreview.unit.sandboxReady,
       focused: this.focusKey !== null,
       width: canvas.clientWidth,
       height: canvas.clientHeight,
@@ -859,6 +1172,12 @@ export class DioramaScene {
       this.scene.remove(unit.root);
     }
     this.units.clear();
+    if (this.focusedPreviewUnit) this.disposeFocusedPreviewUnit();
+    if (this.previewBatch) {
+      this.scene.remove(this.previewBatch.root);
+      this.previewBatch.dispose();
+      this.previewBatch = null;
+    }
     this.controls.dispose();
     this.shared.bodyGeo.dispose();
     this.grid.geometry.dispose();

@@ -138,8 +138,8 @@ export class AttributeStore {
   private linkedHiddenMapIds = new Set<number>();
   private t = 0;
 
-  applyResult(res: WatchAttributeMapsResult): void {
-    const now = Date.now();
+  applyResult(res: WatchAttributeMapsResult, now = Date.now()): void {
+    if (!Number.isFinite(now)) throw new Error('AttributeStore update time must be finite');
     for (const u of res?.watch_attribute_maps_results ?? []) this.applyUpdate(u, now);
     this.t++;
     // NOTE: we deliberately do NOT evict stale maps. The store is naturally bounded
@@ -434,10 +434,10 @@ export class AttributeStore {
     return null;
   }
 
-  toSnapshot(): WorldSnapshot {
+  toSnapshot(now = Date.now()): WorldSnapshot {
+    if (!Number.isFinite(now)) throw new Error('AttributeStore snapshot time must be finite');
     // Collect first so the placeholder layout can fit ALL pieces inside the board
     // (the grid dims + spacing derive from the count — see layoutPos).
-    const now = Date.now();
     const registered = this.registeredIds();
     const maps = [...this.maps]
       .map(([mapId, m]) => ({ mapId, m, kind: this.kindFor(mapId, m, registered, now) }))

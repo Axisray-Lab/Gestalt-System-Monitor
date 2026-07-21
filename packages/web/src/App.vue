@@ -2,9 +2,14 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import { useDiscovery } from '@/discovery/useDiscovery';
 import { useMatches, type MatchHooks } from '@/feed/useMatches';
-import { configuredStaticReplays } from '@/feed/staticReplayCatalog';
+import {
+  configuredStaticReplays,
+  RMUC2026_OVERVIEW_SHARDS,
+  RMUC2026_REPLAY_CATALOG,
+} from '@/feed/staticReplayCatalog';
 import { drainFeedPerf, feedPerf } from '@/feed/feedPerf';
 import { DioramaScene, type ThreePerformanceStats } from '@/three/DioramaScene';
+import { RoundPreviewPlayback } from '@/three/RoundPreviewPlayback';
 import type { WorldSnapshot } from '@gsm/protocol';
 import MatchList from '@/components/MatchList.vue';
 
@@ -12,13 +17,17 @@ const PERF_HUD_STORAGE_KEY = 'gsm.performanceHud';
 const numberFormatter = new Intl.NumberFormat('en-US');
 
 const { processes, connected } = useDiscovery();
+const staticReplays = configuredStaticReplays();
+const staticReplayKeys = new Set(staticReplays.map((replay) => replay.key));
 
 // Single source of truth for which unit is focused, two-way synced with the scene.
 const focusedKey = ref<string | null>(null);
-const catalogPreviewKey = ref<string | null>(null);
+const roundPreviewReady = ref(staticReplays.length === 0);
+const roundPreviewError = ref<string | null>(null);
 const settingsOpen = ref(false);
 const showPerformanceHud = ref(loadPerformanceHudSetting());
 const performanceStats = ref<ThreePerformanceStats>({
+  sampleId: 0,
   fps: 0,
   frameMs: 0,
   frameMsMin: 0,
@@ -100,45 +109,74 @@ const gpuIsIntegrated = computed(() => /intel|uhd|iris|microsoft basic|swiftshad
 
 const host = ref<HTMLDivElement>();
 let scene: DioramaScene | null = null;
+let roundPreviewPlayback: RoundPreviewPlayback | null = null;
+let appUnmounting = false;
+
+function requireScene(): DioramaScene {
+  if (!scene) throw new Error('DioramaScene is unavailable after match feeds started');
+  return scene;
+}
 
 // Latest snapshot per match key, for the sidebar detail panel.
 // shallowRef: every add/remove/snapshot replaces the whole .value object (below),
 // so reactivity fires on identity change without deep-proxying each WorldSnapshot.
 // The Three.js render path reads the raw snap and doesn't need reactivity.
 const snapshotMap = shallowRef<Record<string, WorldSnapshot>>({});
+let requiredPerfSampleId = 0;
 
 const hooks: MatchHooks = {
-  onAdd: (key, label) => scene?.addUnit(key, label),
+  onAdd: (key, label) => {
+    if (staticReplayKeys.has(key)) requireScene().addFocusedPreviewUnit(key, label);
+    else requireScene().addUnit(key, label);
+  },
   onRemove: (key) => {
-    scene?.removeUnit(key);
+    if (staticReplayKeys.has(key)) requireScene().removeFocusedPreviewUnit(key);
+    else requireScene().removeUnit(key);
     if (focusedKey.value === key) {
       focusedKey.value = null;
       snapshotMap.value = {};
     }
   },
-  onMap: (key, map) => scene?.setMap(key, map),
+  onMap: (key, map) => requireScene().setMap(key, map),
   onSnapshot: (key, snap) => {
     const tScene = performance.now();
-    scene?.updateSnapshot(key, snap);
+    requireScene().updateSnapshot(key, snap);
     feedPerf.sceneSnapMs += performance.now() - tScene;
     // Only the focused match's snapshot feeds the sidebar detail panel. Storing all
     // 66 matches reactively (a fresh spread per tick × N feeds) was pure overhead;
     // the Three.js render path consumes `snap` directly above, not snapshotMap.
     if (key === focusedKey.value) snapshotMap.value = { [key]: snap };
   },
+  onReplayPlayback: (key, paused) => requireScene().setReplayPaused(key, paused),
+  onReplayDiscontinuity: (key) => requireScene().markReplayDiscontinuity(key),
 };
 // No built-in synthetic mock: matches come from the agent (real LAN discovery +
 // the auto-replayed local datasets multi-1/15/50). See the gsmAgent vite plugin.
-const { matches, start, setActiveKeys, setFocusedKey: setMaterializedStaticReplayKey } = useMatches(processes, hooks, {
-  staticReplays: configuredStaticReplays(),
+const {
+  matches,
+  start,
+  setActiveKeys,
+  setFocusedKey: setMaterializedStaticReplayKey,
+  setReplayPaused,
+  seekReplay,
+} = useMatches(processes, hooks, {
+  staticReplays,
 });
 
-watch([focusedKey, catalogPreviewKey], ([focused, preview]) => {
-  setMaterializedStaticReplayKey(focused ?? preview);
-});
 watch(focusedKey, (key) => {
+  requiredPerfSampleId = performanceStats.value.sampleId + 1;
+  setMaterializedStaticReplayKey(key);
+  if (key !== null && staticReplayKeys.has(key)) {
+    if (!roundPreviewPlayback) {
+      throw new Error(`Round preview playback is unavailable while focusing ${key}`);
+    }
+    if (!roundPreviewPlayback.hasRound(key)) {
+      throw new Error(`Round preview playback does not contain focused round ${key}`);
+    }
+    seekReplay(key, roundPreviewPlayback.positionMs(key));
+  }
   snapshotMap.value = {};
-  scene?.applyFocus(key);
+  requireScene().applyFocus(key);
 });
 watch(showPerformanceHud, (enabled) => {
   try {
@@ -178,6 +216,113 @@ interface FeedFrameCost {
   sceneSnapMs: number;
   msgsPerSec: number;
 }
+
+interface GsmE2EState {
+  ready: boolean;
+  mode: 'overview' | 'focus-loading' | 'focus';
+  roundKeys: string[];
+  focusedKey: string | null;
+  previewUnitCount: number;
+  previewRobotCount: number;
+  fullUnitCount: number;
+  focusedVehicleCount: number;
+  focusedSandboxReady: boolean;
+  perfSampleId: number;
+  gpuRenderer: string;
+  drawCalls: number;
+  triangles: number;
+  frameMsP95: number;
+  longFrames: number;
+  paused: boolean | null;
+  playbackMs: number | null;
+  durationMs: number | null;
+}
+
+interface GsmE2EHook {
+  getState(): GsmE2EState;
+  selectRound(key: string): void;
+  exitFocus(): void;
+  setPaused(paused: boolean): void;
+  seek(positionMs: number): void;
+}
+
+declare global {
+  interface Window {
+    __GSM_E2E__?: GsmE2EHook;
+  }
+}
+
+function installE2EHook(): void {
+  if (import.meta.env.VITE_GSM_E2E !== '1') return;
+  window.__GSM_E2E__ = {
+    getState: () => {
+      if (!scene) throw new Error('E2E state requested before DioramaScene initialization');
+      const key = focusedKey.value;
+      const view = key === null ? null : matches.value.find((match) => match.key === key) ?? null;
+      const playback = view?.replayPlayback ?? null;
+      const stats = performanceStats.value;
+      const overviewReady =
+        key === null &&
+        stats.focusedKey === null &&
+        stats.previewSlotCount === staticReplays.length &&
+        stats.previewVisibleSlotCount === staticReplays.length &&
+        (stats.previewRobotCount ?? 0) > 0;
+      const focusReady =
+        key !== null &&
+        view?.status === 'open' &&
+        playback !== null &&
+        stats.focusedKey === key &&
+        stats.focusedFullUnitCount === 1 &&
+        stats.focusedSandboxReady === true &&
+        stats.vehicleCount > 0;
+      const mode: GsmE2EState['mode'] =
+        key === null ? 'overview' : focusReady ? 'focus' : 'focus-loading';
+      return {
+        ready:
+          roundPreviewReady.value &&
+          roundPreviewError.value === null &&
+          stats.sampleId >= requiredPerfSampleId &&
+          stats.drawCalls > 0 &&
+          (key === null ? overviewReady : focusReady),
+        mode,
+        roundKeys: staticReplays.map((replay) => replay.key),
+        focusedKey: key,
+        previewUnitCount: stats.previewVisibleSlotCount ?? 0,
+        previewRobotCount: stats.previewRobotCount ?? 0,
+        fullUnitCount: stats.focusedFullUnitCount ?? 0,
+        focusedVehicleCount: stats.vehicleCount,
+        focusedSandboxReady: stats.focusedSandboxReady === true,
+        perfSampleId: stats.sampleId,
+        gpuRenderer: stats.gpuRenderer,
+        drawCalls: stats.drawCalls,
+        triangles: stats.triangles,
+        frameMsP95: stats.frameMsP95,
+        longFrames: stats.longFrames,
+        paused: playback?.paused ?? null,
+        playbackMs: playback?.positionMs ?? null,
+        durationMs: playback?.durationMs ?? null,
+      };
+    },
+    selectRound: (key) => {
+      if (!staticReplayKeys.has(key)) throw new Error(`E2E requested an unknown round: ${key}`);
+      focusedKey.value = key;
+    },
+    exitFocus: () => {
+      focusedKey.value = null;
+    },
+    setPaused: (paused) => {
+      const key = focusedKey.value;
+      if (key === null) throw new Error('E2E pause requested without a focused replay');
+      setReplayPaused(key, paused);
+    },
+    seek: (positionMs) => {
+      const key = focusedKey.value;
+      if (key === null) throw new Error('E2E seek requested without a focused replay');
+      seekReplay(key, positionMs);
+    },
+  };
+}
+
 function perfSample(s: ThreePerformanceStats, feed: FeedFrameCost): Record<string, unknown> {
   return {
     type: 'sample',
@@ -201,8 +346,8 @@ function perfSample(s: ThreePerformanceStats, feed: FeedFrameCost): Record<strin
     gpuMs: round1(s.gpuMs),
     draws: s.drawCalls,
     tris: s.triangles,
-    matches: `${s.activeUnitCount}/${s.unitCount}`,
-    vehicles: s.vehicleCount,
+    matches: `${s.previewVisibleSlotCount ?? s.activeUnitCount}/${s.previewSlotCount ?? s.unitCount}`,
+    vehicles: s.previewRobotCount ?? s.vehicleCount,
     focused: s.focused,
     // Window focus / tab visibility: if hitches line up with hasFocus=false, the
     // jank is the browser throttling the unfocused window, not our rendering.
@@ -267,10 +412,34 @@ onMounted(() => {
     // Hidden boards stop projecting snapshots — only the ~visible/focused feeds work.
     onActiveKeysChange: (keys) => setActiveKeys(keys),
   });
+  if (staticReplays.length > 0) {
+    roundPreviewPlayback = new RoundPreviewPlayback(
+      scene,
+      staticReplays,
+      RMUC2026_OVERVIEW_SHARDS,
+      RMUC2026_REPLAY_CATALOG.databaseSha256
+    );
+    void roundPreviewPlayback.start()
+      .then(() => {
+        if (appUnmounting) return;
+        roundPreviewReady.value = true;
+      })
+      .catch((error: unknown) => {
+        if (appUnmounting) return;
+        const message = error instanceof Error ? error.message : String(error);
+        roundPreviewError.value = message;
+        console.error('[rmuc overview] load failed', error);
+      });
+  }
   start();
+  installE2EHook();
 });
 
 onBeforeUnmount(() => {
+  appUnmounting = true;
+  if (import.meta.env.VITE_GSM_E2E === '1') delete window.__GSM_E2E__;
+  roundPreviewPlayback?.dispose();
+  roundPreviewPlayback = null;
   scene?.dispose();
   scene = null;
 });
@@ -285,10 +454,21 @@ onBeforeUnmount(() => {
       :snapshot-map="snapshotMap"
       @focus="focusedKey = $event"
       @overview="focusedKey = null"
-      @preview="catalogPreviewKey = $event"
+      @replay-paused="setReplayPaused"
+      @replay-seek="seekReplay"
     />
     <main class="stage">
       <div ref="host" class="canvas-host" />
+      <div v-if="roundPreviewError" class="preview-status error" role="alert">
+        RMUC2026 全量预览加载失败：{{ roundPreviewError }}
+      </div>
+      <div
+        v-else-if="staticReplays.length > 0 && !roundPreviewReady"
+        class="preview-status"
+        aria-live="polite"
+      >
+        正在校验并加载 613 局轻量轨迹…
+      </div>
     </main>
 
     <aside v-if="showPerformanceHud" class="perf-hud" aria-label="Three.js performance monitor">
@@ -366,6 +546,10 @@ onBeforeUnmount(() => {
           <dt title="JSON.parse + store fold + projection across all feeds, per frame — a slice of Other">Feed</dt>
           <dd>{{ (feedFrameCost.parseMs + feedFrameCost.applyMs + feedFrameCost.projectMs).toFixed(1) }} ms</dd>
         </div>
+        <div v-if="performanceStats.previewUpdateMs != null">
+          <dt title="Latest shared 613-round point-batch update">Preview</dt>
+          <dd>{{ performanceStats.previewUpdateMs.toFixed(1) }} ms</dd>
+        </div>
         <div>
           <dt title="WS messages folded per second across all open feeds">Feed msgs</dt>
           <dd>{{ formatCount(feedFrameCost.msgsPerSec) }}/s</dd>
@@ -383,12 +567,21 @@ onBeforeUnmount(() => {
           <dd>{{ formatCount(performanceStats.triangles) }}</dd>
         </div>
         <div>
-          <dt title="Rendering / total matches">Matches</dt>
-          <dd>{{ performanceStats.activeUnitCount }} / {{ performanceStats.unitCount }}</dd>
+          <dt title="Visible lightweight previews / total rounds">Previews</dt>
+          <dd>
+            {{ (performanceStats.previewSlotCount ?? 0) > 0
+              ? performanceStats.previewVisibleSlotCount
+              : performanceStats.activeUnitCount }} /
+            {{ (performanceStats.previewSlotCount ?? 0) > 0
+              ? performanceStats.previewSlotCount
+              : performanceStats.unitCount }}
+          </dd>
         </div>
         <div>
-          <dt>Vehicles</dt>
-          <dd>{{ performanceStats.vehicleCount }}</dd>
+          <dt>Preview points</dt>
+          <dd>{{ (performanceStats.previewSlotCount ?? 0) > 0
+            ? performanceStats.previewRobotCount
+            : performanceStats.vehicleCount }}</dd>
         </div>
         <div>
           <dt>Resources</dt>

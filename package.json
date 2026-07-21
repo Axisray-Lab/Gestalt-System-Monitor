@@ -22,10 +22,16 @@
     "verify:rmuc2026-pages-assets": "node packages/agent/src/rmuc2026-pages-replay.mjs --verify-assets-only",
     "build": "npm run build -w @gsm/web",
     "build:web": "npm exec -w @gsm/web -- vite build",
+    "preview:e2e": "npm exec -w @gsm/web -- vite preview --host 127.0.0.1 --port 4173 --strictPort",
     "desktop:dev": "npm run dev -w @gsm/desktop",
     "desktop:build": "npm run build:web && npm run build -w @gsm/desktop",
     "test": "npm run test -w @gsm/agent && npm run test -w @gsm/web",
+    "test:e2e": "playwright test -c tests/e2e/playwright.config.ts",
+    "test:e2e:report": "playwright show-report tests/e2e/test-results/playwright-report",
     "typecheck": "npm run typecheck -w @gsm/web && npm run typecheck -w @gsm/agent"
   },
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
+  }
 }

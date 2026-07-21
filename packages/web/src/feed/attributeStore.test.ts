@@ -19,6 +19,22 @@ function result(
 }
 
 describe('AttributeStore replay lifecycle', () => {
+  it('uses an explicit replay clock for robot freshness', () => {
+    const store = new AttributeStore();
+    const mapId = 101;
+    store.applyResult(result(0, mapId, {
+      [AttrId.Class]: 1003,
+      [AttrId.TeamID]: 0,
+      [AttrId.TeamNumber]: 1,
+      [AttrId.Health]: 100,
+      [AttrId.HealthMax]: 100,
+    }), 10_000);
+
+    expect(store.toSnapshot(13_500).vehicles).toHaveLength(1);
+    expect(store.toSnapshot(13_501).vehicles).toHaveLength(0);
+    expect(() => store.toSnapshot(Number.NaN)).toThrow(/time must be finite/);
+  });
+
   it('removes a native recycle tombstone and accepts a later incremental recreation', () => {
     const store = new AttributeStore();
     const mapId = 101;

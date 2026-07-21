@@ -2,6 +2,20 @@ import type { MapWireframe, WorldSnapshot } from '@gsm/protocol';
 
 export type FeedStatus = 'idle' | 'connecting' | 'open' | 'closed' | 'error';
 
+export interface ReplayPlaybackState {
+  paused: boolean;
+  positionMs: number;
+  durationMs: number;
+}
+
+/** Controls exposed only by deterministic recorded-replay feeds. */
+export interface ReplayPlaybackControls {
+  onState(cb: (state: ReplayPlaybackState) => void): void;
+  onDiscontinuity(cb: () => void): void;
+  setPaused(paused: boolean): void;
+  seek(positionMs: number): void;
+}
+
 /**
  * A telemetry source the renderer consumes. Implemented by both the live
  * WebSocket feed (`createWsFeed`) and the in-browser `createMockFeed`, so
@@ -9,6 +23,8 @@ export type FeedStatus = 'idle' | 'connecting' | 'open' | 'closed' | 'error';
  */
 export interface FeedSource {
   readonly label: string;
+  /** Absent for live WebSocket feeds; present for browser-hosted recordings. */
+  readonly playback?: ReplayPlaybackControls;
   onMap(cb: (m: MapWireframe) => void): void;
   onSnapshot(cb: (s: WorldSnapshot) => void): void;
   onStatus(cb: (s: FeedStatus) => void): void;
@@ -30,6 +46,8 @@ export interface MatchView {
   key: string;
   label: string;
   status: FeedStatus;
+  /** Present while a static replay is materialized. */
+  replayPlayback?: ReplayPlaybackState;
   playerCount?: number;
   /** Present only for browser-hosted replay catalog entries. */
   staticReplay?: {
@@ -39,7 +57,10 @@ export interface MatchView {
     mapLabel: string;
     regionKey: string;
     regionLabel: string;
+    seriesKey: string;
     matchNumber: number;
+    roundNumber: number;
+    gameId: number;
     roundCount: number;
     redSchool: string;
     blueSchool: string;

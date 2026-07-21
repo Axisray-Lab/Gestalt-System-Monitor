@@ -504,6 +504,8 @@ export class MatchUnit {
   private sandboxCalibration = { scaleZ: 1, positionZ: 0 };
   /** Bumped each setMap so a stale async model load can be discarded. */
   private modelLoadId = 0;
+  private sandboxLoadState: 'uninitialized' | 'deferred' | 'loading' | 'ready' | 'error' =
+    'uninitialized';
   /** Sandbox model load is deferred until the board is visible, so a deep stack
    *  doesn't merge dozens of hidden models at once (which blocks the main thread
    *  and starves the feeds). Holds the pending fit params; nulled once loaded. */
@@ -511,6 +513,9 @@ export class MatchUnit {
     | { mapId: string | number | undefined; cx: number; cz: number; sx: number; sz: number }
     | null = null;
   private disposed = false;
+  private replayPausedAt: number | null = null;
+  private replayPausedTotalMs = 0;
+  private replayDiscontinuityPending = false;
   private surfaceProjectionPool: SurfaceProjection[] = Array.from(
     { length: MAX_SURFACE_PROJECTIONS },
     () => ({ x: 0, z: 0, color: NEUTRAL })
@@ -603,6 +608,8 @@ export class MatchUnit {
   }
 
   setMap(map: MapWireframe): void {
+    this.modelLoadId += 1;
+    this.sandboxLoadState = 'deferred';
     this.hasBaseAnchorRed = false;
     this.hasBaseAnchorBlue = false;
     for (const line of this.lines) {
@@ -701,7 +708,11 @@ export class MatchUnit {
     this.setLinesVisible(true);
     const def = mapModelFor(mapId);
     const loadId = ++this.modelLoadId;
-    if (!def) return;
+    if (!def) {
+      this.sandboxLoadState = 'ready';
+      return;
+    }
+    this.sandboxLoadState = 'loading';
     loadMapModel(def)
       .then((m) => {
         if (this.disposed || loadId !== this.modelLoadId) {
@@ -758,9 +769,13 @@ export class MatchUnit {
         this.setLinesVisible(false); // the model replaces the oval wireframe
         this._localBounds.min.y = Math.min(this._localBounds.min.y, -sink);
         this._localBounds.max.y = Math.max(this._localBounds.max.y, m.footprint.y * scaleY - sink);
+        this.sandboxLoadState = 'ready';
         this.onBoundsChange?.();
       })
-      .catch((err) => console.error('[gsm] map model load failed:', err));
+      .catch((err) => {
+        if (!this.disposed && loadId === this.modelLoadId) this.sandboxLoadState = 'error';
+        console.error('[gsm] map model load failed:', err);
+      });
   }
 
   private setLinesVisible(visible: boolean): void {
@@ -827,7 +842,15 @@ export class MatchUnit {
   }
 
   updateSnapshot(snap: WorldSnapshot): void {
-    const now = performance.now();
+    const now = this.visualNow();
+    const discontinuity = this.replayDiscontinuityPending;
+    this.replayDiscontinuityPending = false;
+    if (discontinuity) {
+      for (const viz of this.vehicles.values()) {
+        viz.lastV = null;
+        viz.lastShotAt = -Infinity;
+      }
+    }
     const focused = this.state === 'focused';
     const seen = new Set<number>();
     const damagedThisFrame: DamageTarget[] = [];
@@ -861,6 +884,39 @@ export class MatchUnit {
       }
     }
     this.updateBaseAnchors(snap);
+    if (discontinuity || this.replayPausedAt !== null) this.snapVehiclesToTargets();
+  }
+
+  setReplayPaused(paused: boolean): void {
+    if ((this.replayPausedAt !== null) === paused) return;
+    const now = performance.now();
+    if (paused) {
+      this.replayPausedAt = now;
+      return;
+    }
+    this.replayPausedTotalMs += now - this.replayPausedAt!;
+    this.replayPausedAt = null;
+  }
+
+  markReplayDiscontinuity(): void {
+    this.clearProjectiles();
+    this.pendingShots.length = 0;
+    this.recentDamageTargets.length = 0;
+    this.replayDiscontinuityPending = true;
+  }
+
+  private visualNow(): number {
+    return (this.replayPausedAt ?? performance.now()) - this.replayPausedTotalMs;
+  }
+
+  private snapVehiclesToTargets(): void {
+    for (const viz of this.vehicles.values()) {
+      viz.curPos.copy(viz.tgtPos);
+      viz.curQuat.copy(viz.tgtQuat);
+      viz.group.position.copy(viz.curPos);
+      viz.group.quaternion.copy(viz.curQuat);
+      this.applyBuildingPlacement(viz);
+    }
   }
 
   private updateBaseAnchors(snap: WorldSnapshot): void {
@@ -936,8 +992,9 @@ export class MatchUnit {
       }
       return;
     }
+    if (this.replayPausedAt !== null) return;
     const alpha = 1 - Math.exp(-SMOOTH * dt);
-    const now = performance.now();
+    const now = this.visualNow();
     const focused = this.state === 'focused';
     // Only the focused unit reads root.matrixWorld this frame (surface-projection
     // raycast); for the rest the renderer's own matrix pass suffices.
@@ -1262,6 +1319,10 @@ export class MatchUnit {
     return this.vehicles.size;
   }
 
+  get sandboxReady(): boolean {
+    return this.sandboxLoadState === 'ready';
+  }
+
   worldBounds(target = new THREE.Box3()): THREE.Box3 {
     // Valid because root carries only translation (no rotation/scale).
     return target.copy(this._localBounds).translate(this.root.position);
@@ -1490,7 +1551,7 @@ export class MatchUnit {
     const wasDefeated = vehicleDefeated(viz.lastV);
     const isDefeated = vehicleDefeated(v);
     if (isDefeated && (!wasDefeated || viz.defeatedSince == null)) {
-      viz.defeatedSince = performance.now();
+      viz.defeatedSince = this.visualNow();
     } else if (!isDefeated) {
       viz.defeatedSince = null;
     }
@@ -1529,7 +1590,7 @@ export class MatchUnit {
     const heroLob = v.classId === CLASS_HERO && v.deployed === true && ammo42Drop >= 0.9;
     if (heroLob ? ammo42Drop > 4 : totalDrop < 0.9 || totalDrop > 16) return;
 
-    const now = performance.now();
+    const now = this.visualNow();
     if (now - viz.lastShotAt < PROJECTILE_MIN_INTERVAL_MS) return;
 
     const preferredTarget = heroLob ? this.findEnemyBaseTarget(v) : null;
@@ -1562,7 +1623,7 @@ export class MatchUnit {
         : 0;
     if (drop < 0.9 || drop > 4) return;
 
-    const now = performance.now();
+    const now = this.visualNow();
     if (now - viz.lastShotAt < DART_MIN_TRAVEL_MS * 0.45) return;
 
     const target = this.findEnemyBaseTarget(v);
@@ -1964,7 +2025,7 @@ export class MatchUnit {
   private respawnDisplay(
     viz: VehicleViz,
     v: VehicleState,
-    now = performance.now()
+    now = this.visualNow()
   ): RespawnDisplay | null {
     if (!vehicleDefeated(v)) return null;
 
@@ -2045,7 +2106,7 @@ export class MatchUnit {
       const distance = (viz.placed ? viz.group.position : viz.tgtPos).distanceTo(sourcePoint);
       if (distance >= bestDistance) continue;
       bestDistance = distance;
-      best = { id, viz, vehicle: target, amount: 0, seenAt: performance.now() };
+      best = { id, viz, vehicle: target, amount: 0, seenAt: this.visualNow() };
     }
     return best;
   }
@@ -2324,7 +2385,7 @@ export class MatchUnit {
     return true;
   }
 
-  private updatePanel(viz: VehicleViz, v: VehicleState, now = performance.now()): void {
+  private updatePanel(viz: VehicleViz, v: VehicleState, now = this.visualNow()): void {
     const p = viz.panel;
     if (!p) return;
     const teamChanged = v.team !== p.last.team;
@@ -2508,5 +2569,3 @@ export class MatchUnit {
     }
   }
 }
-
-
