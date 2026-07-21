@@ -161,7 +161,15 @@ const mapGroups = computed<CatalogMapGroup[]>(() => {
 const activeMapKey = ref<string | null>(null);
 const activeRegionKey = ref<string | null>(null);
 const replayPage = ref(1);
+const replaySearch = ref('');
 const REPLAYS_PER_PAGE = 12;
+
+function normalizeReplaySearch(value: string): string {
+  return value.normalize('NFKC').toLocaleLowerCase('zh-CN').trim();
+}
+
+const normalizedReplaySearch = computed(() => normalizeReplaySearch(replaySearch.value));
+const hasReplaySearch = computed(() => normalizedReplaySearch.value.length > 0);
 
 watch(
   mapGroups,
@@ -211,16 +219,40 @@ watch(
 const activeRegion = computed(() =>
   regionGroups.value.find(group => group.key === activeRegionKey.value) ?? null
 );
+const filteredReplays = computed<StaticMatch[]>(() => {
+  if (!hasReplaySearch.value) return activeRegion.value?.matches ?? [];
+  const terms = normalizedReplaySearch.value.split(/\s+/);
+  return (activeMap.value?.matches ?? []).filter(match => {
+    const metadata = match.staticReplay;
+    const haystack = normalizeReplaySearch([
+      match.label,
+      metadata.competitionLabel,
+      metadata.mapLabel,
+      metadata.regionLabel,
+      metadata.redSchool,
+      metadata.blueSchool,
+      formatMatchNumber(metadata.matchNumber),
+      `M${metadata.matchNumber}`,
+      `G${metadata.roundNumber}`,
+      `第${metadata.roundNumber}局`,
+    ].join(' '));
+    return terms.every(term => haystack.includes(term));
+  });
+});
 const replayPageCount = computed(() =>
-  Math.ceil((activeRegion.value?.matches.length ?? 0) / REPLAYS_PER_PAGE)
+  Math.ceil(filteredReplays.value.length / REPLAYS_PER_PAGE)
 );
 const pagedReplays = computed(() => {
   const start = (replayPage.value - 1) * REPLAYS_PER_PAGE;
-  return activeRegion.value?.matches.slice(start, start + REPLAYS_PER_PAGE) ?? [];
+  return filteredReplays.value.slice(start, start + REPLAYS_PER_PAGE);
 });
 
-watch([activeMapKey, activeRegionKey], () => (replayPage.value = 1));
+watch([activeMapKey, activeRegionKey, replaySearch], () => (replayPage.value = 1));
 watch(replayPageCount, count => {
+  if (count === 0) {
+    replayPage.value = 1;
+    return;
+  }
   if (count > 0 && replayPage.value > count) replayPage.value = count;
 });
 function formatMatchNumber(matchNumber: number): string {
@@ -457,7 +489,26 @@ function teamTotal(vehicles: VehicleState[]) {
           </button>
         </nav>
 
-        <nav class="catalog-tabs region-tabs" aria-label="RMUC 2026 regions">
+        <div class="catalog-search">
+          <input
+            v-model="replaySearch"
+            type="search"
+            data-testid="replay-search"
+            aria-label="搜索回放"
+            placeholder="搜索学校 / M001 / G1"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span
+            v-if="hasReplaySearch"
+            data-testid="replay-search-count"
+            aria-live="polite"
+          >
+            {{ filteredReplays.length }} 局 · 全赛区
+          </span>
+        </div>
+
+        <nav v-if="!hasReplaySearch" class="catalog-tabs region-tabs" aria-label="RMUC 2026 regions">
           <button
             v-for="region in regionGroups"
             :key="region.key"
@@ -471,7 +522,12 @@ function teamTotal(vehicles: VehicleState[]) {
           </button>
         </nav>
 
-        <div v-if="replayPageCount > 1" class="catalog-pagination" aria-label="Replay pages">
+        <div
+          v-if="replayPageCount > 1"
+          class="catalog-pagination"
+          data-testid="replay-pagination"
+          aria-label="Replay pages"
+        >
           <button type="button" :disabled="replayPage === 1" @click="previousReplayPage">上一页</button>
           <span>{{ replayPage }} / {{ replayPageCount }}</span>
           <button
@@ -483,12 +539,13 @@ function teamTotal(vehicles: VehicleState[]) {
           </button>
         </div>
 
-        <div class="catalog-replays">
+        <div v-if="filteredReplays.length > 0" class="catalog-replays">
           <button
             v-for="match in pagedReplays"
             :key="match.key"
             type="button"
             class="proc catalog-replay"
+            data-testid="catalog-replay"
             :class="{ active: match.key === focusedKey }"
             @click="emit('focus', match.key)"
           >
@@ -502,10 +559,19 @@ function teamTotal(vehicles: VehicleState[]) {
                 {{ match.staticReplay.blueSchool }}
               </span>
               <span class="proc-sub">
+                <template v-if="hasReplaySearch">{{ match.staticReplay.regionLabel }} · </template>
                 第 {{ match.staticReplay.roundNumber }} 局 · {{ match.status }}
               </span>
             </span>
           </button>
+        </div>
+        <div
+          v-else-if="hasReplaySearch"
+          class="catalog-empty"
+          data-testid="replay-search-empty"
+          role="status"
+        >
+          没有匹配的对局
         </div>
       </section>
 

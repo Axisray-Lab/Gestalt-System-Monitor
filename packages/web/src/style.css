@@ -276,6 +276,41 @@ body {
   min-height: 27px;
   padding-block: 3px;
 }
+.catalog-search {
+  display: grid;
+  gap: 4px;
+}
+.catalog-search input {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  outline: none;
+  background: #0d151e;
+  color: var(--text);
+  padding: 0 10px;
+  font: inherit;
+  font-size: 11px;
+}
+.catalog-search input::placeholder {
+  color: var(--text-dim);
+}
+.catalog-search input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(79, 159, 224, 0.12);
+}
+.catalog-search span,
+.catalog-empty {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+.catalog-empty {
+  padding: 16px 8px;
+  border: 1px dashed var(--line);
+  border-radius: 7px;
+  text-align: center;
+}
 .catalog-replays {
   display: grid;
   gap: 6px;

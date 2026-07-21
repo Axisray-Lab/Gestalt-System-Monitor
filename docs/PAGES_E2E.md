@@ -7,10 +7,11 @@ The Pages workflow runs the built RMUC 2026 replay monitor in headless Chromium 
 The Playwright scenario verifies one continuous user journey:
 
 1. the overview reports exactly 613 unique round previews and 7,151 official robot points;
-2. only lightweight previews render in overview;
-3. selecting one round leaves 612 lightweight previews and creates exactly one full renderer;
-4. a pause longer than the renderer's five-second stale window retains vehicles, while play, exact ±10-second steps, direct seek, and exit change authoritative replay state;
-5. exiting destroys the full renderer and restores all 613 previews.
+2. the replay search finds a unique cross-region school/match/round combination, reports an empty result explicitly, and restores the first catalog page when cleared;
+3. only lightweight previews render in overview;
+4. selecting one round leaves 612 lightweight previews and creates exactly one full renderer;
+5. a pause longer than the renderer's five-second stale window retains vehicles, while play, exact ±10-second steps, direct seek, and exit change authoritative replay state;
+6. exiting destroys the full renderer and restores all 613 previews.
 
 Screenshots, a JSON result, an HTML report, and a Playwright trace on failure are uploaded as the `pages-e2e-report` workflow artifact.
 The measured unit counts, renderer complexity, heap, frame p95, and long-frame ratio are also written to the workflow run summary.

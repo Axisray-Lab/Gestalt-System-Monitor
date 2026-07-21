@@ -105,6 +105,23 @@ test('all rounds stay lightweight while one replay owns the full renderer', asyn
   expect(overview.triangles, 'Overview triangle complexity regression.').toBeLessThanOrEqual(
     LIMITS.overviewTriangles
   );
+
+  const replaySearch = page.getByTestId('replay-search');
+  const catalogReplays = page.getByTestId('catalog-replay');
+  await expect(replaySearch).toBeVisible();
+  await expect(catalogReplays).toHaveCount(12);
+  await replaySearch.fill('华南农业大学 M001 G2');
+  await expect(page.getByTestId('replay-search-count')).toHaveText('1 局 · 全赛区');
+  await expect(catalogReplays).toHaveCount(1);
+  await expect(catalogReplays).toContainText('华南农业大学');
+  await expect(catalogReplays).toContainText('南部赛区');
+  await replaySearch.fill('不存在的学校 M999');
+  await expect(catalogReplays).toHaveCount(0);
+  await expect(page.getByTestId('replay-search-empty')).toHaveText('没有匹配的对局');
+  await replaySearch.fill('');
+  await expect(catalogReplays).toHaveCount(12);
+  await expect(page.getByTestId('replay-pagination')).toContainText('1 / 17');
+
   const overviewTiming = await sampleAnimationFrames(page, 4_000, LIMITS.overviewLongFrameMs);
   const overviewAfterTiming = await readState(page);
   await attachMetrics(testInfo, {
