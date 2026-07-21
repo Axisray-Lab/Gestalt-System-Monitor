@@ -5,24 +5,17 @@ import { useMatches, type MatchHooks } from '@/feed/useMatches';
 import { configuredStaticReplays } from '@/feed/staticReplayCatalog';
 import { drainFeedPerf, feedPerf } from '@/feed/feedPerf';
 import { DioramaScene, type ThreePerformanceStats } from '@/three/DioramaScene';
-import type { HeadlessMatchConfig, WorldSnapshot } from '@gsm/protocol';
+import type { WorldSnapshot } from '@gsm/protocol';
 import MatchList from '@/components/MatchList.vue';
-import TeamBuilderPanel from '@/components/TeamBuilderPanel.vue';
 
 const PERF_HUD_STORAGE_KEY = 'gsm.performanceHud';
 const numberFormatter = new Intl.NumberFormat('en-US');
 
-const {
-  processes,
-  connected,
-  launcherStatus,
-  launcherBusy,
-  launcherError,
-  launchHeadlessMatches,
-} = useDiscovery();
+const { processes, connected } = useDiscovery();
 
 // Single source of truth for which unit is focused, two-way synced with the scene.
 const focusedKey = ref<string | null>(null);
+const catalogPreviewKey = ref<string | null>(null);
 const settingsOpen = ref(false);
 const showPerformanceHud = ref(loadPerformanceHudSetting());
 const performanceStats = ref<ThreePerformanceStats>({
@@ -136,13 +129,15 @@ const hooks: MatchHooks = {
 };
 // No built-in synthetic mock: matches come from the agent (real LAN discovery +
 // the auto-replayed local datasets multi-1/15/50). See the gsmAgent vite plugin.
-const { matches, start, setActiveKeys, setFocusedKey } = useMatches(processes, hooks, {
+const { matches, start, setActiveKeys, setFocusedKey: setMaterializedStaticReplayKey } = useMatches(processes, hooks, {
   staticReplays: configuredStaticReplays(),
 });
 
+watch([focusedKey, catalogPreviewKey], ([focused, preview]) => {
+  setMaterializedStaticReplayKey(focused ?? preview);
+});
 watch(focusedKey, (key) => {
   snapshotMap.value = {};
-  setFocusedKey(key);
   scene?.applyFocus(key);
 });
 watch(showPerformanceHud, (enabled) => {
@@ -159,15 +154,6 @@ function loadPerformanceHudSetting(): boolean {
   } catch {
     return true;
   }
-}
-
-function launchCustomMatch(match: HeadlessMatchConfig): void {
-  void launchHeadlessMatches({
-    targetMatches: 1,
-    parallelism: 1,
-    autoSave: match.attrrecord === true,
-    match,
-  });
 }
 
 function formatCount(value: number): string {
@@ -299,13 +285,7 @@ onBeforeUnmount(() => {
       :snapshot-map="snapshotMap"
       @focus="focusedKey = $event"
       @overview="focusedKey = null"
-    />
-    <TeamBuilderPanel
-      :agent-connected="connected"
-      :launcher-status="launcherStatus"
-      :launcher-busy="launcherBusy"
-      :launcher-error="launcherError"
-      @launch-match="launchCustomMatch"
+      @preview="catalogPreviewKey = $event"
     />
     <main class="stage">
       <div ref="host" class="canvas-host" />

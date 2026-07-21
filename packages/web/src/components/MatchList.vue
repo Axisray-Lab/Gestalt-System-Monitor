@@ -12,6 +12,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'focus', key: string): void;
   (e: 'overview'): void;
+  (e: 'preview', key: string | null): void;
 }>();
 
 
@@ -191,6 +192,11 @@ watch([activeMapKey, activeRegionKey], () => (replayPage.value = 1));
 watch(replayPageCount, count => {
   if (count > 0 && replayPage.value > count) replayPage.value = count;
 });
+watch(
+  pagedReplays,
+  matches => emit('preview', matches[0]?.key ?? null),
+  { immediate: true }
+);
 
 function formatMatchNumber(matchNumber: number): string {
   return `M${String(matchNumber).padStart(3, '0')}`;
