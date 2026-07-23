@@ -1,6 +1,6 @@
 /**
  * Mock LAN — lets you exercise the full discovery + feed pipeline on one box
- * with no game build. It (1) broadcasts beacons (magic "ECHO") to 127.0.0.1:7999 so
+ * with no game build. It (1) broadcasts monitor beacons (magic "MONI") to 127.0.0.1:7999 so
  * the agent's own listener discovers them, and (2) runs one WebSocket feed server
  * per fake match, emitting the target `monitor.mapGeometry` + `monitor.worldSnapshot`
  * JSON-RPC notifications the real game is expected to add (see docs/ARCHITECTURE.md).
@@ -12,7 +12,7 @@ import dgram from 'node:dgram';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   DISCOVERY_PORT,
-  DISCOVERY_MAGIC,
+  MONITOR_DISCOVERY_MAGIC,
   BROADCAST_INTERVAL_MS,
   EJSONRPCType,
   METHOD_MAP_GEOMETRY,
@@ -125,7 +125,7 @@ export function startMock(): void {
     for (const m of matches) {
       const json = Buffer.from(JSON.stringify(m.payload), 'utf8');
       const buf = Buffer.alloc(4 + json.length);
-      buf.writeUInt32LE(DISCOVERY_MAGIC, 0);
+      buf.writeUInt32LE(MONITOR_DISCOVERY_MAGIC, 0);
       json.copy(buf, 4);
       beacon.send(buf, DISCOVERY_PORT, '127.0.0.1');
     }
@@ -185,7 +185,7 @@ export function startScenarioMock(): void {
     for (const f of feeds) {
       const json = Buffer.from(JSON.stringify(f.beaconPayload), 'utf8');
       const buf = Buffer.alloc(4 + json.length);
-      buf.writeUInt32LE(DISCOVERY_MAGIC, 0);
+      buf.writeUInt32LE(MONITOR_DISCOVERY_MAGIC, 0);
       json.copy(buf, 4);
       beacon.send(buf, DISCOVERY_PORT, '127.0.0.1');
     }

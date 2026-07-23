@@ -2,7 +2,7 @@
  * Gestalt-System-Monitor — LAN discovery agent.
  *
  * Browsers cannot listen to UDP broadcast, so this thin Node process sniffs the
- * LAN beacon (udp/7999, magic "ECHO") and serves a live process list to the
+ * process-monitor beacon (udp/7999, magic "MONI") and serves a live process list to the
  * monitor SPA over its own WebSocket. The browser then connects *directly* to
  * each game process's WebSocket (ws://<ip>:<wsPort>) for the telemetry feed.
  *
@@ -17,7 +17,6 @@ import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   DISCOVERY_PORT,
-  DISCOVERY_MAGIC,
   ROOM_EXPIRY_MS,
   BROADCAST_INTERVAL_MS,
   AGENT_BROWSER_PORT,
@@ -42,6 +41,7 @@ import { startMock } from './mock';
 import { startScenarioMock } from './mock';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { TraceReplayer } from './trace-replayer';
+import { isMonitorDiscoveryPacket } from './discovery-wire.js';
 
 const argv = process.argv.slice(2);
 const workspaceRoot = findWorkspaceRoot();
@@ -295,7 +295,7 @@ function websocketHostForBeacon(sourceIp: string): string {
 const udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
 udp.on('message', (buf, rinfo) => {
-  if (buf.length < 4 || buf.readUInt32LE(0) !== DISCOVERY_MAGIC) return;
+  if (!isMonitorDiscoveryPacket(buf)) return;
   let payload: BeaconPayload;
   try {
     payload = JSON.parse(buf.subarray(4).toString('utf8'));

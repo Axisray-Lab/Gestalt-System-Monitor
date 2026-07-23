@@ -13,10 +13,11 @@ above every car.
 
 ## Why an "agent"
 
-Browsers cannot listen to UDP broadcast, and the LAN-discovery beacon is a UDP
-broadcast (`udp/7999`, magic `"ECHO"`). So a thin Node **discovery agent** sniffs
-the beacon and serves a live process list to the SPA over its own WebSocket. The
-browser then connects **directly** to each game process's WebSocket
+Browsers cannot listen to UDP broadcast, and the process-monitor beacon is a UDP
+broadcast (`udp/7999`, magic `"MONI"`). Player-facing room discovery shares the
+port but retains its shipped `"ECHO"` magic; the Node **discovery agent** sniffs
+only `"MONI"` beacons and serves a live process list to the SPA over its own
+WebSocket. The browser then connects **directly** to each game process's WebSocket
 (`ws://<ip>:<wsPort>`) for the telemetry feed — the agent is not in the data path.
 
 ```
@@ -165,7 +166,9 @@ the SPA with `?agent=ws://localhost:7790`.
 - **JSON-RPC envelope** `{type,id?,method,params}` with `type` `0=Request`,
   `1=Response` — identical to the game's in-game WebSocket bridge, so the monitor
   is just another passive client on the same socket the game UI uses.
-- **Discovery**: `udp/7999`, 4-byte LE magic `0x4543484F`, `5s` room expiry.
+- **Process discovery**: `udp/7999`, 4-byte LE magic `0x4D4F4E49` (`"MONI"`),
+  `5s` process expiry. Player-facing room discovery on the same port remains
+  `0x4543484F` (`"ECHO"`).
 - **Coordinates**: UE world cm / Z-up / left-handed → Three.js m / Y-up /
   right-handed (`packages/web/src/three/coords.ts`).
 

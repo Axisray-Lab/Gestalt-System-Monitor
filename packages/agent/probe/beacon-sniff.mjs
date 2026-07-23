@@ -1,5 +1,5 @@
-// Throwaway diagnostic: listen on the LAN-discovery channel (udp/7999, magic
-// "ECHO") and print every beacon's source IP + matchId + wsPort. Groups by source
+// Throwaway diagnostic: listen on the process-monitor channel (udp/7999, magic
+// "MONI") and print every beacon's source IP + matchId + wsPort. Groups by source
 // IP so you can see, per host, how many DISTINCT matchIds are actually on the wire.
 //
 // This is exactly what the discovery agent keys on (`${matchId}@${ip}`), so if a
@@ -13,7 +13,7 @@
 import dgram from 'node:dgram';
 
 const DISCOVERY_PORT = 7999;
-const DISCOVERY_MAGIC = 0x4543484f; // "ECHO", little-endian
+const MONITOR_DISCOVERY_MAGIC = 0x4d4f4e49; // "MONI", little-endian
 const SUMMARY_SEC = Number(process.argv[2] || 15);
 
 // ip -> Map<matchId, { wsPort, name, count, lastSeen }>
@@ -22,7 +22,7 @@ const byIp = new Map();
 const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
 sock.on('message', (buf, rinfo) => {
-  if (buf.length < 4 || buf.readUInt32LE(0) !== DISCOVERY_MAGIC) return;
+  if (buf.length < 4 || buf.readUInt32LE(0) !== MONITOR_DISCOVERY_MAGIC) return;
   let p;
   try {
     p = JSON.parse(buf.subarray(4).toString('utf8').replace(/\0+$/, ''));

@@ -12,7 +12,7 @@ LAN — and (c) the game-side support that *real* (non-mock) matches need.
 Browsers cannot listen to UDP broadcast, so a thin Node **discovery agent** does
 it for them, and is otherwise out of the data path:
 
-- **Discovery agent** — sniffs the `udp/7999` LAN beacon, tracks live matches,
+- **Discovery agent** — sniffs the `udp/7999` process-monitor beacon, tracks live matches,
   scans local Steam libraries for the installed game, exposes host resource
   headroom, and serves this local state to the browser over its own localhost
   WebSocket (`ws://localhost:7788` by default). With `--mock` it also synthesizes
@@ -104,9 +104,12 @@ briefly before the recommendation moves.
 Defined in `packages/protocol`. The mock agent emits exactly these shapes, and
 the live `wsFeed` consumes them.
 
-### Discovery beacon — `udp/7999`
+### Process-monitor discovery beacon — `udp/7999`
 
-4-byte little-endian magic `0x4543484F` (`"ECHO"`) followed by UTF-8 JSON:
+4-byte little-endian magic `0x4D4F4E49` (`"MONI"`) followed by UTF-8 JSON.
+Player-facing room discovery shares `udp/7999` but retains its shipped
+`0x4543484F` (`"ECHO"`) magic; the monitor agent deliberately ignores those room
+packets.
 
 ```ts
 interface BeaconPayload {
